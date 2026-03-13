@@ -145,6 +145,68 @@ feedback is incorporated via the LLM, which modifies the working form.
 
 The choice of review form syntax is a per-project or per-reviewer configuration.
 
+#### 2.3.1 Review Form Examples
+
+The following examples show the `get_key` function from Section 8.3 rendered
+in each target syntax. Effect annotations are rendered as comments, since target
+languages lack native effect types. The review form is read-only output — humans
+do not edit it directly.
+
+**OCaml-like:**
+
+```ocaml
+(* effects: State<Map<string, string>>, Throw<kv_error>, Log *)
+let get_key (key : string) : string =
+  let () = Log.log `Debug ("get: " ^ key) in
+  match Map.lookup key (State.get ()) with
+  | Some v -> v
+  | None   -> raise (KeyNotFound key)
+```
+
+**Rust-like:**
+
+```rust
+// effects: State<Map<String, String>>, Throw<KvError>, Log
+fn get_key(key: String) -> String {
+    Log::log(Level::Debug, format!("get: {}", key));
+    match State::get().lookup(&key) {
+        Some(v) => v,
+        None    => throw(KvError::KeyNotFound(key)),
+    }
+}
+```
+
+**TypeScript-like:**
+
+```typescript
+// effects: State<Map<string, string>>, Throw<KvError>, Log
+function getKey(key: string): string {
+    Log.log("debug", `get: ${key}`);
+    const val = State.get().lookup(key);
+    if (val !== undefined) {
+        return val;
+    } else {
+        throw new KeyNotFoundError(key);
+    }
+}
+```
+
+**Python-like:**
+
+```python
+# effects: State[Map[str, str]], Throw[KvError], Log
+def get_key(key: str) -> str:
+    log(DEBUG, f"get: {key}")
+    match lookup(key, state_get()):
+        case Some(v): return v
+        case None:    raise KeyNotFound(key)
+```
+
+In all four renderings the semantic content is identical — same control flow,
+same data dependencies, same effect invocations. Only surface syntax and
+naming conventions differ. A reviewer familiar with any of these languages can
+audit Axiom code without learning Axiom's working form.
+
 ### 2.4 Transformation Pipeline
 
 ```
@@ -842,6 +904,8 @@ The syntax prioritizes:
 ### 8.2 Grammar Summary
 
 ```
+-- Top-level structure
+
 program     ::= module_decl*
 
 module_decl ::= 'module' IDENT '{' module_item* '}'
@@ -851,35 +915,148 @@ module_item ::= require_decl | type_decl | effect_decl | fn_decl
 require_decl ::= 'require' 'effect' type_expr
 
 type_decl   ::= 'type' type_head '=' variant ('|' variant)*
+type_head   ::= IDENT type_params?
 variant     ::= CTOR_IDENT | CTOR_IDENT '(' type_expr (',' type_expr)* ')'
 
 effect_decl ::= 'effect' type_head '{' op_decl* '}'
-op_decl     ::= IDENT ':' '(' type_expr* ')' '->' type_expr
+op_decl     ::= IDENT ':' '(' type_expr (',' type_expr)* ')' '->' type_expr
 
 fn_decl     ::= 'pub'? 'fn' IDENT type_params? '(' params ')' '->' type_expr '!' effect_set '{' expr '}'
 
-effect_set  ::= 'pure' | '{' effect (',' effect)* '}'
+-- Type-level
 
-expr        ::= let_expr | match_expr | handle_expr | do_expr | perform_expr
-              | fn_expr | if_expr | app_expr | literal | IDENT | record_expr
-              | expr '.' IDENT
+type_params ::= '<' IDENT (',' IDENT)* '>'
+             -- Type parameter list on declarations, e.g. <A, B>
 
-let_expr    ::= 'let' IDENT (':' type_expr)? '=' expr 'in' expr
-              | 'let' IDENT (':' type_expr)? '=' expr  -- in do blocks
+effect_set  ::= 'pure' | '{' type_expr (',' type_expr)* '}'
+             -- 'pure' means no effects; braces list concrete effect types
+
+type_expr   ::= IDENT                                    -- type variable or simple type
+              | IDENT '<' type_expr (',' type_expr)* '>' -- parameterized type
+              | '(' type_expr (',' type_expr)* ')'       -- tuple type
+              | '(' params ')' '->' type_expr '!' effect_set  -- function type
+
+-- Value-level expressions
+
+expr        ::= let_expr
+              | letrec_expr
+              | match_expr
+              | handle_expr
+              | do_expr
+              | perform_expr
+              | fn_expr
+              | if_expr
+              | app_expr
+              | record_expr
+              | expr '.' IDENT     -- field projection
+              | literal
+              | IDENT
+
+app_expr    ::= expr '(' args ')'  -- function application
+
+let_expr    ::= 'let' pattern (':' type_expr)? '=' expr 'in' expr
+              | 'let' pattern (':' type_expr)? '=' expr
+              -- Second form is used inside 'do' blocks (see note below)
+
+letrec_expr ::= 'letrec' '{' letrec_bind (',' letrec_bind)* '}' 'in' expr
+letrec_bind ::= IDENT '(' params ')' ':' type_expr '=' expr
+             -- Each bind names a mutually recursive function with a full signature
 
 match_expr  ::= 'match' expr 'with' '{' ('|' pattern '=>' expr)+ '}'
 
 handle_expr ::= 'handle' expr 'with' '{' handler_clause+ '}'
-handler_clause ::= IDENT '{' (op_handler)+ '}'
+handler_clause ::= IDENT '{' op_handler+ '}'
 op_handler  ::= IDENT '(' params ')' '=>' expr
               | 'return' IDENT '=>' expr
+              -- 'return' branch handles the normal completion value (see note below)
 
 perform_expr ::= 'perform' IDENT '.' IDENT '(' args ')'
+              -- 'perform EffectName.operation(arg1, arg2)'
 
 do_expr     ::= 'do' '{' (stmt ';')* expr '}'
-stmt        ::= 'let' IDENT '=' expr | expr
+stmt        ::= 'let' pattern '=' expr | expr
 
 fn_expr     ::= 'fn' '(' params ')' ('->' type_expr '!' effect_set)? '{' expr '}'
+             -- Anonymous function; type annotation optional in body position
+
+if_expr     ::= 'if' expr '{' expr '}' 'else' '{' expr '}'
+             -- Both branches are required; if_expr is always an expression.
+             -- Sugar for: match expr with { | true => e1 | false => e2 }
+
+record_expr ::= '{' (field_assign (',' field_assign)*)? '}'
+              | '{' expr 'with' field_assign (',' field_assign)* '}'
+              -- First form constructs a record; second form copies with updates.
+field_assign ::= IDENT ':' expr
+
+-- Parameters and arguments
+
+params      ::= (param (',' param)*)?
+param       ::= IDENT ':' type_expr
+
+args        ::= (expr (',' expr)*)?
+
+-- Literals
+
+literal     ::= INT_LIT | FLOAT_LIT | STRING_LIT | BOOL_LIT | '()'
+             -- INT_LIT:    decimal integer (e.g. 42) or 0x hex (e.g. 0xFF)
+             -- FLOAT_LIT:  decimal float with required dot (e.g. 3.14, 1.0e-5)
+             -- STRING_LIT: double-quoted UTF-8 with escapes (\n \t \\ \" \uXXXX)
+             -- BOOL_LIT:   'true' | 'false'
+             -- '()':       Unit value
+
+-- Patterns
+
+pattern     ::= '_'                                              -- wildcard
+              | IDENT                                            -- variable binding
+              | CTOR_IDENT ('(' pattern (',' pattern)* ')')?    -- constructor
+              | literal                                          -- literal match
+              | '{' (field_pat (',' field_pat)*)? ('..')? '}'  -- record pattern
+              | pattern '|' pattern                             -- or-pattern
+              | '(' pattern ')'                                  -- grouping
+
+field_pat   ::= IDENT '=' pattern   -- explicit field binding
+              | IDENT               -- shorthand: field name bound as variable
+             -- '..' in record patterns means "open" — remaining fields ignored.
+             -- Without '..', the pattern must name every field (closed match).
+```
+
+**Note — `let` in `do` blocks.** Inside a `do` block, `let` bindings omit the
+`in` keyword. Their scope extends to the end of the enclosing block. The parser
+distinguishes the two forms by position: a `let` that is not the final item in
+the block is a statement binding; the final item must be a plain expression
+(not `let`).
+
+```
+do {
+  let x = foo();       -- statement binding: no 'in'
+  let y = bar(x);      -- statement binding: no 'in'
+  baz(x, y)            -- final expression: value of the block
+}
+```
+
+**Note — handler `return` branch.** The optional `return` branch in a handler
+clause runs when the handled computation completes normally — that is, when it
+produces a value without invoking any operation handled by this handler. The
+branch names that result value and may transform it. If omitted, the default is
+the identity (`return v => v`).
+
+```
+handle compute() with {
+  State {
+    get()  => resume(current_state, current_state)
+    put(s) => resume((), s)
+    return v => v    -- computation finished; v is its result value
+  }
+}
+```
+
+**Note — or-patterns.** Or-patterns bind the same set of variables in both
+branches. All bound names must have the same type in each branch.
+
+```
+match shape with
+| Circle(r) | Ellipse(r, r) => area_approx(r)
+| _                         => 0.0
 ```
 
 ### 8.3 Complete Example: Key-Value Store

@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (public_name axiom)
+ (libraries axiom_compiler))

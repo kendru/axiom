@@ -1,0 +1,3 @@
+(library
+ (name axiom_compiler)
+ (modules ast lexer parser ir elaborate codegen_wasm))

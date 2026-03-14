@@ -1,0 +1,13 @@
+(lang dune 3.16)
+(name axiom_compiler)
+(generate_opam_files true)
+
+(package
+ (name axiom_compiler)
+ (synopsis "Compiler frontend for the Axiom programming language")
+ (description
+  "OCaml-based compiler frontend for Axiom, a language designed for LLMs.")
+ (depends
+  (ocaml (>= 5.2))
+  (dune (>= 3.16))
+  (alcotest (and :with-test (>= 1.7)))))

@@ -1,0 +1,11 @@
+-- hello.axm: minimal Axiom program that prints to the console.
+-- Demonstrates: module declaration, require effect, pub fn, perform.
+-- See spec/axiom-overview-draft.md §8 for working form syntax.
+
+module hello {
+  require effect Console
+
+  pub fn main() -> Unit ! {Console} {
+    perform Console.print("Hello, Axiom!\n")
+  }
+}

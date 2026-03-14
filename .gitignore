@@ -34,3 +34,8 @@ setup.log
 
 # Local OPAM switch
 _opam/
+
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/

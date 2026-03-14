@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  compiler:
+    name: OCaml compiler
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.2"
+
+      - name: Install dependencies
+        run: opam install . --deps-only --with-test
+        working-directory: compiler
+
+      - name: Build
+        run: opam exec -- dune build
+        working-directory: compiler
+
+      - name: Test
+        run: opam exec -- dune test
+        working-directory: compiler
+
+  runtime:
+    name: Zig runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: "0.15.0"
+
+      - name: Build
+        run: zig build
+        working-directory: runtime
+
+      - name: Test
+        run: zig build test
+        working-directory: runtime

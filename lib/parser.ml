@@ -174,7 +174,7 @@ and parse_expr_state (st : state) : expr =
       | None -> failwith "Parser: expected identifier after 'let'"
     in
     consume st Equal;
-    let value = parse_app st in
+    let value = parse_expr_state st in
     consume st In;
     let body = parse_expr_state st in
     Ast.Let { name; value; body }

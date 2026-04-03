@@ -12,3 +12,8 @@
  (name test_typechecker)
  (modules test_typechecker)
  (libraries axiom_lib alcotest))
+
+(test
+ (name test_decl_parser)
+ (modules test_decl_parser)
+ (libraries axiom_lib alcotest))

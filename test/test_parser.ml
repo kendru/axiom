@@ -191,6 +191,199 @@ let test_match_var_pattern () =
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
+(* ------------------------------------------------------------------ *)
+(* if / else                                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* if b { 1 } else { 0 } *)
+let test_if_basic () =
+  check_expr "if basic"
+    "if b { 1 } else { 0 }"
+    (If { cond = Var "b"; then_ = IntLit 1; else_ = IntLit 0 })
+
+(* if cond { f(x) } else { g(x) } *)
+let test_if_app_body () =
+  check_expr "if with app body"
+    "if cond { f(x) } else { g(x) }"
+    (If { cond = Var "cond"
+        ; then_ = App (Var "f", [Var "x"])
+        ; else_ = App (Var "g", [Var "x"]) })
+
+(* if a { if b { 1 } else { 2 } } else { 3 } *)
+let test_if_nested () =
+  check_expr "nested if"
+    "if a { if b { 1 } else { 2 } } else { 3 }"
+    (If { cond  = Var "a"
+        ; then_ = If { cond = Var "b"; then_ = IntLit 1; else_ = IntLit 2 }
+        ; else_ = IntLit 3 })
+
+(* ------------------------------------------------------------------ *)
+(* handle expressions                                                   *)
+(* ------------------------------------------------------------------ *)
+
+(*
+  handle computation() with {
+    State {
+      get()    => resume(current)
+      put(s)   => resume(())
+    }
+  }
+*)
+let test_handle_state () =
+  check_expr "handle State"
+    "handle computation() with { State { get() => resume(s) \n put(v) => resume(()) } }"
+    (Handle
+       { handled   = App (Var "computation", [])
+       ; handlers  =
+           [ { effect_handler = "State"
+             ; op_handlers    =
+                 [ { op_handler_name   = "get"
+                   ; op_handler_params = []
+                   ; op_handler_body   = App (Var "resume", [Var "s"]) }
+                 ; { op_handler_name   = "put"
+                   ; op_handler_params = ["v"]
+                   ; op_handler_body   = App (Var "resume", [UnitLit]) } ]
+             ; return_handler = None } ] })
+
+(* handle with a return branch *)
+let test_handle_return_branch () =
+  check_expr "handle with return"
+    "handle f() with { Throw { throw(e) => e \n return v => v } }"
+    (Handle
+       { handled  = App (Var "f", [])
+       ; handlers =
+           [ { effect_handler = "Throw"
+             ; op_handlers    =
+                 [ { op_handler_name   = "throw"
+                   ; op_handler_params = ["e"]
+                   ; op_handler_body   = Var "e" } ]
+             ; return_handler = Some { return_var = "v"; return_body = Var "v" } } ] })
+
+(* ------------------------------------------------------------------ *)
+(* perform                                                              *)
+(* ------------------------------------------------------------------ *)
+
+(* perform Console.print("hi") *)
+let test_perform_basic () =
+  check_expr "perform basic"
+    {|perform Console.print("hi")|}
+    (Perform { effect_name = "Console"; op_name = "print"
+             ; args = [StringLit "hi"] })
+
+(* perform State.get() -- zero args *)
+let test_perform_no_args () =
+  check_expr "perform no args"
+    "perform State.get()"
+    (Perform { effect_name = "State"; op_name = "get"; args = [] })
+
+(* perform Throw.throw(KeyNotFound(key)) -- ctor arg *)
+let test_perform_ctor_arg () =
+  check_expr "perform ctor arg"
+    "perform Throw.throw(err)"
+    (Perform { effect_name = "Throw"; op_name = "throw"; args = [Var "err"] })
+
+(* inside a do block *)
+let test_perform_in_do () =
+  check_expr "perform in do"
+    {|do { perform Log.log(msg); x }|}
+    (Do [ StmtExpr (Perform { effect_name = "Log"; op_name = "log"
+                             ; args = [Var "msg"] })
+        ; StmtExpr (Var "x") ])
+
+(* ------------------------------------------------------------------ *)
+(* do blocks                                                            *)
+(* ------------------------------------------------------------------ *)
+
+(* do { x }  -- trivial single-expression block *)
+let test_do_single () =
+  check_expr "do single expr"
+    "do { x }"
+    (Do [StmtExpr (Var "x")])
+
+(* do { f(); x }  -- effect stmt then result *)
+let test_do_effect_then_result () =
+  check_expr "do effect then result"
+    "do { f(); x }"
+    (Do [StmtExpr (App (Var "f", [])); StmtExpr (Var "x")])
+
+(* do { let x = 42; x }  -- let stmt (no 'in') *)
+let test_do_let_stmt () =
+  check_expr "do let stmt"
+    "do { let x = 42; x }"
+    (Do [StmtLet { name = "x"; value = IntLit 42 }; StmtExpr (Var "x")])
+
+(* do { let a = 1; let b = 2; a }  -- multiple let stmts *)
+let test_do_multi_let () =
+  check_expr "do multi let"
+    "do { let a = 1; let b = 2; a }"
+    (Do [ StmtLet { name = "a"; value = IntLit 1 }
+        ; StmtLet { name = "b"; value = IntLit 2 }
+        ; StmtExpr (Var "a") ])
+
+(* ------------------------------------------------------------------ *)
+(* letrec expressions                                                   *)
+(* ------------------------------------------------------------------ *)
+
+(* letrec { f(x: Int): Int = x } in f(42) *)
+let test_letrec_single () =
+  check_expr "letrec single"
+    "letrec { f(x: Int): Int = x } in f(42)"
+    (Letrec
+       ( [ { letrec_name = "f"
+           ; letrec_params = [{ param_name = "x"; param_type = TyName "Int" }]
+           ; letrec_return_type = TyName "Int"
+           ; letrec_body = Var "x" } ]
+       , App (Var "f", [IntLit 42]) ))
+
+(* letrec { even(n: Int): Bool = n, odd(n: Int): Bool = n } in even(0) *)
+let test_letrec_mutual () =
+  check_expr "letrec mutual"
+    "letrec { even(n: Int): Bool = n, odd(n: Int): Bool = n } in even(0)"
+    (Letrec
+       ( [ { letrec_name = "even"
+           ; letrec_params = [{ param_name = "n"; param_type = TyName "Int" }]
+           ; letrec_return_type = TyName "Bool"
+           ; letrec_body = Var "n" }
+         ; { letrec_name = "odd"
+           ; letrec_params = [{ param_name = "n"; param_type = TyName "Int" }]
+           ; letrec_return_type = TyName "Bool"
+           ; letrec_body = Var "n" } ]
+       , App (Var "even", [IntLit 0]) ))
+
+(* ------------------------------------------------------------------ *)
+(* Record literals, updates, and projection                            *)
+(* ------------------------------------------------------------------ *)
+
+(* {} -- empty record *)
+let test_record_empty () =
+  check_expr "empty record"
+    "{}"
+    (Record [])
+
+(* { x: 1, y: 2 } *)
+let test_record_literal () =
+  check_expr "record literal"
+    "{ x: 1, y: 2 }"
+    (Record [("x", IntLit 1); ("y", IntLit 2)])
+
+(* { p with x: 3 } -- record update *)
+let test_record_update () =
+  check_expr "record update"
+    "{ p with x: 3 }"
+    (RecordUpdate (Var "p", [("x", IntLit 3)]))
+
+(* p.x -- field projection *)
+let test_project_field () =
+  check_expr "project field"
+    "p.x"
+    (Project (Var "p", "x"))
+
+(* p.x.y -- chained projection *)
+let test_project_chain () =
+  check_expr "chained projection"
+    "p.x.y"
+    (Project (Project (Var "p", "x"), "y"))
+
 let () =
   Alcotest.run "Parser"
     [ ( "let-expression",
@@ -223,4 +416,36 @@ let () =
         ; Alcotest.test_case "wildcard arm"      `Quick test_match_wildcard
         ; Alcotest.test_case "constructor arms"  `Quick test_match_constructor
         ; Alcotest.test_case "var pattern"       `Quick test_match_var_pattern
+        ] )
+    ; ( "if-else",
+        [ Alcotest.test_case "if true/false"     `Quick test_if_basic
+        ; Alcotest.test_case "if with app body"  `Quick test_if_app_body
+        ; Alcotest.test_case "nested if"         `Quick test_if_nested
+        ] )
+    ; ( "do-block",
+        [ Alcotest.test_case "single expr"           `Quick test_do_single
+        ; Alcotest.test_case "effect then result"    `Quick test_do_effect_then_result
+        ; Alcotest.test_case "let stmt"              `Quick test_do_let_stmt
+        ; Alcotest.test_case "multi let"             `Quick test_do_multi_let
+        ] )
+    ; ( "perform",
+        [ Alcotest.test_case "basic"        `Quick test_perform_basic
+        ; Alcotest.test_case "no args"      `Quick test_perform_no_args
+        ; Alcotest.test_case "ctor arg"     `Quick test_perform_ctor_arg
+        ; Alcotest.test_case "in do block"  `Quick test_perform_in_do
+        ] )
+    ; ( "handle",
+        [ Alcotest.test_case "State handler"    `Quick test_handle_state
+        ; Alcotest.test_case "return branch"    `Quick test_handle_return_branch
+        ] )
+    ; ( "letrec",
+        [ Alcotest.test_case "single binding"   `Quick test_letrec_single
+        ; Alcotest.test_case "mutual bindings"  `Quick test_letrec_mutual
+        ] )
+    ; ( "record",
+        [ Alcotest.test_case "empty"             `Quick test_record_empty
+        ; Alcotest.test_case "literal"           `Quick test_record_literal
+        ; Alcotest.test_case "update"            `Quick test_record_update
+        ; Alcotest.test_case "project field"     `Quick test_project_field
+        ; Alcotest.test_case "chained project"   `Quick test_project_chain
         ] ) ]

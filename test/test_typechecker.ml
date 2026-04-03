@@ -97,6 +97,22 @@ let test_match_arms_type_mismatch () =
     {|match true with { | true => 1 | false => "oops" }|}
 
 (* ------------------------------------------------------------------ *)
+(* letrec                                                               *)
+(* ------------------------------------------------------------------ *)
+
+(* letrec { f(x: Int): Int = x } in f(42)  =>  Int *)
+let test_letrec_simple () =
+  check_ty "letrec simple"
+    "letrec { f(x: Int): Int = x } in f(42)"
+    (TyCon "Int")
+
+(* letrec { f(x: Int): Bool = true } in f  =>  Int -> Bool *)
+let test_letrec_fn_type () =
+  check_ty "letrec fn type"
+    "letrec { f(x: Int): Bool = true } in f"
+    (TyFun (TyCon "Int", TyCon "Bool"))
+
+(* ------------------------------------------------------------------ *)
 (* Type errors                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -133,6 +149,10 @@ let () =
     ; ( "match",
         [ Alcotest.test_case "arms same type"    `Quick test_match_arms_same_type
         ; Alcotest.test_case "arm type mismatch" `Quick test_match_arms_type_mismatch
+        ] )
+    ; ( "letrec",
+        [ Alcotest.test_case "simple"            `Quick test_letrec_simple
+        ; Alcotest.test_case "fn type"           `Quick test_letrec_fn_type
         ] )
     ; ( "errors",
         [ Alcotest.test_case "unbound var"       `Quick test_unbound_var

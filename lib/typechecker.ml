@@ -232,6 +232,33 @@ let rec infer_expr (env : env) (e : expr) : ty =
     let env'    = env_extend name scheme env in
     infer_expr env' body
 
+  | Letrec (bindings, body) ->
+    (* Compute annotated types for each binding: param types + return type -> fun_ty *)
+    let binding_info = List.map (fun b ->
+        let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) b.letrec_params in
+        let ret_ty    = ty_of_type_expr b.letrec_return_type in
+        let fun_ty    = List.fold_right (fun pt acc -> TyFun (pt, acc)) param_tys ret_ty in
+        (b, param_tys, ret_ty, fun_ty)
+      ) bindings in
+    (* Extend env with all bindings at their monomorphic function types for recursion *)
+    let env_rec = List.fold_left (fun acc (b, _, _, fun_ty) ->
+        env_extend b.letrec_name (mono fun_ty) acc
+      ) env binding_info in
+    (* Infer each body in env extended with its own params, unify with return type *)
+    List.iter (fun (b, param_tys, ret_ty, _) ->
+        let env_params = List.fold_left2
+            (fun acc p pt -> env_extend p.param_name (mono pt) acc)
+            env_rec b.letrec_params param_tys
+        in
+        let body_ty = infer_expr env_params b.letrec_body in
+        unify body_ty ret_ty
+      ) binding_info;
+    (* Generalize and build the env for the continuation *)
+    let env' = List.fold_left (fun acc (b, _, _, fun_ty) ->
+        env_extend b.letrec_name (generalize env fun_ty) acc
+      ) env binding_info in
+    infer_expr env' body
+
   | Fn { params; return_type; fn_body; _ } ->
     (* Replace type variable names with fresh metas so that let-generalization
        can quantify over them.  A single shared table ensures that the same name
@@ -283,6 +310,50 @@ let rec infer_expr (env : env) (e : expr) : ty =
         unify result_ty arm_ty
       ) arms;
     deref result_ty
+
+  | Record fields ->
+    (* Record types are nominal/structural — deferred until kind system.
+       Infer field types for side-effects (catches unbound vars), return a fresh meta. *)
+    List.iter (fun (_, e) -> ignore (infer_expr env e)) fields;
+    fresh_meta ()
+
+  | RecordUpdate (base, fields) ->
+    let _base_ty = infer_expr env base in
+    List.iter (fun (_, e) -> ignore (infer_expr env e)) fields;
+    fresh_meta ()
+
+  | Project (e, _field) ->
+    ignore (infer_expr env e);
+    fresh_meta ()
+
+  | Perform _ ->
+    (* Effect typing deferred — return a fresh meta for now *)
+    fresh_meta ()
+
+  | Handle { handled; handlers = _ } ->
+    (* Effect typing deferred — infer the handled expression's type for now *)
+    infer_expr env handled
+
+  | Do stmts ->
+    (* Each StmtExpr is inferred and discarded; StmtLet extends the env.
+       The final stmt must be a StmtExpr whose type is the block's type. *)
+    let rec go env = function
+      | []                         -> TyCon "Unit"
+      | [StmtExpr e]               -> infer_expr env e
+      | StmtExpr e :: rest         -> ignore (infer_expr env e); go env rest
+      | StmtLet { name; value } :: rest ->
+        let ty  = infer_expr env value in
+        let env' = env_extend name (generalize env ty) env in
+        go env' rest
+    in
+    go env stmts
+
+  | If { cond; then_; else_ } ->
+    unify (infer_expr env cond) (TyCon "Bool");
+    let t = infer_expr env then_ in
+    let e = infer_expr env else_ in
+    unify t e;
+    deref t
 
 (** Extend environment with bindings introduced by a pattern.
     Currently handles PWild and PVar; constructor patterns don't bind new scrutinee types. *)

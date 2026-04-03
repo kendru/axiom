@@ -43,10 +43,6 @@ let test_let_nested () =
     (Let { name = "x"; value = IntLit 1
          ; body = Let { name = "y"; value = IntLit 2; body = Var "x" } })
 
-(* ------------------------------------------------------------------ *)
-(* Variable reference as let value                                      *)
-(* ------------------------------------------------------------------ *)
-
 let test_let_var_value () =
   check_expr "let y = x in y"
     "let y = x in y"
@@ -88,6 +84,75 @@ let test_app_in_let () =
     (Let { name = "x"; value = App (Var "f", [IntLit 42]); body = Var "x" })
 
 (* ------------------------------------------------------------------ *)
+(* fn expressions                                                       *)
+(* ------------------------------------------------------------------ *)
+
+(* fn (x: Int) -> Int ! pure { x } *)
+let test_fn_identity_annotated () =
+  check_expr "fn (x: Int) -> Int ! pure { x }"
+    "fn (x: Int) -> Int ! pure { x }"
+    (Fn { params      = [{ param_name = "x"; param_type = TyName "Int" }]
+        ; return_type = Some (TyName "Int")
+        ; effects     = Some Pure
+        ; fn_body     =Var "x" })
+
+(* fn (x: Int, y: Int) -> Int ! pure { x } *)
+let test_fn_two_params () =
+  check_expr "fn with two params"
+    "fn (x: Int, y: Int) -> Int ! pure { x }"
+    (Fn { params      = [ { param_name = "x"; param_type = TyName "Int" }
+                         ; { param_name = "y"; param_type = TyName "Int" } ]
+        ; return_type = Some (TyName "Int")
+        ; effects     = Some Pure
+        ; fn_body     =Var "x" })
+
+(* fn () -> Unit ! pure { () }  — zero params *)
+let test_fn_no_params () =
+  check_expr "fn no params"
+    "fn () -> Unit ! pure { () }"
+    (Fn { params      = []
+        ; return_type = Some (TyName "Unit")
+        ; effects     = Some Pure
+        ; fn_body     =UnitLit })
+
+(* fn (x: Int) -> Int ! pure { x }  body is an application *)
+let test_fn_body_app () =
+  check_expr "fn body is application"
+    "fn (x: Int) -> Int ! pure { f(x) }"
+    (Fn { params      = [{ param_name = "x"; param_type = TyName "Int" }]
+        ; return_type = Some (TyName "Int")
+        ; effects     = Some Pure
+        ; fn_body     =App (Var "f", [Var "x"]) })
+
+(* Without return type annotation — optional in body position *)
+let test_fn_no_annotation () =
+  check_expr "fn without annotation"
+    "fn (x: Int) { x }"
+    (Fn { params      = [{ param_name = "x"; param_type = TyName "Int" }]
+        ; return_type = None
+        ; effects     = None
+        ; fn_body     =Var "x" })
+
+(* Parameterised type: fn (xs: List<Int>) -> Int ! pure { 0 } *)
+let test_fn_generic_param () =
+  check_expr "fn with generic param type"
+    "fn (xs: List<Int>) -> Int ! pure { 0 }"
+    (Fn { params      = [{ param_name = "xs"
+                         ; param_type = TyApp ("List", [TyName "Int"]) }]
+        ; return_type = Some (TyName "Int")
+        ; effects     = Some Pure
+        ; fn_body     =IntLit 0 })
+
+(* Effect set with named effects: fn (x: Int) -> Int ! {Log, Throw<E>} { x } *)
+let test_fn_effect_set () =
+  check_expr "fn with effect set"
+    "fn (x: Int) -> Int ! {Log} { x }"
+    (Fn { params      = [{ param_name = "x"; param_type = TyName "Int" }]
+        ; return_type = Some (TyName "Int")
+        ; effects     = Some (Effects [TyName "Log"])
+        ; fn_body     =Var "x" })
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -108,4 +173,13 @@ let () =
         ; Alcotest.test_case "f()"                `Quick test_app_no_args
         ; Alcotest.test_case "f(g(x))"            `Quick test_app_nested
         ; Alcotest.test_case "let x = f(42) in x" `Quick test_app_in_let
+        ] )
+    ; ( "fn-expression",
+        [ Alcotest.test_case "identity annotated"  `Quick test_fn_identity_annotated
+        ; Alcotest.test_case "two params"          `Quick test_fn_two_params
+        ; Alcotest.test_case "no params"           `Quick test_fn_no_params
+        ; Alcotest.test_case "body is application" `Quick test_fn_body_app
+        ; Alcotest.test_case "no annotation"       `Quick test_fn_no_annotation
+        ; Alcotest.test_case "generic param type"  `Quick test_fn_generic_param
+        ; Alcotest.test_case "effect set"          `Quick test_fn_effect_set
         ] ) ]

@@ -29,6 +29,27 @@ type param = {
 }
 
 (* ------------------------------------------------------------------ *)
+(* Literal values (used in patterns and expressions)                   *)
+(* ------------------------------------------------------------------ *)
+
+type literal =
+  | LInt    of int
+  | LFloat  of float
+  | LString of string
+  | LBool   of bool
+  | LUnit
+
+(* ------------------------------------------------------------------ *)
+(* Patterns                                                             *)
+(* ------------------------------------------------------------------ *)
+
+type pattern =
+  | PWild                             (** _ *)
+  | PVar   of string                  (** x *)
+  | PLit   of literal                 (** 42, true, "s", () *)
+  | PCtor  of string * pattern list   (** Some(p), Cons(h, t), None *)
+
+(* ------------------------------------------------------------------ *)
 (* Expression AST                                                       *)
 (* ------------------------------------------------------------------ *)
 
@@ -45,6 +66,16 @@ and let_binding = {
   body  : expr;
 }
 
+and match_arm = {
+  pattern  : pattern;
+  arm_body : expr;
+}
+
+and match_data = {
+  scrutinee : expr;
+  arms      : match_arm list;
+}
+
 and expr =
   | Var       of string
   | IntLit    of int
@@ -55,10 +86,27 @@ and expr =
   | Let       of let_binding
   | App       of expr * expr list   (** f(arg1, arg2, ...) *)
   | Fn        of fn_data            (** fn (params) -> T ! E { body } *)
+  | Match     of match_data         (** match e with { | p => e ... } *)
 
 (* ------------------------------------------------------------------ *)
 (* Pretty-printers                                                      *)
 (* ------------------------------------------------------------------ *)
+
+let pp_literal fmt = function
+  | LInt n    -> Format.fprintf fmt "LInt(%d)" n
+  | LFloat f  -> Format.fprintf fmt "LFloat(%g)" f
+  | LString s -> Format.fprintf fmt "LString(%S)" s
+  | LBool b   -> Format.fprintf fmt "LBool(%b)" b
+  | LUnit     -> Format.pp_print_string fmt "LUnit"
+
+let rec pp_pattern fmt = function
+  | PWild      -> Format.pp_print_string fmt "PWild"
+  | PVar s     -> Format.fprintf fmt "PVar(%S)" s
+  | PLit l     -> Format.fprintf fmt "PLit(%a)" pp_literal l
+  | PCtor (s, ps) ->
+    Format.fprintf fmt "PCtor(%S, [%a])" s
+      (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f "; ")
+         pp_pattern) ps
 
 let rec pp_type_expr fmt = function
   | TyName s -> Format.pp_print_string fmt s
@@ -99,10 +147,35 @@ let rec pp_expr fmt = function
       (Format.pp_print_option pp_type_expr) return_type
       (Format.pp_print_option pp_effect_set) effects
       pp_expr fn_body
+  | Match { scrutinee; arms } ->
+    let pp_arm fmt { pattern; arm_body } =
+      Format.fprintf fmt "| %a => %a" pp_pattern pattern pp_expr arm_body
+    in
+    Format.fprintf fmt "Match{scrut=%a; arms=[%a]}"
+      pp_expr scrutinee
+      (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f "; ")
+         pp_arm) arms
 
 (* ------------------------------------------------------------------ *)
 (* Structural equality                                                  *)
 (* ------------------------------------------------------------------ *)
+
+let equal_literal a b = match a, b with
+  | LInt m,    LInt n    -> m = n
+  | LFloat f,  LFloat g  -> f = g
+  | LString s, LString t -> s = t
+  | LBool p,   LBool q   -> p = q
+  | LUnit,     LUnit     -> true
+  | _,         _         -> false
+
+let rec equal_pattern a b = match a, b with
+  | PWild,        PWild        -> true
+  | PVar x,       PVar y       -> x = y
+  | PLit la,      PLit lb      -> equal_literal la lb
+  | PCtor (a, pa), PCtor (b, pb) ->
+    a = b && List.length pa = List.length pb
+    && List.for_all2 equal_pattern pa pb
+  | _, _ -> false
 
 let rec equal_type_expr a b = match a, b with
   | TyName x,     TyName y     -> x = y
@@ -142,4 +215,11 @@ let rec equal_expr a b = match a, b with
     && Option.equal equal_type_expr fa.return_type fb.return_type
     && Option.equal equal_effect_set fa.effects fb.effects
     && equal_expr fa.fn_body fb.fn_body
+  | Match ma, Match mb ->
+    equal_expr ma.scrutinee mb.scrutinee
+    && List.length ma.arms = List.length mb.arms
+    && List.for_all2
+         (fun a b -> equal_pattern a.pattern b.pattern
+                     && equal_expr a.arm_body b.arm_body)
+         ma.arms mb.arms
   | _, _ -> false

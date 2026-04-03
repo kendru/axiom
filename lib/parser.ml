@@ -1,6 +1,8 @@
 (** Axiom working-form parser.
 
-    Recursive-descent parser. Grows incrementally with the language. *)
+    Recursive-descent parser. All parsing functions are mutually
+    recursive in a single [let rec ... and ...] block so that
+    patterns and expressions can freely cross-reference each other. *)
 
 open Lexer
 open Ast
@@ -34,10 +36,9 @@ let consume st expected =
                 pp_token expected)
 
 (* ------------------------------------------------------------------ *)
-(* Type expression parser                                               *)
+(* Type expression parser (non-recursive with expressions)             *)
 (* ------------------------------------------------------------------ *)
 
-(** Parse a type expression: IDENT or IDENT '<' type_expr (',' type_expr)* '>' *)
 let rec parse_type_expr (st : state) : type_expr =
   let name = match peek st with
     | Some (Ident s) | Some (CtorIdent s) -> advance st; s
@@ -59,26 +60,22 @@ and parse_type_args_rest (st : state) : type_expr list =
   | Some Comma -> advance st; let t = parse_type_expr st in t :: parse_type_args_rest st
   | _          -> []
 
-(** Parse an effect set: 'pure' | '{' type_expr (',' type_expr)* '}' *)
 let parse_effect_set (st : state) : effect_set =
   match peek st with
-  | Some Pure ->
-    advance st; Ast.Pure
+  | Some Pure   -> advance st; Ast.Pure
   | Some LBrace ->
     advance st;
     (match peek st with
      | Some RBrace -> advance st; Ast.Effects []
      | _ ->
        let first = parse_type_expr st in
-       let rest  = parse_type_args_rest st in  (* reuse comma-separated list *)
+       let rest  = parse_type_args_rest st in
        consume st RBrace;
        Ast.Effects (first :: rest))
   | Some t ->
-    failwith (Format.asprintf "Parser: expected effect set ('pure' or '{...}'), got %a"
-                pp_token t)
+    failwith (Format.asprintf "Parser: expected effect set, got %a" pp_token t)
   | None -> failwith "Parser: expected effect set, got end of input"
 
-(** Parse a single parameter: IDENT ':' type_expr *)
 let parse_param (st : state) : param =
   let name = match peek st with
     | Some (Ident s) -> advance st; s
@@ -90,14 +87,12 @@ let parse_param (st : state) : param =
   let ty = parse_type_expr st in
   { param_name = name; param_type = ty }
 
-(** Parse a comma-separated parameter list. The opening '(' has already been consumed. *)
 let rec parse_params (st : state) : param list =
   match peek st with
   | Some RParen -> []
   | _ ->
     let first = parse_param st in
-    let rest  = parse_params_rest st in
-    first :: rest
+    first :: parse_params_rest st
 
 and parse_params_rest (st : state) : param list =
   match peek st with
@@ -105,17 +100,62 @@ and parse_params_rest (st : state) : param list =
   | _          -> []
 
 (* ------------------------------------------------------------------ *)
-(* Expression parser                                                    *)
+(* Mutually recursive expression + pattern parsers                     *)
 (* ------------------------------------------------------------------ *)
 
-(** Parse a comma-separated argument list (past the opening '('). *)
-let rec parse_args (st : state) : expr list =
+let rec parse_pattern (st : state) : pattern =
+  match peek st with
+  | Some (Ident "_")   -> advance st; Ast.PWild
+  | Some (Ident s)     -> advance st; Ast.PVar s
+  | Some (CtorIdent s) ->
+    advance st;
+    let sub_pats = match peek st with
+      | Some LParen ->
+        advance st;
+        (match peek st with
+         | Some RParen -> advance st; []
+         | _ ->
+           let first = parse_pattern st in
+           let rest  = parse_pat_args_rest st in
+           consume st RParen;
+           first :: rest)
+      | _ -> []
+    in
+    Ast.PCtor (s, sub_pats)
+  | Some (IntLit n)    -> advance st; Ast.PLit (LInt n)
+  | Some (FloatLit f)  -> advance st; Ast.PLit (LFloat f)
+  | Some (StringLit s) -> advance st; Ast.PLit (LString s)
+  | Some True          -> advance st; Ast.PLit (LBool true)
+  | Some False         -> advance st; Ast.PLit (LBool false)
+  | Some LParen ->
+    (match st.tokens with
+     | _ :: RParen :: _ -> advance st; advance st; Ast.PLit LUnit
+     | _ -> failwith "Parser: unexpected '(' in pattern")
+  | Some t ->
+    failwith (Format.asprintf "Parser: unexpected token in pattern: %a" pp_token t)
+  | None -> failwith "Parser: unexpected end of input in pattern"
+
+and parse_pat_args_rest (st : state) : pattern list =
+  match peek st with
+  | Some Comma -> advance st; let p = parse_pattern st in p :: parse_pat_args_rest st
+  | _          -> []
+
+and parse_match_arms (st : state) : match_arm list =
+  match peek st with
+  | Some Pipe ->
+    advance st;
+    let pattern  = parse_pattern st in
+    consume st FatArrow;
+    let arm_body = parse_expr_state st in
+    { pattern; arm_body } :: parse_match_arms st
+  | _ -> []
+
+and parse_args (st : state) : expr list =
   match peek st with
   | Some RParen -> []
   | _ ->
     let first = parse_expr_state st in
-    let rest  = parse_args_rest st in
-    first :: rest
+    first :: parse_args_rest st
 
 and parse_args_rest (st : state) : expr list =
   match peek st with
@@ -131,7 +171,7 @@ and parse_expr_state (st : state) : expr =
       | Some t ->
         failwith (Format.asprintf "Parser: expected identifier after 'let', got %a"
                     pp_token t)
-      | None -> failwith "Parser: expected identifier after 'let', got end of input"
+      | None -> failwith "Parser: expected identifier after 'let'"
     in
     consume st Equal;
     let value = parse_app st in
@@ -139,12 +179,20 @@ and parse_expr_state (st : state) : expr =
     let body = parse_expr_state st in
     Ast.Let { name; value; body }
 
+  | Some Match ->
+    advance st;
+    let scrutinee = parse_app st in
+    consume st With;
+    consume st LBrace;
+    let arms = parse_match_arms st in
+    consume st RBrace;
+    Ast.Match { scrutinee; arms }
+
   | Some Fn ->
     advance st;
     consume st LParen;
     let params = parse_params st in
     consume st RParen;
-    (* Optional return type and effect annotation *)
     let (return_type, effects) =
       match peek st with
       | Some Arrow ->
@@ -156,14 +204,13 @@ and parse_expr_state (st : state) : expr =
       | _ -> (None, None)
     in
     consume st LBrace;
-    let body = parse_expr_state st in
+    let fn_body = parse_expr_state st in
     consume st RBrace;
-    Ast.Fn { params; return_type; effects; fn_body = body }
+    Ast.Fn { params; return_type; effects; fn_body }
 
   | _ ->
     parse_app st
 
-(** Parse application: atom optionally followed by '(' args ')'. Left-associative. *)
 and parse_app (st : state) : expr =
   let base = parse_atom st in
   parse_app_rest st base
@@ -177,8 +224,6 @@ and parse_app_rest (st : state) (f : expr) : expr =
     parse_app_rest st (Ast.App (f, args))
   | _ -> f
 
-(** Parse an atomic expression: literal, variable, unit, or fn expression.
-    '(' immediately followed by ')' is the unit literal. *)
 and parse_atom (st : state) : expr =
   match peek st with
   | Some (IntLit n)    -> advance st; Ast.IntLit n
@@ -187,13 +232,10 @@ and parse_atom (st : state) : expr =
   | Some True          -> advance st; Ast.BoolLit true
   | Some False         -> advance st; Ast.BoolLit false
   | Some (Ident s)     -> advance st; Ast.Var s
-  (* '()' — unit literal, distinguished from f() by not following a callee *)
   | Some LParen ->
     (match st.tokens with
-     | _ :: RParen :: _ ->
-       advance st; advance st; Ast.UnitLit
-     | _ ->
-       failwith "Parser: unexpected '(' (grouped expressions not yet supported)")
+     | _ :: RParen :: _ -> advance st; advance st; Ast.UnitLit
+     | _ -> failwith "Parser: unexpected '(' (grouped expressions not yet supported)")
   | Some t ->
     failwith (Format.asprintf "Parser: unexpected token %a" pp_token t)
   | None ->

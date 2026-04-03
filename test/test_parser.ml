@@ -153,6 +153,41 @@ let test_fn_effect_set () =
         ; fn_body     =Var "x" })
 
 (* ------------------------------------------------------------------ *)
+(* match expressions                                                    *)
+(* ------------------------------------------------------------------ *)
+
+(* match x with { | true => 1 | false => 0 } *)
+let test_match_bool_arms () =
+  check_expr "match bool"
+    "match x with { | true => 1 | false => 0 }"
+    (Match { scrutinee = Var "x"
+           ; arms = [ { pattern = PLit (LBool true);  arm_body = IntLit 1 }
+                    ; { pattern = PLit (LBool false); arm_body = IntLit 0 } ] })
+
+(* match n with { | 0 => true | _ => false } *)
+let test_match_wildcard () =
+  check_expr "match with wildcard"
+    "match n with { | 0 => true | _ => false }"
+    (Match { scrutinee = Var "n"
+           ; arms = [ { pattern = PLit (LInt 0); arm_body = BoolLit true }
+                    ; { pattern = PWild;          arm_body = BoolLit false } ] })
+
+(* match opt with { | Some(x) => x | None => 0 } *)
+let test_match_constructor () =
+  check_expr "match constructor"
+    "match opt with { | Some(x) => x | None => 0 }"
+    (Match { scrutinee = Var "opt"
+           ; arms = [ { pattern = PCtor ("Some", [PVar "x"]); arm_body = Var "x" }
+                    ; { pattern = PCtor ("None", []);          arm_body = IntLit 0 } ] })
+
+(* match x with { | y => y }  -- variable binding pattern *)
+let test_match_var_pattern () =
+  check_expr "match var pattern"
+    "match x with { | y => y }"
+    (Match { scrutinee = Var "x"
+           ; arms = [ { pattern = PVar "y"; arm_body = Var "y" } ] })
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -182,4 +217,10 @@ let () =
         ; Alcotest.test_case "no annotation"       `Quick test_fn_no_annotation
         ; Alcotest.test_case "generic param type"  `Quick test_fn_generic_param
         ; Alcotest.test_case "effect set"          `Quick test_fn_effect_set
+        ] )
+    ; ( "match-expression",
+        [ Alcotest.test_case "bool arms"         `Quick test_match_bool_arms
+        ; Alcotest.test_case "wildcard arm"      `Quick test_match_wildcard
+        ; Alcotest.test_case "constructor arms"  `Quick test_match_constructor
+        ; Alcotest.test_case "var pattern"       `Quick test_match_var_pattern
         ] ) ]

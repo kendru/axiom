@@ -96,11 +96,11 @@ let test_lex_string_escape_backslash () =
   check_tokens {|string with \\|} {|"a\\b"|} [ StringLit "a\\b" ]
 
 (* ------------------------------------------------------------------ *)
-(* Unit literal                                                         *)
+(* Unit: () lexes as LParen RParen; parser resolves the meaning        *)
 (* ------------------------------------------------------------------ *)
 
 let test_lex_unit () =
-  check_tokens "unit ()" "()" [ UnitLit ]
+  check_tokens "unit ()" "()" [ LParen; RParen ]
 
 (* ------------------------------------------------------------------ *)
 (* Punctuation / operator tests                                         *)

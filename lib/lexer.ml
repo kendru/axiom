@@ -14,7 +14,7 @@ type token =
   | Perform | Handle | With | Match | Do | Resume | Letrec
   | If | Else | Return
   (* Built-in value keywords *)
-  | Pure | True | False | UnitLit
+  | Pure | True | False
   (* Identifiers *)
   | Ident of string       (** lowercase-start or underscore-start *)
   | CtorIdent of string   (** uppercase-start — constructor / type name *)
@@ -68,7 +68,6 @@ let pp_token fmt = function
   | Pure     -> Format.pp_print_string fmt "Pure"
   | True     -> Format.pp_print_string fmt "True"
   | False    -> Format.pp_print_string fmt "False"
-  | UnitLit  -> Format.pp_print_string fmt "UnitLit"
   | Ident s       -> Format.fprintf fmt "Ident(%S)" s
   | CtorIdent s   -> Format.fprintf fmt "CtorIdent(%S)" s
   | IntLit n      -> Format.fprintf fmt "IntLit(%d)" n
@@ -276,11 +275,7 @@ let tokenize (src : string) : token list =
     (* String literals *)
     | Some '"' -> advance st; push (scan_string st); loop ()
 
-    (* Unit literal "()" — must check before '(' *)
-    | Some '(' when peek2 st = Some ')' ->
-      advance st; advance st; push UnitLit; loop ()
-
-    (* Two-character operators — check before single-char fallthrough *)
+      (* Two-character operators — check before single-char fallthrough *)
     | Some '-' when peek2 st = Some '>' ->
       advance st; advance st; push Arrow; loop ()
     | Some '=' when peek2 st = Some '>' ->

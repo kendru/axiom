@@ -39,8 +39,22 @@ let consume st expected =
 (* Expression parser                                                    *)
 (* ------------------------------------------------------------------ *)
 
+(** Parse a comma-separated argument list, already past the '('. *)
+let rec parse_args (st : state) : expr list =
+  match peek st with
+  | Some RParen -> []
+  | _ ->
+    let first = parse_expr_state st in
+    let rest = parse_args_rest st in
+    first :: rest
+
+and parse_args_rest (st : state) : expr list =
+  match peek st with
+  | Some Comma -> advance st; parse_args st
+  | _          -> []
+
 (** Parse a single expression from the token stream. *)
-let rec parse_expr_state (st : state) : expr =
+and parse_expr_state (st : state) : expr =
   match peek st with
   | Some Let ->
     advance st;
@@ -52,14 +66,30 @@ let rec parse_expr_state (st : state) : expr =
       | None -> failwith "Parser: expected identifier after 'let', got end of input"
     in
     consume st Equal;
-    let value = parse_atom st in
+    let value = parse_app st in
     consume st In;
     let body = parse_expr_state st in
     Ast.Let { name; value; body }
   | _ ->
-    parse_atom st
+    parse_app st
 
-(** Parse an atomic expression: a literal or a variable. *)
+(** Parse application: an atom optionally followed by '(' args ')'.
+    Application is left-associative: f(x)(y) = (f(x))(y). *)
+and parse_app (st : state) : expr =
+  let base = parse_atom st in
+  parse_app_rest st base
+
+and parse_app_rest (st : state) (f : expr) : expr =
+  match peek st with
+  | Some LParen ->
+    advance st;
+    let args = parse_args st in
+    consume st RParen;
+    parse_app_rest st (Ast.App (f, args))
+  | _ -> f
+
+(** Parse an atomic expression: a literal or a variable.
+    '(' immediately followed by ')' is the unit literal. *)
 and parse_atom (st : state) : expr =
   match peek st with
   | Some (IntLit n)    -> advance st; Ast.IntLit n
@@ -67,8 +97,14 @@ and parse_atom (st : state) : expr =
   | Some (StringLit s) -> advance st; Ast.StringLit s
   | Some True          -> advance st; Ast.BoolLit true
   | Some False         -> advance st; Ast.BoolLit false
-  | Some UnitLit       -> advance st; Ast.UnitLit
   | Some (Ident s)     -> advance st; Ast.Var s
+  (* '()' — unit literal, distinct from application's empty arg list *)
+  | Some LParen ->
+    (match st.tokens with
+     | _ :: RParen :: _ ->
+       advance st; advance st; Ast.UnitLit
+     | _ ->
+       failwith "Parser: unexpected '(' (grouped expressions not yet supported)")
   | Some t ->
     failwith (Format.asprintf "Parser: unexpected token %a" pp_token t)
   | None ->

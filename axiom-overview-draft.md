@@ -1583,8 +1583,12 @@ query, not an iterative exploration:
 }
 ```
 
-The response returns all collected nodes, each identified by its
-content-addressed hash:
+The response returns all collected nodes across the full transitive
+closure, each identified by its content-addressed hash. The traversal
+follows data flow across function boundaries — when an argument traces
+back to a caller's parameter, the query continues through that caller's
+call sites and their origins, recursively, until every path terminates
+at a node with no incoming data flow:
 
 ```json
 {
@@ -1601,8 +1605,36 @@ content-addressed hash:
   ],
   "origins": [
     { "id": "1a2b...", "kind": "parameter", "name": "user_pos",
-      "function": "render_map" },
+      "function": "render_map",
+      "upstream": {
+        "call_sites": [
+          { "id": "aa01...", "function": "handle_click", "line": 18 },
+          { "id": "aa02...", "function": "pan_viewport", "line": 7 }
+        ],
+        "arguments": [
+          { "id": "ab01...", "call_site": "aa01...", "expr": "click_pos" },
+          { "id": "ab02...", "call_site": "aa02...", "expr": "center" }
+        ],
+        "origins": [
+          { "id": "ac01...", "kind": "external_boundary",
+            "source": "event_handler", "type": "deserialize(ClickEvent).pos",
+            "function": "handle_click" },
+          { "id": "ac02...", "kind": "field_access",
+            "expr": "viewport.center", "function": "pan_viewport",
+            "upstream": {
+              "origins": [
+                { "id": "ac03...", "kind": "parameter", "name": "viewport",
+                  "function": "pan_viewport",
+                  "upstream": { "...": "continues transitively" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
     { "id": "3c4d...", "kind": "let_binding", "name": "coords",
+      "expr": "List.map(points, fn(p) -> [p.x, p.y])",
       "function": "find_nearest" },
     { "id": "5e6f...", "kind": "literal", "value": "[1.0, 2.0]",
       "function": "test_get_location" }
@@ -1610,15 +1642,23 @@ content-addressed hash:
 }
 ```
 
-From this single response, the LLM can categorize each origin and plan
-the refactor:
+From this single response, the LLM has the complete picture and can
+categorize each terminal node to plan the refactor:
 
-- **Literals** (like `[1.0, 2.0]`): replace with a `Point2D` constructor.
-- **Let bindings** (like `coords`): retype at their declaration.
-- **Function parameters** (like `user_pos` in `render_map`): require their
-  own propagation analysis — the LLM issues another graph query anchored
-  on `render_map.user_pos` to find *its* callers and origins, repeating
-  until the frontier closes.
+- **Literals** (like `[1.0, 2.0]`): replace with a `Point2D` constructor
+  directly.
+- **Let bindings with intermediate expressions** (like `coords` computed
+  via `List.map`): the binding's type changes, and the expression may
+  need syntactic adjustment (e.g., `[p.x, p.y]` becomes `Point2D(p.x,
+  p.y)`).
+- **External boundaries** (like `deserialize(ClickEvent).pos`): indicate
+  that the type change has reached an API or serialization boundary. The
+  LLM must decide whether to change the external format (updating the
+  `ClickEvent` schema) or insert a conversion at the boundary.
+- **Intermediate parameters** that appear along the path (like `user_pos`
+  in `render_map`) are not terminal — the query has already traversed
+  through them. Their type annotations will need updating, but the LLM
+  does not need to issue follow-up queries to discover their callers.
 
 Node IDs serve as stable handles for all subsequent write operations.
 The LLM uses these IDs to target specific nodes when submitting working

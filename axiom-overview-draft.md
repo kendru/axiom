@@ -284,6 +284,7 @@ program.axm-image/
     types.idx                # type and effect index for structural queries
   history/
     operations.log           # ordered log of all edits, transforms, and verifications
+    snapshots/               # periodic full snapshots (root hash + index state)
   cache/
     compiled.wasm            # pre-compiled deployment artifact
     merkle.db                # cached Merkle tree structure for fast traversal
@@ -305,6 +306,14 @@ program.axm-image/
   "modified lines 47-52 of server.axm". Because the IR is content-addressed,
   any historical state can be reconstructed from the operation log and the
   (garbage-collected) node store.
+- **Operations are undoable.** Each operation in the log records enough
+  information to reverse it — the previous root hash, the replaced node
+  hashes, and the prior index state. Undo is a first-class operation, not
+  a convention. Additionally, the image periodically records **snapshots**
+  (a root hash plus index state) so that navigating to an arbitrary point
+  in history does not require replaying the entire operation log from the
+  beginning. This is especially important for long-lived projects where
+  the operation log may contain thousands of entries.
 - **Images are portable.** An image is a self-contained archive (e.g., a
   tarball) that can be shared, inspected with standard tools (`tar tf`),
   and reconstituted on any machine with an Axiom toolchain.
@@ -1501,55 +1510,127 @@ image's cached graph indexes for performance.
 
 The key insight is that reads in Axiom are graph-shaped, not file-shaped.
 Instead of "show me the file containing function F," the natural question
-is "show me every node that contributes to the behavior of function F
-when called with parameter type P."
+is "show me the transitive closure of all nodes affected by changing
+parameter P of function F." The MCP server does not interpret natural
+language — queries are structured graph traversals with explicit anchors,
+edge types, directions, and collection points.
 
-**`query upstream <node> [--filter <predicate>]`** — Return all nodes
-that the given node depends on (transitively), optionally filtered:
+**Query structure:** A graph query specifies:
 
+- An **anchor** node (identified by label and properties).
+- A sequence of **traversals**, each specifying an edge type, direction,
+  optional filter, and a collection name for matched nodes.
+- Traversals can be **nested** (`follow`) to walk multiple edge types
+  in a single query.
+- A `depth` field controls whether traversal is single-hop or transitive.
+- A `terminal_when` field specifies stopping conditions for transitive
+  traversals.
+
+**Edge types in the IR graph include:**
+
+- `HAS_PARAM` — function → parameter definition
+- `HAS_ARGUMENT` — call site → argument expression
+- `CALLS` — function → function (or call site → callee)
+- `DATA_FLOW` — expression → expression (value flows from source to sink)
+- `HAS_TYPE` — node → type annotation
+- `PERFORMS` — function → effect operation
+- `HANDLES` — handler → effect operation
+- `REFERENCES` — node → type, effect, or module
+
+**Worked example: analyzing a parameter type change.** Suppose the user
+asks the LLM to change the `loc` parameter of `get_location` from
+`Vec<Float64>` to `Point2D`. The LLM needs the complete transitive closure
+of affected nodes — the parameter definition, every call site, every
+argument passed as `loc`, and every origin of those arguments recursively
+until it hits literals or external boundaries. This should be a single
+query, not an iterative exploration:
+
+```json
+{
+  "tool": "query_codebase_graph",
+  "arguments": {
+    "anchor": {
+      "label": "Function",
+      "properties": { "name": "get_location" }
+    },
+    "traverse": [
+      {
+        "edge": "HAS_PARAM",
+        "direction": "out",
+        "filter": { "name": "loc" },
+        "collect": "param"
+      },
+      {
+        "edge": "CALLS",
+        "direction": "in",
+        "collect": "call_sites",
+        "follow": {
+          "edge": "HAS_ARGUMENT",
+          "direction": "out",
+          "filter": { "param": "loc" },
+          "collect": "arguments",
+          "follow": {
+            "edge": "DATA_FLOW",
+            "direction": "in",
+            "depth": "transitive",
+            "collect": "origins",
+            "terminal_when": "no_incoming_data_flow"
+          }
+        }
+      }
+    ]
+  }
+}
 ```
-> query upstream kv_store.get_key --filter "passes String into"
 
-Upstream subgraph (4 nodes):
-  kv_store.get_key        — receives key: String
-  kv_store.validate_key   — called with key: String
-  core.String.is_empty    — called with key: String
-  core.String.trim        — called with key: String (via validate_key)
+The response returns all collected nodes, each identified by its
+content-addressed hash:
+
+```json
+{
+  "param": [{ "id": "a3f8...", "name": "loc", "type": "Vec<Float64>" }],
+  "call_sites": [
+    { "id": "b7c2...", "function": "render_map", "line": 34 },
+    { "id": "d1e5...", "function": "find_nearest", "line": 12 },
+    { "id": "f9a0...", "function": "test_get_location", "line": 7 }
+  ],
+  "arguments": [
+    { "id": "c4d1...", "call_site": "b7c2...", "expr": "user_pos" },
+    { "id": "e6f3...", "call_site": "d1e5...", "expr": "coords" },
+    { "id": "a2b8...", "call_site": "f9a0...", "expr": "[1.0, 2.0]" }
+  ],
+  "origins": [
+    { "id": "1a2b...", "kind": "parameter", "name": "user_pos",
+      "function": "render_map" },
+    { "id": "3c4d...", "kind": "let_binding", "name": "coords",
+      "function": "find_nearest" },
+    { "id": "5e6f...", "kind": "literal", "value": "[1.0, 2.0]",
+      "function": "test_get_location" }
+  ]
+}
 ```
 
-**`query downstream <node>`** — Return all nodes that depend on the
-given node (callers, type references, effect handlers):
+From this single response, the LLM can categorize each origin and plan
+the refactor:
 
-```
-> query downstream KVError
+- **Literals** (like `[1.0, 2.0]`): replace with a `Point2D` constructor.
+- **Let bindings** (like `coords`): retype at their declaration.
+- **Function parameters** (like `user_pos` in `render_map`): require their
+  own propagation analysis — the LLM issues another graph query anchored
+  on `render_map.user_pos` to find *its* callers and origins, repeating
+  until the frontier closes.
 
-Downstream subgraph (5 nodes):
-  kv_store.get_key      — performs Throw<KVError>
-  kv_store.delete_key   — performs Throw<KVError>
-  app.main              — handles Throw<KVError>
-  kv_store_test         — handles Throw<KVError>
-  monitoring.log_error  — pattern matches on KVError variants
-```
+Node IDs serve as stable handles for all subsequent write operations.
+The LLM uses these IDs to target specific nodes when submitting working
+form replacements via the MCP server.
 
-**`query surface <change-description>`** — Given a proposed change,
-compute the full surface area of the refactor — every node that would
-need to be inspected or modified:
-
-```
-> query surface "change parameter type of kv_store.get_key from String to Key"
-
-Refactor surface (7 nodes):
-  kv_store.get_key          — parameter type changes
-  kv_store.validate_key     — receives key, type propagates
-  app.main                  — passes String literal, needs Key construction
-  app.handle_request        — passes String, needs Key construction
-  kv_store_test.test_get_*  — 3 test functions pass String literals
-```
-
-These graph queries return sets of content-addressed node hashes that can
-be individually inspected, emitted as working form text, or passed to
-transform commands. They are the foundation of Axiom's refactoring
-workflow: understand the blast radius before making changes.
+**Initial discovery.** For cases where the LLM does not already know
+which node to anchor on — e.g., "find all functions related to
+authentication" — the image's full-text and vector indexes support
+keyword and semantic search as a discovery step. These searches return
+node IDs that can then be used as anchors for structured graph queries.
+The MCP server itself performs no AI inference; the indexes are
+pre-computed and cached in the image.
 
 ### 11.3 Transform Commands
 
@@ -1878,12 +1959,13 @@ In Axiom, version control is an intrinsic property of the system:
   node store means delta computation is efficient — only nodes with new
   hashes need to be transmitted.
 
-This model renders tools like GitHub less useful for Axiom code, and that
-is by design. Text-based version control assumes that the canonical
-representation of a program is a collection of text files. Axiom's
-canonical representation is a content-addressed graph, and its version
-control, collaboration, and distribution mechanisms follow from that
-foundation rather than being bolted on after the fact.
+This model represents a fundamentally different approach to version control
+and collaboration. Text-based tools assume that the canonical representation
+of a program is a collection of text files. Axiom's canonical representation
+is a content-addressed graph, and its version control, collaboration, and
+distribution mechanisms follow from that foundation rather than being bolted
+on after the fact. Axiom will need its own collaboration infrastructure
+designed around image exchange and graph-level operations.
 
 ### 12.7 Bootstrapping Path
 

@@ -86,21 +86,46 @@ transformations.
 
 The binary IR is the ground truth. It is a compact, versioned, binary encoding
 of the fully elaborated abstract syntax tree. Every program is stored and
-transmitted in this form.
+transmitted in this form. The binary IR is not a file format in the traditional
+sense — it is a content-addressed graph of fragments that can be assembled,
+queried, and transformed without ever materializing as a single flat file.
 
 **Properties:**
 
 - Fully type-annotated (all inference results are materialized).
-- Every node carries a unique content-addressed identifier.
+- Every node carries a unique content-addressed identifier (Merkle hash).
 - Effects are fully resolved — every `perform` is linked to its declared effect.
 - Deterministic serialization — the same program always produces the same bytes.
 - Designed for tooling: diffing, merging, refactoring, and analysis operate on
   the binary IR directly.
 
+**Content-addressing and Merkle structure:** Each node's identifier is a
+cryptographic hash of its own data plus the hashes of its children (Merkle
+tree). This means:
+
+- Structurally identical subtrees share the same hash and are automatically
+  deduplicated.
+- Any change to a node propagates new hashes upward to the root, making
+  tampering or corruption detectable.
+- Nodes are independently addressable fragments — a function, a type
+  definition, or even a single pattern match arm can be referenced, fetched,
+  and cached by its hash alone.
+- Garbage collection reclaims unreachable fragments. When a refactor replaces
+  a subtree, the old nodes become unreferenced and are eligible for collection.
+
+**Header node:** Every complete program or library has a well-known header node
+that serves as the root of the graph. For executable programs, the header node
+references the main entry function plus metadata: target platform, required
+top-level effect handlers, compiler version, and any other program-level
+configuration. The header node is the starting point for all traversals — the
+equivalent of an ELF entry point, but richer.
+
 **Design rationale:** A binary canonical form means the working form and review
 form can evolve independently. Syntax experiments, new keyword schemes, different
 visual layouts — none of these require migrating stored programs. The IR is the
-stable foundation.
+stable foundation. Content-addressing makes the IR inherently versionable without
+external version control — every historical state of the program is a different
+root hash.
 
 **Encoding strategy:** The IR is a tagged, tree-structured binary format.
 Each node is prefixed with a type tag (1 byte), followed by child references
@@ -128,6 +153,20 @@ boundaries, with visual structure that aids scope recognition.
 research may reveal that alternative syntaxes are more effective. The three-layer
 architecture allows the working form to evolve without breaking programs. Multiple
 working forms can coexist — the binary IR is the source of truth.
+
+**Grain of authoring.** The typical unit of authoring is a function or module,
+not individual AST nodes. When an LLM writes a new feature, it often produces
+an entire module as working form text that is parsed and elaborated into the IR.
+When editing, the grain is usually a function: the LLM rewrites a function body,
+and the system replaces the corresponding subtree in the IR graph. More granular
+edits (e.g., changing a single parameter type) are possible but less common in
+direct authoring — they are more typical of system-initiated cascading transforms
+(see Section 11).
+
+The working form remains critical even though the canonical representation is a
+binary graph. It surfaces language semantics in a way that is far easier to
+reason about than raw binary AST structure, and it is the form that LLMs are
+most effective at producing and understanding.
 
 ### 2.3 Layer 3: Review Form (Human-Optimized)
 
@@ -216,11 +255,81 @@ Working Form ──parse──▶ AST ──elaborate──▶ Binary IR ──e
                                                ├──emit──▶ Review Form (Rust-like)
                                                ├──emit──▶ Review Form (TypeScript-like)
                                                │
-                                               └──compile──▶ WebAssembly
+                                               ├──compile──▶ WebAssembly (deployment artifact)
+                                               │
+                                               └──snapshot──▶ Image (development artifact)
 ```
 
 All transformations are deterministic and lossless (between IR and any text form).
 The binary IR preserves all information needed to reconstruct any surface syntax.
+
+### 2.5 The Image (Development-Time Representation)
+
+While the binary IR defines the canonical form of a program's semantics, the
+**image** is the canonical form of a development workspace. An image is an
+archive that bundles the IR fragments together with derived data structures,
+indexes, and operational history that make the system usable for interactive
+development.
+
+**Image contents:**
+
+```
+program.axm-image/
+  manifest.json              # image version, root hash, node count, index inventory
+  nodes/                     # content-addressed IR fragments (the source of truth)
+  indexes/
+    graph.db                 # dependency graph, caller/callee relationships
+    fulltext.idx             # full-text search index over working form text
+    vectors.idx              # vector embeddings for semantic search
+    types.idx                # type and effect index for structural queries
+  history/
+    operations.log           # ordered log of all edits, transforms, and verifications
+    snapshots/               # periodic full snapshots (root hash + index state)
+  cache/
+    compiled.wasm            # pre-compiled deployment artifact
+    merkle.db                # cached Merkle tree structure for fast traversal
+```
+
+**Key design decisions:**
+
+- **The IR nodes are the source of truth.** Everything else in the image is
+  derived and can be regenerated from the nodes alone — at the cost of time.
+  The indexes and caches exist to make interactive development fast.
+- **Graph indexes are not part of the IR.** The dependency graph, caller maps,
+  and other structural indexes are computed from the IR and cached in the image.
+  They accelerate graph-structured queries (see Section 11) but are not
+  themselves content-addressed or versioned.
+- **Operation history replaces version control.** The image records an ordered
+  log of every edit, transform, and verification. This serves the role that
+  git history serves for text-based projects, but at the semantic level — "changed
+  parameter type of `process_request` from `String` to `RequestBody`" rather than
+  "modified lines 47-52 of server.axm". Because the IR is content-addressed,
+  any historical state can be reconstructed from the operation log and the
+  (garbage-collected) node store.
+- **Operations are undoable.** Each operation in the log records enough
+  information to reverse it — the previous root hash, the replaced node
+  hashes, and the prior index state. Undo is a first-class operation, not
+  a convention. Additionally, the image periodically records **snapshots**
+  (a root hash plus index state) so that navigating to an arbitrary point
+  in history does not require replaying the entire operation log from the
+  beginning. This is especially important for long-lived projects where
+  the operation log may contain thousands of entries.
+- **Images are portable.** An image is a self-contained archive (e.g., a
+  tarball) that can be shared, inspected with standard tools (`tar tf`),
+  and reconstituted on any machine with an Axiom toolchain.
+
+**Image vs. deployment artifact:** The image is the development-time
+representation. It contains everything needed to continue working on a program:
+source IR, indexes, history, caches. The deployment artifact is a compiled
+binary — initially WebAssembly — that contains only what is needed to run.
+The two serve fundamentally different purposes and have different lifecycles.
+
+**Future direction: live images.** In testing and staging scenarios, it may be
+valuable to deploy a live image rather than a compiled binary. A live image
+would retain the full IR graph and indexes at runtime, enabling runtime
+introspection, hot-patching, and interactive debugging at the semantic level —
+similar to Smalltalk images or Common Lisp cores. This is a future initiative,
+not part of the initial design.
 
 ---
 
@@ -1221,31 +1330,41 @@ Map.remove  : forall K V. (K, Map<K, V>) -> Map<K, V> ! pure
 
 ---
 
-## 11. System Interaction Commands
+## 11. System Interaction: The MCP Server
 
-Axiom is a programming *system*, not just a language with a compiler. While
-the LLM writes code primarily as text in the working form, reading,
-reasoning about, and refactoring code often benefits from structured
-commands that return precisely the information needed without dumping
+Axiom is a programming *system*, not just a language with a compiler. The
+primary interface for LLM interaction is an **MCP (Model Context Protocol)
+server** that exposes the image's full capabilities as structured tool calls.
+While the LLM writes code primarily as text in the working form, reading,
+reasoning about, and refactoring code operates through the MCP server, which
+provides targeted access to the IR graph and its indexes without dumping
 entire modules into context.
 
-The system provides three categories of built-in commands: **query**
-(extract targeted information from the codebase), **transform** (apply
-structured modifications), and **verify** (check invariants and
-properties). These commands operate on the binary IR and return compact,
-semantically rich responses.
+The MCP server encourages a **graph-shaped workflow**: rather than treating
+a program as a collection of text files to be read and written sequentially,
+the LLM interacts with a live graph of content-addressed fragments. It can
+query upstream dependencies, trace effect propagation, apply cascading
+transforms, and validate invariants — all through structured tool calls that
+operate on the IR graph and leverage the image's cached indexes.
+
+The server provides three categories of tools: **query** (extract targeted
+information from the IR graph), **transform** (apply structured modifications
+that cascade through the graph), and **verify** (check invariants and
+properties). These tools operate on the binary IR within the image and return
+compact, semantically rich responses.
 
 ### 11.1 Design Rationale
 
-The problem these commands solve is context pollution. When an LLM needs
+The problem these tools solve is context pollution. When an LLM needs
 to answer "what effects does this module require?" the naive approach is
 to read the entire module source. For a large module, this consumes
 thousands of tokens — most of which are irrelevant function bodies. A
 structured query returns just the answer: a list of effect signatures.
 
-The principle: **write code as text, inspect code via commands.** The
-working form is optimized for authoring. The command interface is optimized
-for targeted retrieval and mechanical transformation.
+The principle: **write code as text, inspect and refactor code via graph
+operations.** The working form is optimized for authoring. The MCP server
+is optimized for targeted retrieval, graph traversal, and mechanical
+transformation.
 
 ### 11.2 Query Commands
 
@@ -1381,6 +1500,177 @@ module http_client
   pub fn post(url: Url, body: Bytes) -> HttpResponse ! {Net, Throw<HttpError>, Log}
   pub fn head(url: Url) -> HttpResponse ! {Net, Throw<HttpError>, Log}
 ```
+
+### 11.2.1 Graph-Structured Queries
+
+Beyond the targeted queries above, the MCP server supports general
+**graph-structured queries** that traverse the IR's dependency graph and
+return subgraphs of content-addressed nodes. These queries leverage the
+image's cached graph indexes for performance.
+
+The key insight is that reads in Axiom are graph-shaped, not file-shaped.
+Instead of "show me the file containing function F," the natural question
+is "show me the transitive closure of all nodes affected by changing
+parameter P of function F." The MCP server does not interpret natural
+language — queries are structured graph traversals with explicit anchors,
+edge types, directions, and collection points.
+
+**Query structure:** A graph query specifies:
+
+- An **anchor** node (identified by label and properties).
+- A sequence of **traversals**, each specifying an edge type, direction,
+  optional filter, and a collection name for matched nodes.
+- Traversals can be **nested** (`follow`) to walk multiple edge types
+  in a single query.
+- A `depth` field controls whether traversal is single-hop or transitive.
+- A `terminal_when` field specifies stopping conditions for transitive
+  traversals.
+
+**Edge types in the IR graph include:**
+
+- `HAS_PARAM` — function → parameter definition
+- `HAS_ARGUMENT` — call site → argument expression
+- `CALLS` — function → function (or call site → callee)
+- `DATA_FLOW` — expression → expression (value flows from source to sink)
+- `HAS_TYPE` — node → type annotation
+- `PERFORMS` — function → effect operation
+- `HANDLES` — handler → effect operation
+- `REFERENCES` — node → type, effect, or module
+
+**Worked example: analyzing a parameter type change.** Suppose the user
+asks the LLM to change the `loc` parameter of `get_location` from
+`Vec<Float64>` to `Point2D`. The LLM needs the complete transitive closure
+of affected nodes — the parameter definition, every call site, every
+argument passed as `loc`, and every origin of those arguments recursively
+until it hits literals or external boundaries. This should be a single
+query, not an iterative exploration:
+
+```json
+{
+  "tool": "query_codebase_graph",
+  "arguments": {
+    "anchor": {
+      "label": "Function",
+      "properties": { "name": "get_location" }
+    },
+    "traverse": [
+      {
+        "edge": "HAS_PARAM",
+        "direction": "out",
+        "filter": { "name": "loc" },
+        "collect": "param"
+      },
+      {
+        "edge": "CALLS",
+        "direction": "in",
+        "collect": "call_sites",
+        "follow": {
+          "edge": "HAS_ARGUMENT",
+          "direction": "out",
+          "filter": { "param": "loc" },
+          "collect": "arguments",
+          "follow": {
+            "edge": "DATA_FLOW",
+            "direction": "in",
+            "depth": "transitive",
+            "collect": "origins",
+            "terminal_when": "no_incoming_data_flow"
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+The response returns all collected nodes across the full transitive
+closure, each identified by its content-addressed hash. The traversal
+follows data flow across function boundaries — when an argument traces
+back to a caller's parameter, the query continues through that caller's
+call sites and their origins, recursively, until every path terminates
+at a node with no incoming data flow:
+
+```json
+{
+  "param": [{ "id": "a3f8...", "name": "loc", "type": "Vec<Float64>" }],
+  "call_sites": [
+    { "id": "b7c2...", "function": "render_map", "line": 34 },
+    { "id": "d1e5...", "function": "find_nearest", "line": 12 },
+    { "id": "f9a0...", "function": "test_get_location", "line": 7 }
+  ],
+  "arguments": [
+    { "id": "c4d1...", "call_site": "b7c2...", "expr": "user_pos" },
+    { "id": "e6f3...", "call_site": "d1e5...", "expr": "coords" },
+    { "id": "a2b8...", "call_site": "f9a0...", "expr": "[1.0, 2.0]" }
+  ],
+  "origins": [
+    { "id": "1a2b...", "kind": "parameter", "name": "user_pos",
+      "function": "render_map",
+      "upstream": {
+        "call_sites": [
+          { "id": "aa01...", "function": "handle_click", "line": 18 },
+          { "id": "aa02...", "function": "pan_viewport", "line": 7 }
+        ],
+        "arguments": [
+          { "id": "ab01...", "call_site": "aa01...", "expr": "click_pos" },
+          { "id": "ab02...", "call_site": "aa02...", "expr": "center" }
+        ],
+        "origins": [
+          { "id": "ac01...", "kind": "external_boundary",
+            "source": "event_handler", "type": "deserialize(ClickEvent).pos",
+            "function": "handle_click" },
+          { "id": "ac02...", "kind": "field_access",
+            "expr": "viewport.center", "function": "pan_viewport",
+            "upstream": {
+              "origins": [
+                { "id": "ac03...", "kind": "parameter", "name": "viewport",
+                  "function": "pan_viewport",
+                  "upstream": { "...": "continues transitively" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    { "id": "3c4d...", "kind": "let_binding", "name": "coords",
+      "expr": "List.map(points, fn(p) -> [p.x, p.y])",
+      "function": "find_nearest" },
+    { "id": "5e6f...", "kind": "literal", "value": "[1.0, 2.0]",
+      "function": "test_get_location" }
+  ]
+}
+```
+
+From this single response, the LLM has the complete picture and can
+categorize each terminal node to plan the refactor:
+
+- **Literals** (like `[1.0, 2.0]`): replace with a `Point2D` constructor
+  directly.
+- **Let bindings with intermediate expressions** (like `coords` computed
+  via `List.map`): the binding's type changes, and the expression may
+  need syntactic adjustment (e.g., `[p.x, p.y]` becomes `Point2D(p.x,
+  p.y)`).
+- **External boundaries** (like `deserialize(ClickEvent).pos`): indicate
+  that the type change has reached an API or serialization boundary. The
+  LLM must decide whether to change the external format (updating the
+  `ClickEvent` schema) or insert a conversion at the boundary.
+- **Intermediate parameters** that appear along the path (like `user_pos`
+  in `render_map`) are not terminal — the query has already traversed
+  through them. Their type annotations will need updating, but the LLM
+  does not need to issue follow-up queries to discover their callers.
+
+Node IDs serve as stable handles for all subsequent write operations.
+The LLM uses these IDs to target specific nodes when submitting working
+form replacements via the MCP server.
+
+**Initial discovery.** For cases where the LLM does not already know
+which node to anchor on — e.g., "find all functions related to
+authentication" — the image's full-text and vector indexes support
+keyword and semantic search as a discovery step. These searches return
+node IDs that can then be used as anchors for structured graph queries.
+The MCP server itself performs no AI inference; the indexes are
+pre-computed and cached in the image.
 
 ### 11.3 Transform Commands
 
@@ -1533,34 +1823,46 @@ or:
 
 ### 11.5 Interaction Model
 
-The expected workflow is:
+The MCP server defines the expected workflow:
 
-1. **Author:** The LLM writes code in the working form text. This is the
-   primary mode — most code is written and edited as text, just as it
-   would be in any language.
+1. **Author:** The LLM writes code in the working form text and submits it
+   to the MCP server, which parses and elaborates it into the IR graph.
+   The typical grain is a function or module. For new programs or large
+   features, the LLM may produce an entire module as text in a single
+   operation.
 
 2. **Inspect:** When the LLM needs to understand existing code for
-   composition, refactoring, or debugging, it uses query commands to
+   composition, refactoring, or debugging, it uses query tools to
    retrieve precisely the information it needs. `query interface` to
    understand a module's API. `query effect-flow` to trace side effects.
-   `query callers` to find impact of a change. This avoids reading entire
-   modules into context.
+   `query upstream` and `query surface` to understand the blast radius
+   of a change. This avoids reading entire modules into context.
 
 3. **Transform:** For mechanical refactoring operations (rename, extract,
-   mock generation), the LLM invokes transform commands rather than
-   manually rewriting code. The system applies the change consistently
-   across all references.
+   mock generation, cascading type changes), the LLM invokes transform
+   tools rather than manually rewriting code. The system applies the
+   change consistently across all references in the IR graph. Cascading
+   transforms — such as changing a parameter type and propagating the
+   change to all callers — are a first-class capability enabled by the
+   graph structure.
 
 4. **Validate:** After writing or transforming code, the LLM runs verify
-   commands to confirm correctness. `verify types` and `verify effects`
+   tools to confirm correctness. `verify types` and `verify effects`
    are the most common. The compact error output gives the LLM just
    enough information to locate and fix problems without re-reading the
    entire codebase.
 
-These commands are designed to be invokable as tool calls (in the MCP
-or similar agentic protocol sense) — each takes structured input and
-returns structured output. The LLM does not need to parse natural
-language responses from the system.
+All tools take structured input (node hashes, module names, type
+expressions) and return structured output (node sets, diagnostic lists,
+diff summaries). The MCP protocol ensures that the LLM never needs to
+parse natural language responses from the system.
+
+**Text files as import/export.** While it is possible to write an Axiom
+program in a text file and compile it into the IR, this is not the
+typical workflow. The typical workflow is interactive: modules, functions,
+and other nodes are created and modified via the MCP server, which
+maintains the image. Text files serve as an import path (for bootstrapping
+or migration) and an export path (for review forms or archival).
 
 ### 11.6 Testing via Effects
 
@@ -1594,7 +1896,8 @@ module kv_store_test {
 
 The binary IR is content-addressed and dependency-tracked. When the LLM
 modifies a module, the system determines the minimal set of modules that
-need recompilation and reports the result:
+need recompilation using the image's cached dependency graph and reports
+the result:
 
 ```
 > verify types
@@ -1603,6 +1906,12 @@ Recompiling: kv_store (modified), app (depends on kv_store)
 Skipping: http_client, json_parser (unchanged, no transitive dependency)
 
 ✓ All types check.
+```
+
+Because the image maintains the Merkle tree and graph indexes, incremental
+compilation is a natural consequence of the architecture rather than a
+separate optimization. Changed nodes produce new hashes, and the dependency
+graph identifies exactly which downstream nodes need re-elaboration.
 
 ---
 
@@ -1664,7 +1973,41 @@ efficiency hypothesis. Key metrics:
 - Round-trip fidelity: LLM reads working form, modifies it, and the
   result compiles without type errors.
 
-### 12.6 Bootstrapping Path
+### 12.6 Version Control and Collaboration
+
+The image model represents a deliberate departure from text-file-based version
+control. Traditional tools like git operate on line diffs of text files — a
+model that is increasingly strained by AI-driven development where changes
+are semantic, not textual.
+
+In Axiom, version control is an intrinsic property of the system:
+
+- **The IR is already content-addressed.** Every historical state of the
+  program is a different root hash. "Rolling back" means pointing to a
+  previous root, not running `git revert`.
+- **Operation history is semantic.** The image's operation log records
+  edits at the level of "renamed `get_key` to `lookup`" or "added parameter
+  `timeout: Duration` to `http_client.get`" — not "changed lines 47-52."
+  This makes history meaningful to both humans and LLMs.
+- **Branching and merging operate on graphs.** Because nodes are content-
+  addressed, merging two branches of development is a graph operation:
+  nodes that share the same hash are identical and need no reconciliation.
+  Conflicts are structural (two branches modified the same node) rather
+  than textual (two branches modified the same line).
+- **Distribution is image sharing.** Collaborators exchange images (or
+  deltas between images) rather than text patches. The content-addressed
+  node store means delta computation is efficient — only nodes with new
+  hashes need to be transmitted.
+
+This model represents a fundamentally different approach to version control
+and collaboration. Text-based tools assume that the canonical representation
+of a program is a collection of text files. Axiom's canonical representation
+is a content-addressed graph, and its version control, collaboration, and
+distribution mechanisms follow from that foundation rather than being bolted
+on after the fact. Axiom will need its own collaboration infrastructure
+designed around image exchange and graph-level operations.
+
+### 12.7 Bootstrapping Path
 
 The long-term goal is for Axiom to be self-hosting: the compiler is
 written in Axiom, compiled to WASM, and runs on the Zig runtime.

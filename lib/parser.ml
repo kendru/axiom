@@ -1,8 +1,4 @@
-(** Axiom working-form parser.
-
-    Recursive-descent parser. All parsing functions are mutually
-    recursive in a single [let rec ... and ...] block so that
-    patterns and expressions can freely cross-reference each other. *)
+(** Axiom working-form parser. Recursive-descent. *)
 
 open Lexer
 open Ast
@@ -11,15 +7,11 @@ open Ast
 (* Parser state                                                         *)
 (* ------------------------------------------------------------------ *)
 
-type state = {
-  mutable tokens : token list;
-}
+type state = { mutable tokens : token list }
 
 let make_state tokens = { tokens }
 
-let peek st = match st.tokens with
-  | []     -> None
-  | t :: _ -> Some t
+let peek st = match st.tokens with [] -> None | t :: _ -> Some t
 
 let advance st = match st.tokens with
   | []      -> failwith "Parser.advance: unexpected end of input"
@@ -36,31 +28,65 @@ let consume st expected =
                 pp_token expected)
 
 (* ------------------------------------------------------------------ *)
-(* Type expression parser (non-recursive with expressions)             *)
+(* Type expression, effect set, and param parsers (mutually recursive) *)
 (* ------------------------------------------------------------------ *)
 
 let rec parse_type_expr (st : state) : type_expr =
-  let name = match peek st with
-    | Some (Ident s) | Some (CtorIdent s) -> advance st; s
-    | Some t ->
-      failwith (Format.asprintf "Parser: expected type name, got %a" pp_token t)
-    | None -> failwith "Parser: expected type name, got end of input"
-  in
   match peek st with
-  | Some LAngle ->
+  | Some LParen ->
     advance st;
-    let first = parse_type_expr st in
-    let rest  = parse_type_args_rest st in
-    consume st RAngle;
-    TyApp (name, first :: rest)
-  | _ -> TyName name
+    (match peek st with
+     | Some RParen ->
+       (* () -> T ! E  — zero-parameter function type *)
+       advance st;
+       consume st Arrow;
+       let ret = parse_type_expr st in
+       consume st Bang;
+       let eff = parse_effect_set st in
+       TyFun ([], ret, Some eff)
+     | _ ->
+       (* Could be a tuple (T1, T2) or function type (T1, T2) -> T ! E.
+          Peek: if next token is 'ident :' it's a named-param function type. *)
+       let is_fn_type = match st.tokens with
+         | (Ident _ | CtorIdent _) :: Colon :: _ -> true
+         | _ -> false
+       in
+       if is_fn_type then begin
+         let params = parse_params st in
+         consume st RParen;
+         consume st Arrow;
+         let ret = parse_type_expr st in
+         consume st Bang;
+         let eff = parse_effect_set st in
+         TyFun (List.map (fun p -> p.param_type) params, ret, Some eff)
+       end else begin
+         let first = parse_type_expr st in
+         let rest  = parse_type_args_rest st in
+         consume st RParen;
+         match rest with
+         | [] -> first          (* (T) is parenthesised T *)
+         | _  -> TyTuple (first :: rest)
+       end)
+  | Some (Ident s) | Some (CtorIdent s) ->
+    advance st;
+    (match peek st with
+     | Some LAngle ->
+       advance st;
+       let first = parse_type_expr st in
+       let rest  = parse_type_args_rest st in
+       consume st RAngle;
+       TyApp (s, first :: rest)
+     | _ -> TyName s)
+  | Some t ->
+    failwith (Format.asprintf "Parser: expected type name, got %a" pp_token t)
+  | None -> failwith "Parser: expected type name, got end of input"
 
 and parse_type_args_rest (st : state) : type_expr list =
   match peek st with
   | Some Comma -> advance st; let t = parse_type_expr st in t :: parse_type_args_rest st
   | _          -> []
 
-let parse_effect_set (st : state) : effect_set =
+and parse_effect_set (st : state) : effect_set =
   match peek st with
   | Some Pure   -> advance st; Ast.Pure
   | Some LBrace ->
@@ -76,7 +102,7 @@ let parse_effect_set (st : state) : effect_set =
     failwith (Format.asprintf "Parser: expected effect set, got %a" pp_token t)
   | None -> failwith "Parser: expected effect set, got end of input"
 
-let parse_param (st : state) : param =
+and parse_param (st : state) : param =
   let name = match peek st with
     | Some (Ident s) -> advance st; s
     | Some t ->
@@ -87,12 +113,10 @@ let parse_param (st : state) : param =
   let ty = parse_type_expr st in
   { param_name = name; param_type = ty }
 
-let rec parse_params (st : state) : param list =
+and parse_params (st : state) : param list =
   match peek st with
   | Some RParen -> []
-  | _ ->
-    let first = parse_param st in
-    first :: parse_params_rest st
+  | _ -> let first = parse_param st in first :: parse_params_rest st
 
 and parse_params_rest (st : state) : param list =
   match peek st with
@@ -100,9 +124,11 @@ and parse_params_rest (st : state) : param list =
   | _          -> []
 
 (* ------------------------------------------------------------------ *)
-(* Mutually recursive expression + pattern parsers                     *)
+(* Mutually recursive pattern + expression parsers                     *)
 (* ------------------------------------------------------------------ *)
 
+(* parse_pattern parses a single atomic pattern (no or-pattern at top level).
+   Use parse_pattern_or in contexts that accept | inside a pattern. *)
 let rec parse_pattern (st : state) : pattern =
   match peek st with
   | Some (Ident "_")   -> advance st; Ast.PWild
@@ -115,7 +141,7 @@ let rec parse_pattern (st : state) : pattern =
         (match peek st with
          | Some RParen -> advance st; []
          | _ ->
-           let first = parse_pattern st in
+           let first = parse_pattern_or st in
            let rest  = parse_pat_args_rest st in
            consume st RParen;
            first :: rest)
@@ -130,21 +156,59 @@ let rec parse_pattern (st : state) : pattern =
   | Some LParen ->
     (match st.tokens with
      | _ :: RParen :: _ -> advance st; advance st; Ast.PLit LUnit
+     | _ :: _ ->
+       (* Parenthesised pattern *)
+       advance st;
+       let p = parse_pattern_or st in
+       consume st RParen;
+       p
      | _ -> failwith "Parser: unexpected '(' in pattern")
+  | Some LBrace ->
+    (* Record pattern: { f = p, g, .. } *)
+    advance st;
+    let (fields, open_) = parse_record_pat_fields st in
+    consume st RBrace;
+    Ast.PRecord (fields, open_)
   | Some t ->
     failwith (Format.asprintf "Parser: unexpected token in pattern: %a" pp_token t)
   | None -> failwith "Parser: unexpected end of input in pattern"
 
+and parse_pattern_or (st : state) : pattern =
+  let p = parse_pattern st in
+  match peek st with
+  | Some Pipe -> advance st; Ast.POr (p, parse_pattern_or st)
+  | _ -> p
+
 and parse_pat_args_rest (st : state) : pattern list =
   match peek st with
-  | Some Comma -> advance st; let p = parse_pattern st in p :: parse_pat_args_rest st
+  | Some Comma -> advance st; let p = parse_pattern_or st in p :: parse_pat_args_rest st
   | _          -> []
+
+and parse_record_pat_fields (st : state) : (string * pattern) list * bool =
+  match peek st with
+  | Some RBrace  -> ([], false)
+  | Some DotDot  -> advance st; ([], true)
+  | Some (Ident field) ->
+    advance st;
+    let pat = match peek st with
+      | Some Equal -> advance st; parse_pattern_or st
+      | _          -> Ast.PVar field   (* shorthand: field name as variable *)
+    in
+    (match peek st with
+     | Some Comma ->
+       advance st;
+       let (rest, open_) = parse_record_pat_fields st in
+       ((field, pat) :: rest, open_)
+     | _ -> ([(field, pat)], false))
+  | Some t ->
+    failwith (Format.asprintf "Parser: unexpected token in record pattern: %a" pp_token t)
+  | None -> failwith "Parser: unexpected end of input in record pattern"
 
 and parse_match_arms (st : state) : match_arm list =
   match peek st with
   | Some Pipe ->
     advance st;
-    let pattern  = parse_pattern st in
+    let pattern  = parse_pattern_or st in   (* or-patterns allowed in arms *)
     consume st FatArrow;
     let arm_body = parse_expr_state st in
     { pattern; arm_body } :: parse_match_arms st
@@ -167,8 +231,9 @@ and parse_op_handlers (st : state) : op_handler list * return_handler option =
     advance st;
     let return_var = match peek st with
       | Some (Ident s) -> advance st; s
-      | Some t -> failwith (Format.asprintf "Parser: expected var after 'return', got %a" pp_token t)
-      | None   -> failwith "Parser: expected var after 'return'"
+      | Some t ->
+        failwith (Format.asprintf "Parser: expected var after 'return', got %a" pp_token t)
+      | None -> failwith "Parser: expected var after 'return'"
     in
     consume st FatArrow;
     let return_body = parse_expr_state st in
@@ -200,29 +265,40 @@ and parse_handler_params (st : state) : string list =
   | None -> failwith "Parser: expected handler param"
 
 and parse_do_stmts (st : state) : do_stmt list =
-  (* Peek ahead: if next two tokens are 'let IDENT' it's a statement binding *)
-  match st.tokens with
-  | Let :: Ident name :: _ ->
-    advance st; advance st;       (* consume 'let' and name *)
+  (* A statement let uses a pattern: 'let pat = e ;'
+     We look for 'let' as the leading token. *)
+  match peek st with
+  | Some Let ->
+    (* peek ahead to see if there's a ';' later (i.e., it's a stmt not the final expr) *)
+    (* Strategy: parse 'let pat = expr' and then check for ';' *)
+    let saved = st.tokens in
+    advance st;   (* consume 'let' *)
+    let pat = parse_pattern_or st in
     consume st Equal;
     let value = parse_expr_state st in
-    consume st Semi;
-    Ast.StmtLet { name; value } :: parse_do_stmts st
+    (match peek st with
+     | Some Semi ->
+       advance st;
+       Ast.StmtLet { pat; value } :: parse_do_stmts st
+     | _ ->
+       (* No semicolon: this was NOT a statement binding.
+          We hit the final expression of the block but it starts with 'let'.
+          Restore and let parse_expr_state handle the whole thing. *)
+       st.tokens <- saved;
+       let e = parse_expr_state st in
+       [Ast.StmtExpr e])
   | _ ->
     let e = parse_expr_state st in
     (match peek st with
      | Some Semi ->
        advance st;
        Ast.StmtExpr e :: parse_do_stmts st
-     | _ ->
-       [Ast.StmtExpr e])
+     | _ -> [Ast.StmtExpr e])
 
 and parse_args (st : state) : expr list =
   match peek st with
   | Some RParen -> []
-  | _ ->
-    let first = parse_expr_state st in
-    first :: parse_args_rest st
+  | _ -> let first = parse_expr_state st in first :: parse_args_rest st
 
 and parse_args_rest (st : state) : expr list =
   match peek st with
@@ -233,7 +309,8 @@ and parse_letrec_binding (st : state) : Ast.letrec_binding =
   let letrec_name = match peek st with
     | Some (Ident s) -> advance st; s
     | Some t ->
-      failwith (Format.asprintf "Parser: expected identifier in letrec binding, got %a" pp_token t)
+      failwith (Format.asprintf "Parser: expected identifier in letrec binding, got %a"
+                  pp_token t)
     | None -> failwith "Parser: expected identifier in letrec binding"
   in
   consume st LParen;
@@ -247,7 +324,10 @@ and parse_letrec_binding (st : state) : Ast.letrec_binding =
 
 and parse_letrec_bindings_rest (st : state) : Ast.letrec_binding list =
   match peek st with
-  | Some Comma -> advance st; let b = parse_letrec_binding st in b :: parse_letrec_bindings_rest st
+  | Some Comma ->
+    advance st;
+    let b = parse_letrec_binding st in
+    b :: parse_letrec_bindings_rest st
   | _ -> []
 
 and parse_expr_state (st : state) : expr =
@@ -264,18 +344,12 @@ and parse_expr_state (st : state) : expr =
 
   | Some Let ->
     advance st;
-    let name = match peek st with
-      | Some (Ident s) -> advance st; s
-      | Some t ->
-        failwith (Format.asprintf "Parser: expected identifier after 'let', got %a"
-                    pp_token t)
-      | None -> failwith "Parser: expected identifier after 'let'"
-    in
+    let pat = parse_pattern_or st in
     consume st Equal;
     let value = parse_expr_state st in
     consume st In;
     let body = parse_expr_state st in
-    Ast.Let { name; value; body }
+    Ast.Let { pat; value; body }
 
   | Some Handle ->
     advance st;
@@ -290,14 +364,17 @@ and parse_expr_state (st : state) : expr =
     advance st;
     let effect_name = match peek st with
       | Some (CtorIdent s) -> advance st; s
-      | Some t -> failwith (Format.asprintf "Parser: expected effect name after 'perform', got %a" pp_token t)
-      | None   -> failwith "Parser: expected effect name after 'perform'"
+      | Some t ->
+        failwith (Format.asprintf "Parser: expected effect name after 'perform', got %a"
+                    pp_token t)
+      | None -> failwith "Parser: expected effect name after 'perform'"
     in
     consume st Dot;
     let op_name = match peek st with
       | Some (Ident s) -> advance st; s
-      | Some t -> failwith (Format.asprintf "Parser: expected operation name, got %a" pp_token t)
-      | None   -> failwith "Parser: expected operation name"
+      | Some t ->
+        failwith (Format.asprintf "Parser: expected operation name, got %a" pp_token t)
+      | None -> failwith "Parser: expected operation name"
     in
     consume st LParen;
     let args = parse_args st in
@@ -401,10 +478,7 @@ and parse_atom (st : state) : expr =
   | Some (Ident s)     -> advance st; Ast.Var s
   | Some Resume        -> advance st; Ast.Var "resume"
   | Some LBrace ->
-    (* Disambiguate: { ident : ... } is a record literal;
-       { expr with ... } is a record update (expr must be parsed first).
-       Peek ahead: if the sequence is LBrace Ident Colon, it's a record literal.
-       If LBrace RBrace, it's an empty record. Otherwise try record update. *)
+    (* { } empty record; { ident : ... } record literal; { expr with ... } update *)
     (match st.tokens with
      | _ :: RBrace :: _ ->
        advance st; advance st; Ast.Record []
@@ -423,14 +497,14 @@ and parse_atom (st : state) : expr =
   | Some LParen ->
     (match st.tokens with
      | _ :: RParen :: _ -> advance st; advance st; Ast.UnitLit
-     | _ -> failwith "Parser: unexpected '(' (grouped expressions not yet supported)")
+     | _ -> failwith "Parser: unexpected '(' (use do-block for sequencing)")
   | Some t ->
     failwith (Format.asprintf "Parser: unexpected token %a" pp_token t)
   | None ->
     failwith "Parser: unexpected end of input"
 
 (* ------------------------------------------------------------------ *)
-(* Public entry point — expressions                                    *)
+(* Public entry point — expressions                                     *)
 (* ------------------------------------------------------------------ *)
 
 let parse_expr (tokens : token list) : expr =
@@ -443,7 +517,7 @@ let parse_expr (tokens : token list) : expr =
   e
 
 (* ------------------------------------------------------------------ *)
-(* Top-level declaration parsers                                       *)
+(* Top-level declaration parsers                                        *)
 (* ------------------------------------------------------------------ *)
 
 let parse_type_params (st : state) : string list =
@@ -456,7 +530,7 @@ let parse_type_params (st : state) : string list =
         advance st;
         let rest = match peek st with
           | Some Comma -> advance st; loop ()
-          | _ -> []
+          | _          -> []
         in
         s :: rest
       | _ -> []
@@ -469,8 +543,9 @@ let parse_type_params (st : state) : string list =
 let parse_ctor_decl (st : state) : Ast.ctor_decl =
   let ctor_name = match peek st with
     | Some (CtorIdent s) -> advance st; s
-    | Some t -> failwith (Format.asprintf "Parser: expected constructor name, got %a" pp_token t)
-    | None   -> failwith "Parser: expected constructor name"
+    | Some t ->
+      failwith (Format.asprintf "Parser: expected constructor name, got %a" pp_token t)
+    | None -> failwith "Parser: expected constructor name"
   in
   let ctor_params = match peek st with
     | Some LParen ->
@@ -491,12 +566,15 @@ let rec parse_ctor_decls_rest (st : state) : Ast.ctor_decl list =
   | Some Pipe -> advance st; let c = parse_ctor_decl st in c :: parse_ctor_decls_rest st
   | _         -> []
 
+(* effect op syntax: op_name : (T1, T2) -> T *)
 let parse_effect_op_decl (st : state) : Ast.effect_op =
   let effect_op_name = match peek st with
     | Some (Ident s) -> advance st; s
-    | Some t -> failwith (Format.asprintf "Parser: expected op name, got %a" pp_token t)
-    | None   -> failwith "Parser: expected op name"
+    | Some t ->
+      failwith (Format.asprintf "Parser: expected op name, got %a" pp_token t)
+    | None -> failwith "Parser: expected op name"
   in
+  consume st Colon;
   consume st LParen;
   let effect_op_params = match peek st with
     | Some RParen -> advance st; []
@@ -506,14 +584,17 @@ let parse_effect_op_decl (st : state) : Ast.effect_op =
       consume st RParen;
       first :: rest
   in
-  consume st Colon;
+  consume st Arrow;
   let effect_op_return = parse_type_expr st in
   { Ast.effect_op_name; effect_op_params; effect_op_return }
 
 let rec parse_effect_ops_rest (st : state) : Ast.effect_op list =
   match peek st with
-  | Some Comma -> advance st; let op = parse_effect_op_decl st in op :: parse_effect_ops_rest st
-  | _          -> []
+  | Some Comma ->
+    advance st;
+    let op = parse_effect_op_decl st in
+    op :: parse_effect_ops_rest st
+  | _ -> []
 
 let rec parse_decl (st : state) : Ast.decl =
   let pub = match peek st with
@@ -525,8 +606,9 @@ let rec parse_decl (st : state) : Ast.decl =
     advance st;
     let fn_name = match peek st with
       | Some (Ident s) -> advance st; s
-      | Some t -> failwith (Format.asprintf "Parser: expected fn name, got %a" pp_token t)
-      | None   -> failwith "Parser: expected fn name"
+      | Some t ->
+        failwith (Format.asprintf "Parser: expected fn name, got %a" pp_token t)
+      | None -> failwith "Parser: expected fn name"
     in
     let type_params = parse_type_params st in
     consume st LParen;
@@ -551,8 +633,9 @@ let rec parse_decl (st : state) : Ast.decl =
     advance st;
     let type_name = match peek st with
       | Some (CtorIdent s) -> advance st; s
-      | Some t -> failwith (Format.asprintf "Parser: expected type name, got %a" pp_token t)
-      | None   -> failwith "Parser: expected type name"
+      | Some t ->
+        failwith (Format.asprintf "Parser: expected type name, got %a" pp_token t)
+      | None -> failwith "Parser: expected type name"
     in
     let type_params = parse_type_params st in
     consume st Equal;
@@ -565,8 +648,9 @@ let rec parse_decl (st : state) : Ast.decl =
     advance st;
     let effect_name = match peek st with
       | Some (CtorIdent s) -> advance st; s
-      | Some t -> failwith (Format.asprintf "Parser: expected effect name, got %a" pp_token t)
-      | None   -> failwith "Parser: expected effect name"
+      | Some t ->
+        failwith (Format.asprintf "Parser: expected effect name, got %a" pp_token t)
+      | None -> failwith "Parser: expected effect name"
     in
     let type_params = parse_type_params st in
     consume st LBrace;
@@ -584,8 +668,9 @@ let rec parse_decl (st : state) : Ast.decl =
     advance st;
     let module_name = match peek st with
       | Some (Ident s) -> advance st; s
-      | Some t -> failwith (Format.asprintf "Parser: expected module name, got %a" pp_token t)
-      | None   -> failwith "Parser: expected module name"
+      | Some t ->
+        failwith (Format.asprintf "Parser: expected module name, got %a" pp_token t)
+      | None -> failwith "Parser: expected module name"
     in
     consume st LBrace;
     let body = parse_decls_until_rbrace st in
@@ -594,6 +679,7 @@ let rec parse_decl (st : state) : Ast.decl =
 
   | Some Require ->
     advance st;
+    consume st Effect;    (* require effect T — the 'effect' keyword is mandatory *)
     let t = parse_type_expr st in
     Ast.DeclRequire t
 
@@ -605,9 +691,7 @@ let rec parse_decl (st : state) : Ast.decl =
 and parse_decls_until_rbrace (st : state) : Ast.decl list =
   match peek st with
   | Some RBrace | None -> []
-  | _ ->
-    let d = parse_decl st in
-    d :: parse_decls_until_rbrace st
+  | _ -> let d = parse_decl st in d :: parse_decls_until_rbrace st
 
 let parse_program (tokens : token list) : Ast.program =
   let st = make_state tokens in

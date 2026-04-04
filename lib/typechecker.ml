@@ -201,11 +201,15 @@ let generalize env ty =
 (** Convert an AST type_expr to a checker ty.
     Type variables (lowercase names not in scope as type constructors)
     are treated as rigid type variables. *)
-let ty_of_type_expr = function
+let rec ty_of_type_expr = function
   | TyName s when String.length s > 0 && s.[0] >= 'a' && s.[0] <= 'z' ->
-    TyVar s   (* lowercase: type variable *)
+    TyVar s
   | TyName s  -> TyCon s
-  | TyApp (s, _args) -> TyCon s  (* ignore params for now — type ctors are opaque *)
+  | TyApp (s, _args) -> TyCon s
+  | TyTuple _ -> fresh_meta ()    (* tuple types deferred *)
+  | TyFun (param_tys, ret, _eff) ->
+    let ret_ty = ty_of_type_expr ret in
+    List.fold_right (fun pt acc -> TyFun (ty_of_type_expr pt, acc)) param_tys ret_ty
 
 (* ------------------------------------------------------------------ *)
 (* Inference                                                            *)
@@ -226,10 +230,13 @@ let rec infer_expr (env : env) (e : expr) : ty =
     let scheme = env_lookup name env in
     instantiate scheme
 
-  | Let { name; value; body } ->
-    let ty_val  = infer_expr env value in
-    let scheme  = generalize env ty_val in
-    let env'    = env_extend name scheme env in
+  | Let { pat; value; body } ->
+    let ty_val = infer_expr env value in
+    let scheme = generalize env ty_val in
+    let env'   = match pat with
+      | PVar name -> env_extend name scheme env
+      | _         -> env_from_pattern env pat ty_val
+    in
     infer_expr env' body
 
   | Letrec (bindings, body) ->
@@ -272,8 +279,9 @@ let rec infer_expr (env : env) (e : expr) : ty =
            | None   ->
              let m = fresh_meta () in
              tv_table := (s, m) :: !tv_table; m)
-        | TyName s     -> TyCon s
-        | TyApp (s, _) -> TyCon s   (* type args ignored until kind system exists *)
+        | TyName s            -> TyCon s
+        | TyApp (s, _)        -> TyCon s
+        | TyTuple _ | TyFun _ -> fresh_meta ()
       in
       go ty_expr
     in
@@ -341,9 +349,12 @@ let rec infer_expr (env : env) (e : expr) : ty =
       | []                         -> TyCon "Unit"
       | [StmtExpr e]               -> infer_expr env e
       | StmtExpr e :: rest         -> ignore (infer_expr env e); go env rest
-      | StmtLet { name; value } :: rest ->
-        let ty  = infer_expr env value in
-        let env' = env_extend name (generalize env ty) env in
+      | StmtLet { pat; value } :: rest ->
+        let ty   = infer_expr env value in
+        let env' = match pat with
+          | PVar name -> env_extend name (generalize env ty) env
+          | _         -> env_from_pattern env pat ty
+        in
         go env' rest
     in
     go env stmts
@@ -359,9 +370,13 @@ let rec infer_expr (env : env) (e : expr) : ty =
     Currently handles PWild and PVar; constructor patterns don't bind new scrutinee types. *)
 and env_from_pattern env pat scrut_ty =
   match pat with
-  | PWild  -> env
-  | PVar x -> env_extend x (mono scrut_ty) env
-  | PLit _ -> env
+  | PWild         -> env
+  | PVar x        -> env_extend x (mono scrut_ty) env
+  | PLit _        -> env
   | PCtor (_, sub_pats) ->
-    (* Give each sub-pattern a fresh meta for now *)
     List.fold_left (fun e p -> env_from_pattern e p (fresh_meta ())) env sub_pats
+  | PRecord (fields, _) ->
+    List.fold_left (fun e (_, p) -> env_from_pattern e p (fresh_meta ())) env fields
+  | POr (p1, _p2) ->
+    (* Both branches bind the same variables; use p1 *)
+    env_from_pattern env p1 scrut_ty

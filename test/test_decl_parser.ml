@@ -117,10 +117,10 @@ let test_type_decl_result () =
 (* effect declarations                                                  *)
 (* ------------------------------------------------------------------ *)
 
-(* effect State<s> { get(): s, put(s): Unit } *)
+(* effect State<s> { get: () -> s, put: (s) -> Unit } *)
 let test_effect_decl_state () =
   check_decl "effect State"
-    "effect State<s> { get(): s, put(s): Unit }"
+    "effect State<s> { get: () -> s, put: (s) -> Unit }"
     (DeclEffect { pub         = false
                 ; effect_name = "State"
                 ; type_params = ["s"]
@@ -131,10 +131,10 @@ let test_effect_decl_state () =
                                   ; effect_op_params  = [TyName "s"]
                                   ; effect_op_return  = TyName "Unit" } ] })
 
-(* effect Log { log(String): Unit } *)
+(* effect Log { log: (String) -> Unit } *)
 let test_effect_decl_log () =
   check_decl "effect Log"
-    "effect Log { log(String): Unit }"
+    "effect Log { log: (String) -> Unit }"
     (DeclEffect { pub         = false
                 ; effect_name = "Log"
                 ; type_params = []
@@ -165,10 +165,10 @@ let test_module_decl () =
 (* require declarations                                                 *)
 (* ------------------------------------------------------------------ *)
 
-(* require Log *)
+(* require effect Log *)
 let test_require_decl () =
   check_decl "require"
-    "require Log"
+    "require effect Log"
     (DeclRequire (TyName "Log"))
 
 (* ------------------------------------------------------------------ *)

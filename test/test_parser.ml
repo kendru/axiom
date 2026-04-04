@@ -20,39 +20,39 @@ let check_expr label src expected =
 let test_let_int_body_var () =
   check_expr "let x = 42 in x"
     "let x = 42 in x"
-    (Let { name = "x"; value = IntLit 42; body = Var "x" })
+    (Let { pat = PVar "x"; value = IntLit 42; body = Var "x" })
 
 let test_let_bool () =
   check_expr "let x = true in x"
     "let x = true in x"
-    (Let { name = "x"; value = BoolLit true; body = Var "x" })
+    (Let { pat = PVar "x"; value = BoolLit true; body = Var "x" })
 
 let test_let_string () =
   check_expr {|let x = "hello" in x|}
     {|let x = "hello" in x|}
-    (Let { name = "x"; value = StringLit "hello"; body = Var "x" })
+    (Let { pat = PVar "x"; value = StringLit "hello"; body = Var "x" })
 
 let test_let_unit () =
   check_expr "let x = () in x"
     "let x = () in x"
-    (Let { name = "x"; value = UnitLit; body = Var "x" })
+    (Let { pat = PVar "x"; value = UnitLit; body = Var "x" })
 
 let test_let_nested () =
   check_expr "nested let"
     "let x = 1 in let y = 2 in x"
-    (Let { name = "x"; value = IntLit 1
-         ; body = Let { name = "y"; value = IntLit 2; body = Var "x" } })
+    (Let { pat = PVar "x"; value = IntLit 1
+         ; body = Let { pat = PVar "y"; value = IntLit 2; body = Var "x" } })
 
 let test_let_var_value () =
   check_expr "let y = x in y"
     "let y = x in y"
-    (Let { name = "y"; value = Var "x"; body = Var "y" })
+    (Let { pat = PVar "y"; value = Var "x"; body = Var "y" })
 
 let test_let_chain_var () =
   check_expr "chained var binding"
     "let a = 1 in let b = a in b"
-    (Let { name = "a"; value = IntLit 1
-         ; body = Let { name = "b"; value = Var "a"; body = Var "b" } })
+    (Let { pat = PVar "a"; value = IntLit 1
+         ; body = Let { pat = PVar "b"; value = Var "a"; body = Var "b" } })
 
 (* ------------------------------------------------------------------ *)
 (* Function application                                                 *)
@@ -81,7 +81,7 @@ let test_app_nested () =
 let test_app_in_let () =
   check_expr "let x = f(42) in x"
     "let x = f(42) in x"
-    (Let { name = "x"; value = App (Var "f", [IntLit 42]); body = Var "x" })
+    (Let { pat = PVar "x"; value = App (Var "f", [IntLit 42]); body = Var "x" })
 
 (* ------------------------------------------------------------------ *)
 (* fn expressions                                                       *)
@@ -310,14 +310,14 @@ let test_do_effect_then_result () =
 let test_do_let_stmt () =
   check_expr "do let stmt"
     "do { let x = 42; x }"
-    (Do [StmtLet { name = "x"; value = IntLit 42 }; StmtExpr (Var "x")])
+    (Do [StmtLet { pat = PVar "x"; value = IntLit 42 }; StmtExpr (Var "x")])
 
 (* do { let a = 1; let b = 2; a }  -- multiple let stmts *)
 let test_do_multi_let () =
   check_expr "do multi let"
     "do { let a = 1; let b = 2; a }"
-    (Do [ StmtLet { name = "a"; value = IntLit 1 }
-        ; StmtLet { name = "b"; value = IntLit 2 }
+    (Do [ StmtLet { pat = PVar "a"; value = IntLit 1 }
+        ; StmtLet { pat = PVar "b"; value = IntLit 2 }
         ; StmtExpr (Var "a") ])
 
 (* ------------------------------------------------------------------ *)

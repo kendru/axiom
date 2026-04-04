@@ -1,23 +1,19 @@
-(** Axiom abstract syntax tree.
-
-    Types grow incrementally as new language features are parsed.
-    All nodes are position-free for now; source locations are a future concern. *)
+(** Axiom abstract syntax tree. *)
 
 (* ------------------------------------------------------------------ *)
-(* Type expressions                                                     *)
+(* Type expressions and effect sets (mutually recursive)               *)
 (* ------------------------------------------------------------------ *)
 
 type type_expr =
-  | TyName of string                      (** Int, String, Bool, Unit, ... *)
-  | TyApp  of string * type_expr list     (** List<A>, Map<K,V>, Option<A> *)
+  | TyName  of string                       (** Int, Bool, a, ... *)
+  | TyApp   of string * type_expr list      (** List<A>, Map<K,V> *)
+  | TyTuple of type_expr list               (** (T1, T2, ...) *)
+  | TyFun   of type_expr list * type_expr * effect_set option
+                                            (** (T1, T2) -> T ! E *)
 
-(* ------------------------------------------------------------------ *)
-(* Effect sets                                                          *)
-(* ------------------------------------------------------------------ *)
-
-type effect_set =
-  | Pure                   (** no effects *)
-  | Effects of type_expr list  (** { Log, Throw<E>, ... } *)
+and effect_set =
+  | Pure                        (** no effects *)
+  | Effects of type_expr list   (** { Log, Throw<E>, ... } *)
 
 (* ------------------------------------------------------------------ *)
 (* Function parameters                                                  *)
@@ -29,7 +25,7 @@ type param = {
 }
 
 (* ------------------------------------------------------------------ *)
-(* Literal values (used in patterns and expressions)                   *)
+(* Literal values                                                       *)
 (* ------------------------------------------------------------------ *)
 
 type literal =
@@ -44,13 +40,16 @@ type literal =
 (* ------------------------------------------------------------------ *)
 
 type pattern =
-  | PWild                             (** _ *)
-  | PVar   of string                  (** x *)
-  | PLit   of literal                 (** 42, true, "s", () *)
-  | PCtor  of string * pattern list   (** Some(p), Cons(h, t), None *)
+  | PWild                               (** _ *)
+  | PVar    of string                   (** x *)
+  | PLit    of literal                  (** 42, true, "s", () *)
+  | PCtor   of string * pattern list    (** Some(p), Cons(h, t) *)
+  | PRecord of (string * pattern) list * bool
+                                        (** { f = p, .. }; bool = is_open *)
+  | POr     of pattern * pattern        (** p1 | p2 *)
 
 (* ------------------------------------------------------------------ *)
-(* Expression AST                                                       *)
+(* Expression AST (mutually recursive)                                  *)
 (* ------------------------------------------------------------------ *)
 
 type fn_data = {
@@ -61,7 +60,7 @@ type fn_data = {
 }
 
 and let_binding = {
-  name  : string;
+  pat   : pattern;    (** the bound pattern — PVar "x" for simple bindings *)
   value : expr;
   body  : expr;
 }
@@ -90,8 +89,8 @@ and if_data = {
 }
 
 and do_stmt =
-  | StmtLet  of { name : string; value : expr }  (** let x = e  (no 'in') *)
-  | StmtExpr of expr                              (** e *)
+  | StmtLet  of { pat : pattern; value : expr }
+  | StmtExpr of expr
 
 and expr =
   | Var       of string
@@ -101,17 +100,17 @@ and expr =
   | BoolLit   of bool
   | UnitLit
   | Let       of let_binding
-  | App       of expr * expr list   (** f(arg1, arg2, ...) *)
-  | Fn        of fn_data            (** fn (params) -> T ! E { body } *)
-  | Match     of match_data         (** match e with { | p => e ... } *)
-  | If        of if_data            (** if e { e } else { e } *)
-  | Do        of do_stmt list       (** do { stmt; ...; expr } *)
-  | Letrec    of letrec_binding list * expr  (** letrec { f(p): T = e, ... } in e *)
-  | Record    of (string * expr) list        (** { field: expr, ... } *)
-  | RecordUpdate of expr * (string * expr) list  (** { expr with field: expr, ... } *)
-  | Project   of expr * string               (** expr.field *)
-  | Perform   of perform_data       (** perform Effect.op(args) *)
-  | Handle    of handle_data        (** handle e with { Effect { op(p) => e } } *)
+  | App       of expr * expr list
+  | Fn        of fn_data
+  | Match     of match_data
+  | If        of if_data
+  | Do        of do_stmt list
+  | Letrec    of letrec_binding list * expr
+  | Record    of (string * expr) list
+  | RecordUpdate of expr * (string * expr) list
+  | Project   of expr * string
+  | Perform   of perform_data
+  | Handle    of handle_data
 
 and perform_data = {
   effect_name : string;
@@ -153,13 +152,21 @@ let pp_literal fmt = function
   | LUnit     -> Format.pp_print_string fmt "LUnit"
 
 let rec pp_pattern fmt = function
-  | PWild      -> Format.pp_print_string fmt "PWild"
-  | PVar s     -> Format.fprintf fmt "PVar(%S)" s
-  | PLit l     -> Format.fprintf fmt "PLit(%a)" pp_literal l
+  | PWild        -> Format.pp_print_string fmt "PWild"
+  | PVar s       -> Format.fprintf fmt "PVar(%S)" s
+  | PLit l       -> Format.fprintf fmt "PLit(%a)" pp_literal l
   | PCtor (s, ps) ->
     Format.fprintf fmt "PCtor(%S, [%a])" s
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f "; ")
          pp_pattern) ps
+  | PRecord (fields, open_) ->
+    let pp_f fmt (name, p) = Format.fprintf fmt "%s = %a" name pp_pattern p in
+    Format.fprintf fmt "PRecord{%a%s}"
+      (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ") pp_f)
+      fields
+      (if open_ then ", .." else "")
+  | POr (a, b) ->
+    Format.fprintf fmt "POr(%a, %a)" pp_pattern a pp_pattern b
 
 let rec pp_type_expr fmt = function
   | TyName s -> Format.pp_print_string fmt s
@@ -167,8 +174,18 @@ let rec pp_type_expr fmt = function
     Format.fprintf fmt "%s<%a>" s
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
          pp_type_expr) args
+  | TyTuple ts ->
+    Format.fprintf fmt "(%a)"
+      (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
+         pp_type_expr) ts
+  | TyFun (params, ret, eff) ->
+    Format.fprintf fmt "(%a) -> %a%s"
+      (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
+         pp_type_expr) params
+      pp_type_expr ret
+      (match eff with None -> "" | Some e -> Format.asprintf " ! %a" pp_effect_set e)
 
-let pp_effect_set fmt = function
+and pp_effect_set fmt = function
   | Pure -> Format.pp_print_string fmt "pure"
   | Effects ts ->
     Format.fprintf fmt "{%a}"
@@ -185,9 +202,9 @@ let rec pp_expr fmt = function
   | StringLit s -> Format.fprintf fmt "StringLit(%S)" s
   | BoolLit b   -> Format.fprintf fmt "BoolLit(%b)" b
   | UnitLit     -> Format.pp_print_string fmt "UnitLit"
-  | Let { name; value; body } ->
-    Format.fprintf fmt "Let{name=%S; value=%a; body=%a}"
-      name pp_expr value pp_expr body
+  | Let { pat; value; body } ->
+    Format.fprintf fmt "Let{pat=%a; value=%a; body=%a}"
+      pp_pattern pat pp_expr value pp_expr body
   | App (f, args) ->
     Format.fprintf fmt "App(%a, [%a])"
       pp_expr f
@@ -230,8 +247,8 @@ let rec pp_expr fmt = function
       args
   | Do stmts ->
     let pp_stmt fmt = function
-      | StmtLet { name; value } ->
-        Format.fprintf fmt "StmtLet(%S, %a)" name pp_expr value
+      | StmtLet { pat; value } ->
+        Format.fprintf fmt "StmtLet(%a, %a)" pp_pattern pat pp_expr value
       | StmtExpr e ->
         Format.fprintf fmt "StmtExpr(%a)" pp_expr e
     in
@@ -286,27 +303,41 @@ let equal_literal a b = match a, b with
   | _,         _         -> false
 
 let rec equal_pattern a b = match a, b with
-  | PWild,        PWild        -> true
-  | PVar x,       PVar y       -> x = y
-  | PLit la,      PLit lb      -> equal_literal la lb
-  | PCtor (a, pa), PCtor (b, pb) ->
+  | PWild,           PWild           -> true
+  | PVar x,          PVar y          -> x = y
+  | PLit la,         PLit lb         -> equal_literal la lb
+  | PCtor (a, pa),   PCtor (b, pb)   ->
     a = b && List.length pa = List.length pb
     && List.for_all2 equal_pattern pa pb
-  | _, _ -> false
+  | PRecord (fa, oa), PRecord (fb, ob) ->
+    oa = ob && List.length fa = List.length fb
+    && List.for_all2 (fun (na, pa) (nb, pb) ->
+        na = nb && equal_pattern pa pb) fa fb
+  | POr (a1, a2),    POr (b1, b2)   ->
+    equal_pattern a1 b1 && equal_pattern a2 b2
+  | _,               _              -> false
 
 let rec equal_type_expr a b = match a, b with
-  | TyName x,     TyName y     -> x = y
-  | TyApp (x, a), TyApp (y, b) ->
+  | TyName x,       TyName y       -> x = y
+  | TyApp (x, a),   TyApp (y, b)   ->
     x = y && List.length a = List.length b
     && List.for_all2 equal_type_expr a b
-  | _, _ -> false
+  | TyTuple ta,     TyTuple tb     ->
+    List.length ta = List.length tb
+    && List.for_all2 equal_type_expr ta tb
+  | TyFun (pa, ra, ea), TyFun (pb, rb, eb) ->
+    List.length pa = List.length pb
+    && List.for_all2 equal_type_expr pa pb
+    && equal_type_expr ra rb
+    && Option.equal equal_effect_set ea eb
+  | _,               _             -> false
 
-let equal_effect_set a b = match a, b with
+and equal_effect_set a b = match a, b with
   | Pure,       Pure       -> true
   | Effects xs, Effects ys ->
     List.length xs = List.length ys
     && List.for_all2 equal_type_expr xs ys
-  | _, _ -> false
+  | _,          _          -> false
 
 let equal_param a b =
   a.param_name = b.param_name && equal_type_expr a.param_type b.param_type
@@ -319,7 +350,7 @@ let rec equal_expr a b = match a, b with
   | BoolLit p,   BoolLit q   -> p = q
   | UnitLit,     UnitLit     -> true
   | Let la,      Let lb      ->
-    la.name = lb.name
+    equal_pattern la.pat lb.pat
     && equal_expr la.value lb.value
     && equal_expr la.body  lb.body
   | App (f1, a1), App (f2, a2) ->
@@ -345,11 +376,13 @@ let rec equal_expr a b = match a, b with
         && List.for_all2 (fun x y ->
             x.op_handler_name = y.op_handler_name
             && x.op_handler_params = y.op_handler_params
-            && equal_expr x.op_handler_body y.op_handler_body) a.op_handlers b.op_handlers
+            && equal_expr x.op_handler_body y.op_handler_body)
+           a.op_handlers b.op_handlers
         && Option.equal (fun r s ->
-            r.return_var = s.return_var && equal_expr r.return_body s.return_body)
-            a.return_handler b.return_handler
-      ) ha.handlers hb.handlers
+            r.return_var = s.return_var
+            && equal_expr r.return_body s.return_body)
+           a.return_handler b.return_handler)
+       ha.handlers hb.handlers
   | Perform pa, Perform pb ->
     pa.effect_name = pb.effect_name && pa.op_name = pb.op_name
     && List.length pa.args = List.length pb.args
@@ -358,9 +391,9 @@ let rec equal_expr a b = match a, b with
     List.length sa = List.length sb
     && List.for_all2 (fun a b -> match a, b with
         | StmtLet la, StmtLet lb ->
-          la.name = lb.name && equal_expr la.value lb.value
+          equal_pattern la.pat lb.pat && equal_expr la.value lb.value
         | StmtExpr a, StmtExpr b -> equal_expr a b
-        | _, _ -> false) sa sb
+        | _,          _          -> false) sa sb
   | Letrec (ba, bodya), Letrec (bb, bodyb) ->
     List.length ba = List.length bb
     && List.for_all2 (fun a b ->
@@ -392,13 +425,11 @@ let rec equal_expr a b = match a, b with
 (* Top-level declarations                                               *)
 (* ------------------------------------------------------------------ *)
 
-(** A constructor in a type declaration: Name(T1, T2, ...) *)
 type ctor_decl = {
   ctor_name   : string;
   ctor_params : type_expr list;
 }
 
-(** An operation in an effect declaration: op_name(T1, T2, ...): T *)
 type effect_op = {
   effect_op_name   : string;
   effect_op_params : type_expr list;
@@ -432,12 +463,12 @@ type decl =
       module_name : string;
       body        : decl list;
     }
-  | DeclRequire of type_expr   (** require effect T *)
+  | DeclRequire of type_expr
 
 type program = decl list
 
 (* ------------------------------------------------------------------ *)
-(* Pretty-printers for declarations                                    *)
+(* Pretty-printers for declarations                                     *)
 (* ------------------------------------------------------------------ *)
 
 let pp_ctor_decl fmt { ctor_name; ctor_params } =
@@ -463,8 +494,10 @@ let rec pp_decl fmt = function
       (if type_params = [] then "" else "<" ^ String.concat ", " type_params ^ ">")
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
          pp_param) params
-      (match return_type with None -> "" | Some t -> Format.asprintf " -> %a" pp_type_expr t)
-      (match effects with None -> "" | Some e -> Format.asprintf " ! %a" pp_effect_set e)
+      (match return_type with None -> "" | Some t ->
+         Format.asprintf " -> %a" pp_type_expr t)
+      (match effects with None -> "" | Some e ->
+         Format.asprintf " ! %a" pp_effect_set e)
       pp_expr decl_body
   | DeclType { pub; type_name; type_params; ctors } ->
     Format.fprintf fmt "%sType %s%s = %a"
@@ -490,7 +523,7 @@ let rec pp_decl fmt = function
     Format.fprintf fmt "Require(%a)" pp_type_expr t
 
 (* ------------------------------------------------------------------ *)
-(* Equality for declarations                                           *)
+(* Equality for declarations                                            *)
 (* ------------------------------------------------------------------ *)
 
 let equal_ctor_decl a b =

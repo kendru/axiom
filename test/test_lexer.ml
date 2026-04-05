@@ -147,15 +147,6 @@ let test_lex_multi_token () =
     [ Let; Ident "x"; Equal; IntLit 42; In; Ident "x" ]
 
 (* ------------------------------------------------------------------ *)
-(* Comment tests (single-line -- style)                                 *)
-(* ------------------------------------------------------------------ *)
-
-let test_lex_line_comment () =
-  check_tokens "line comment skipped"
-    "let -- this is a comment\nin"
-    [ Let; In ]
-
-(* ------------------------------------------------------------------ *)
 (* Node-attached comment tests (@# ... #@)                              *)
 (* ------------------------------------------------------------------ *)
 
@@ -259,11 +250,10 @@ let () =
         ; Alcotest.test_case "==" `Quick test_lex_eq_eq
         ; Alcotest.test_case "!=" `Quick test_lex_bang_eq
         ] )
-    ; ( "whitespace-and-comments",
+    ; ( "whitespace",
         [ Alcotest.test_case "whitespace ignored" `Quick test_lex_whitespace_ignored
         ; Alcotest.test_case "newline ignored" `Quick test_lex_newline_ignored
         ; Alcotest.test_case "multi-token" `Quick test_lex_multi_token
-        ; Alcotest.test_case "line comment" `Quick test_lex_line_comment
         ] )
     ; ( "node-comments",
         [ Alcotest.test_case "simple"              `Quick test_lex_comment_simple

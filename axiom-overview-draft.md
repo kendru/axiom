@@ -146,11 +146,8 @@ boundaries, with visual structure that aids scope recognition.
 - Visual chunk boundaries via indentation and keyword-delimited blocks.
 - Redundant semantic markers where they aid reasoning (e.g., `-> ReturnType`
   even when inferrable).
-- Named parameters at function boundaries.
-
-> **Implementation note:** Positional shorthand (`$0`, `$1`) for closures is
-> described here as a design aspiration but is not yet implemented in the lexer
-> or parser.
+- Named parameters at function boundaries, positional shorthand (`$0`, `$1`)
+  available within small closures.
 
 **The working form is not fixed.** Different LLMs, different tasks, and future
 research may reveal that alternative syntaxes are more effective. The three-layer
@@ -377,6 +374,24 @@ p ::=
   | p₁ | p₂                   -- or-pattern
 ```
 
+**Node-attached comments:**
+
+Every expression, pattern, and declaration node in the AST carries an optional
+comment annotation. This is a deliberate design choice: because LLMs are the
+primary authors and consumers of Axiom code, textual context that explains
+intent, records reasoning, or captures design rationale is semantically
+meaningful — not mere decoration. Comments are preserved through the parse,
+elaboration, and binary IR round-trip.
+
+```
+annotation ::= '@#' text '#@'     -- attaches to the following node
+```
+
+The `@#...#@` form is a token that the parser consumes and attaches to the
+immediately following expression, pattern, or declaration node. This means
+comments survive in the AST and binary IR, enabling tooling to display,
+search, and reason about annotated code.
+
 ### 3.2 Mutual Recursion
 
 Mutually recursive definitions are grouped explicitly with `letrec`:
@@ -427,12 +442,6 @@ primitives when needed.
   | { l₁: τ₁, ..., lₙ: τₙ | ρ }            -- extensible record (row poly)
   | forall α . τ                             -- universal quantification
   | rec α . τ                                -- recursive type
-
-> **Implementation status:** The current AST `type_expr` supports `TyName`,
-> `TyApp`, `TyTuple`, and `TyFun`. Row-polymorphic records (`{ ... | ρ }`)
-> and recursive types (`rec α . τ`) are not yet represented in the AST or
-> parser. The type checker's internal `ty` also lacks these forms. These are
-> planned features that will require AST and parser extensions.
 ```
 
 ### 4.2 Effect Types
@@ -442,12 +451,6 @@ primitives when needed.
   | pure                                     -- no effects
   | { E₁, ..., Eₙ | ε' }                   -- effect set with row variable
   | ε'                                       -- effect variable (polymorphism)
-
-> **Implementation status:** The current AST `effect_set` is
-> `Pure | Effects of type_expr list` — a closed set with no row variable slot.
-> Effect row polymorphism (the `| ε'` tail) is not yet implemented.
-> The type checker defers effect inference entirely, returning fresh meta
-> variables for all effect positions.
 ```
 
 Every function type carries an effect annotation. A function `A -> B ! pure` is
@@ -624,7 +627,7 @@ handle
 with {
   Throw<String> {
     return x      => Ok(x)
-    throw(msg)    => Err(msg)        -- no resume: abort on throw
+    throw(msg)    => Err(msg)        @# no resume: abort on throw #@
   }
 }
 ```
@@ -685,7 +688,7 @@ handle app_logic() with {
   }
 }
 
--- In tests:
+@# In tests: #@
 handle app_logic() with {
   Database {
     query(sql)      => resume mock_db.record_and_return(sql)
@@ -702,7 +705,7 @@ handle file_processing() with {
     read_file(path) => {
       let handle = os_open(path)
       let result = os_read(handle)
-      os_close(handle)        -- cleanup always runs
+      os_close(handle)        @# cleanup always runs #@
       resume result
     }
   }
@@ -820,7 +823,7 @@ fn sum(xs: List<Int>) -> Int ! pure {
   fn go(acc: Int, rest: List<Int>) -> Int ! pure {
     match rest with {
     | Nil        => acc
-    | Cons(h, t) => go(acc + h, t)    -- tail call, compiles to jump
+    | Cons(h, t) => go(acc + h, t)    @# tail call, compiles to jump #@
     }
   }
   go(0, xs)
@@ -848,7 +851,7 @@ fn count_loop(n: Int) -> Int ! {State<Int>} {
   | 0 => perform State.get()
   | _ => {
       perform State.put(perform State.get() + 1)
-      count_loop(n - 1)    -- tail call, bounded stack even through handler
+      count_loop(n - 1)    @# tail call, bounded stack even through handler #@
     }
   }
 }
@@ -862,7 +865,7 @@ Sequential effects use `do` blocks. The last expression is in tail position:
 do {
   perform Log.log(Info, "starting");
   let data = perform FileSystem.read_file(path);
-  process(data)    -- tail position
+  process(data)    @# tail position #@
 }
 ```
 
@@ -912,7 +915,7 @@ module json_parser {
     }
   }
 
-  -- Private helper, not exported
+  @# Private helper, not exported #@
   fn parse_value(tokens: List<Token>, pos: Int) -> (JsonValue, Int) ! {Throw<ParseError>} {
     ...
   }
@@ -925,21 +928,16 @@ The `pub` interface of a module is designed so that an LLM can reason about
 the module's behavior by reading **only** the public signatures:
 
 ```
--- An LLM sees this and knows:
--- "json_parser needs file access and may throw ParseError.
---  It provides parse_string (pure except for errors) and
---  parse_file (needs filesystem, may error)."
+@# An LLM sees this and knows:
+   json_parser needs file access and may throw ParseError.
+   It provides parse_string (pure except for errors) and
+   parse_file (needs filesystem, may error). #@
 ```
 
 This is the fundamental unit of abstraction. The LLM can compose modules
 without reading their implementations.
 
 ### 7.3 Module Imports and Composition
-
-> **Implementation status:** The `import` keyword and module import/aliasing
-> (`import X as Y`) are not yet implemented in the lexer, parser, or AST.
-> The examples below represent the planned design. Currently, only `require
-> effect` declarations exist for declaring module dependencies.
 
 ```
 module app {
@@ -965,7 +963,7 @@ Modules can define new effects and export them, enabling framework patterns:
 
 ```
 module web_framework {
-  -- Framework-defined effects that user code performs
+  @# Framework-defined effects that user code performs #@
   effect Route {
     get:  (String, Handler) -> Unit
     post: (String, Handler) -> Unit
@@ -985,7 +983,7 @@ module web_framework {
 
   type Handler = () -> Unit ! {Request, Response, Throw<HttpError>}
 
-  -- Framework provides the handler that wires effects to the runtime
+  @# Framework provides the handler that wires effects to the runtime #@
   pub fn serve(port: Int, setup: () -> Unit ! {Route}) -> Unit ! {Net, Log} {
     ...
   }
@@ -1158,6 +1156,12 @@ field_pat   ::= IDENT '=' pattern   -- explicit field binding
               | IDENT               -- shorthand: field name bound as variable
              -- '..' in record patterns means "open" — remaining fields ignored.
              -- Without '..', the pattern must name every field (closed match).
+
+-- Node-attached comments
+
+comment     ::= '@#' TEXT '#@'
+             -- Attaches to the immediately following expression, pattern, or
+             -- declaration. Preserved in the AST and binary IR. See Section 3.1.
 ```
 
 **Note — `let` in `do` blocks.** Inside a `do` block, `let` bindings omit the
@@ -1168,9 +1172,9 @@ the block is a statement binding; the final item must be a plain expression
 
 ```
 do {
-  let x = foo();       -- statement binding: no 'in'
-  let y = bar(x);      -- statement binding: no 'in'
-  baz(x, y)            -- final expression: value of the block
+  let x = foo();       @# statement binding: no 'in' #@
+  let y = bar(x);      @# statement binding: no 'in' #@
+  baz(x, y)            @# final expression: value of the block #@
 }
 ```
 
@@ -1185,7 +1189,7 @@ handle compute() with {
   State {
     get()  => resume(current_state, current_state)
     put(s) => resume((), s)
-    return v => v    -- computation finished; v is its result value
+    return v => v    @# computation finished; v is its result value #@
   }
 }
 ```
@@ -1919,7 +1923,7 @@ module kv_store_test {
         throw(other)            => fail("unexpected error")
       }
       Log {
-        log(_, _) => resume ()    -- discard logs in tests
+        log(_, _) => resume ()    @# discard logs in tests #@
       }
     }
   }

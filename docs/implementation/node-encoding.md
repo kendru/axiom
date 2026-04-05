@@ -119,6 +119,19 @@ addressable in the store.
 name:str  type:ty
 ```
 
+### Node-Attached Comment (`comment`)
+
+Every expression, pattern, and declaration node may carry an optional
+node-attached comment. This is encoded as a trailing field in the node's
+inline data:
+
+```
+opt(lstr)     -- None if no comment; Some(text) if @#...#@ was attached
+```
+
+The comment uses `lstr` (u32 length prefix) rather than `str` because
+comments may contain substantial reasoning context for LLM consumption.
+
 ---
 
 ## Node Payload Format

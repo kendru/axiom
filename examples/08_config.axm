@@ -1,0 +1,173 @@
+-- 08_config.axm
+-- Configuration loading with layered effect handling.
+-- Demonstrates nested handlers and translating between effects.
+
+type List<a> = | Nil | Cons(a, List<a>)
+type Option<a> = | None | Some(a)
+type Result<a, e> = | Ok(a) | Err(e)
+type Pair<a, b> = | Pair(a, b)
+
+-- ----------------------------------------------------------------
+-- Configuration types
+-- ----------------------------------------------------------------
+
+type ConfigValue
+  = | CString(String)
+  | CInt(Int)
+  | CBool(Bool)
+
+type Config = | Config(List<Pair<String, ConfigValue>>)
+
+type ConfigError
+  = | KeyNotFound(String)
+  | TypeMismatch(String, String) @# key, expected type #@
+
+-- ----------------------------------------------------------------
+-- Effects for configuration
+-- ----------------------------------------------------------------
+
+effect ConfigRead {
+  get_config: (String) -> ConfigValue
+}
+
+effect Env {
+  get_env: (String) -> Option<String>
+}
+
+-- ----------------------------------------------------------------
+-- Reading typed config values
+-- ----------------------------------------------------------------
+
+fn get_string(key: String) -> String ! {ConfigRead, Throw<ConfigError>} {
+  match perform ConfigRead.get_config(key) with {
+    | CString(s) => s
+    | _ => perform Throw.throw(type_mismatch(key, "String"))
+  }
+}
+
+fn get_int(key: String) -> Int ! {ConfigRead, Throw<ConfigError>} {
+  match perform ConfigRead.get_config(key) with {
+    | CInt(n) => n
+    | _ => perform Throw.throw(type_mismatch(key, "Int"))
+  }
+}
+
+fn get_bool(key: String) -> Bool ! {ConfigRead, Throw<ConfigError>} {
+  match perform ConfigRead.get_config(key) with {
+    | CBool(b) => b
+    | _ => perform Throw.throw(type_mismatch(key, "Bool"))
+  }
+}
+
+fn get_string_or(key: String, default: String) -> String ! {ConfigRead} {
+  match perform ConfigRead.get_config(key) with {
+    | CString(s) => s
+    | _ => default
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Application configuration
+-- ----------------------------------------------------------------
+
+type AppConfig = | AppConfig(String, Int, Bool, String)
+  @# host, port, debug, log_path #@
+
+fn load_app_config() -> AppConfig ! {ConfigRead, Throw<ConfigError>} {
+  do {
+    let host = get_string("server.host");
+    let port = get_int("server.port");
+    let debug = get_bool("server.debug");
+    let log_path = get_string_or("server.log_path", "/var/log/app.log");
+    app_config(host, port, debug, log_path)
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Handlers: different config sources
+-- ----------------------------------------------------------------
+
+-- Handler that reads from a static Config value (in-memory map).
+fn with_static_config<a>(
+  cfg: Config,
+  computation: (u: Unit) -> a ! {ConfigRead}
+) -> a ! {Throw<ConfigError>} {
+  handle computation(()) with {
+    ConfigRead {
+      get_config(key) =>
+        match config_lookup(key, cfg) with {
+          | Some(v) => resume(v)
+          | None => perform Throw.throw(key_not_found(key))
+        }
+    }
+  }
+}
+
+-- Handler that reads from environment variables (translating effects).
+fn with_env_config<a>(
+  computation: (u: Unit) -> a ! {ConfigRead}
+) -> a ! {Env, Throw<ConfigError>} {
+  handle computation(()) with {
+    ConfigRead {
+      get_config(key) =>
+        match perform Env.get_env(key) with {
+          | Some(value) => resume(c_string(value))
+          | None => perform Throw.throw(key_not_found(key))
+        }
+    }
+  }
+}
+
+-- Layered handler: try static config first, fall back to env.
+fn with_layered_config<a>(
+  cfg: Config,
+  computation: (u: Unit) -> a ! {ConfigRead}
+) -> a ! {Env, Throw<ConfigError>} {
+  handle computation(()) with {
+    ConfigRead {
+      get_config(key) =>
+        match config_lookup(key, cfg) with {
+          | Some(v) => resume(v)
+          | None =>
+            match perform Env.get_env(key) with {
+              | Some(value) => resume(c_string(value))
+              | None => perform Throw.throw(key_not_found(key))
+            }
+        }
+    }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Config lookup helper
+-- ----------------------------------------------------------------
+
+fn config_lookup(key: String, cfg: Config) -> Option<ConfigValue> ! pure {
+  match cfg with {
+    | Config(entries) => lookup_by_key(key, entries)
+  }
+}
+
+fn lookup_by_key(
+  key: String,
+  entries: List<Pair<String, ConfigValue>>
+) -> Option<ConfigValue> ! pure {
+  match entries with {
+    | Nil => none()
+    | Cons(Pair(k, v), rest) =>
+      if string_eq(k, key) { some(v) } else { lookup_by_key(key, rest) }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Example: building a config and using it
+-- ----------------------------------------------------------------
+
+fn example_config() -> Config ! pure {
+  config(
+    cons(pair("server.host", c_string("0.0.0.0")),
+    cons(pair("server.port", c_int(8080)),
+    cons(pair("server.debug", c_bool(false)),
+    nil())))
+  )
+}

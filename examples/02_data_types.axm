@@ -1,0 +1,187 @@
+-- 02_data_types.axm
+-- Algebraic data types: defining and working with custom types.
+
+-- Standard Option type.
+type Option<a> = | None | Some(a)
+
+-- Standard Result type.
+type Result<a, e> = | Ok(a) | Err(e)
+
+-- Linked list.
+type List<a> = | Nil | Cons(a, List<a>)
+
+-- Binary tree.
+type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)
+
+-- A pair type.
+type Pair<a, b> = | Pair(a, b)
+
+-- Non-empty list: guarantees at least one element at the type level.
+type NonEmpty<a> = | NonEmpty(a, List<a>)
+
+-- Ordering result for comparisons.
+type Ordering = | LT | EQ | GT
+
+-- ----------------------------------------------------------------
+-- Working with Option
+-- ----------------------------------------------------------------
+
+-- Unwrap an Option with a default value.
+-- Note: constructor "application" uses lowercase wrapper functions
+-- (e.g. some(x), none()) because the parser currently treats
+-- uppercase identifiers as types, not as expression-level constructors.
+-- This guides a stdlib decision: provide such wrappers, or extend the
+-- parser to allow constructors as expressions.
+
+fn unwrap_or<a>(opt: Option<a>, default: a) -> a ! pure {
+  match opt with {
+    | Some(x) => x
+    | None => default
+  }
+}
+
+fn map_option<a, b>(f: (x: a) -> b ! pure, opt: Option<a>) -> Option<b> ! pure {
+  match opt with {
+    | Some(x) => some(f(x))
+    | None => none()
+  }
+}
+
+fn flat_map_option<a, b>(f: (x: a) -> Option<b> ! pure, opt: Option<a>) -> Option<b> ! pure {
+  match opt with {
+    | Some(x) => f(x)
+    | None => none()
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Working with Result
+-- ----------------------------------------------------------------
+
+fn map_result<a, b, e>(f: (x: a) -> b ! pure, r: Result<a, e>) -> Result<b, e> ! pure {
+  match r with {
+    | Ok(x) => ok(f(x))
+    | Err(e) => err(e)
+  }
+}
+
+fn map_error<a, e1, e2>(f: (x: e1) -> e2 ! pure, r: Result<a, e1>) -> Result<a, e2> ! pure {
+  match r with {
+    | Ok(x) => ok(x)
+    | Err(e) => err(f(e))
+  }
+}
+
+fn result_to_option<a, e>(r: Result<a, e>) -> Option<a> ! pure {
+  match r with {
+    | Ok(x) => some(x)
+    | Err(_) => none()
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Working with List
+-- ----------------------------------------------------------------
+
+fn length<a>(xs: List<a>) -> Int ! pure {
+  match xs with {
+    | Nil => 0
+    | Cons(_, t) => add(1, length(t))
+  }
+}
+
+fn map<a, b>(f: (x: a) -> b ! pure, xs: List<a>) -> List<b> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(h, t) => cons(f(h), map(f, t))
+  }
+}
+
+fn filter<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> List<a> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(h, t) =>
+      if pred(h) { cons(h, filter(pred, t)) } else { filter(pred, t) }
+  }
+}
+
+fn fold_left<a, b>(f: (acc: b, x: a) -> b ! pure, acc: b, xs: List<a>) -> b ! pure {
+  match xs with {
+    | Nil => acc
+    | Cons(h, t) => fold_left(f, f(acc, h), t)
+  }
+}
+
+fn reverse<a>(xs: List<a>) -> List<a> ! pure {
+  fold_left(fn (acc: List<a>, x: a) -> List<a> ! pure { cons(x, acc) }, nil(), xs)
+}
+
+fn append<a>(xs: List<a>, ys: List<a>) -> List<a> ! pure {
+  match xs with {
+    | Nil => ys
+    | Cons(h, t) => cons(h, append(t, ys))
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Working with Tree
+-- ----------------------------------------------------------------
+
+fn tree_size<a>(t: Tree<a>) -> Int ! pure {
+  match t with {
+    | Leaf => 0
+    | Node(l, _, r) => add(add(1, tree_size(l)), tree_size(r))
+  }
+}
+
+fn tree_depth<a>(t: Tree<a>) -> Int ! pure {
+  match t with {
+    | Leaf => 0
+    | Node(l, _, r) => add(1, max(tree_depth(l), tree_depth(r)))
+  }
+}
+
+fn tree_map<a, b>(f: (x: a) -> b ! pure, t: Tree<a>) -> Tree<b> ! pure {
+  match t with {
+    | Leaf => leaf()
+    | Node(l, v, r) => node(tree_map(f, l), f(v), tree_map(f, r))
+  }
+}
+
+fn tree_fold<a, b>(f: (l: b, v: a, r: b) -> b ! pure, base: b, t: Tree<a>) -> b ! pure {
+  match t with {
+    | Leaf => base
+    | Node(l, v, r) => f(tree_fold(f, base, l), v, tree_fold(f, base, r))
+  }
+}
+
+-- In-order traversal to a list.
+fn tree_to_list<a>(t: Tree<a>) -> List<a> ! pure {
+  match t with {
+    | Leaf => nil()
+    | Node(l, v, r) => append(tree_to_list(l), cons(v, tree_to_list(r)))
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Working with NonEmpty
+-- ----------------------------------------------------------------
+
+fn non_empty_head<a>(ne: NonEmpty<a>) -> a ! pure {
+  match ne with {
+    | NonEmpty(h, _) => h
+  }
+}
+
+fn non_empty_to_list<a>(ne: NonEmpty<a>) -> List<a> ! pure {
+  match ne with {
+    | NonEmpty(h, t) => cons(h, t)
+  }
+}
+
+fn from_list<a>(xs: List<a>) -> Option<NonEmpty<a>> ! pure {
+  match xs with {
+    | Nil => none()
+    | Cons(h, t) => some(non_empty(h, t))
+  }
+}

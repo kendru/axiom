@@ -1,0 +1,167 @@
+-- 07_validation.axm
+-- Data validation with structured error accumulation.
+-- Demonstrates composing pure validation logic with effect-based reporting.
+
+type List<a> = | Nil | Cons(a, List<a>)
+type Option<a> = | None | Some(a)
+type Pair<a, b> = | Pair(a, b)
+
+-- ----------------------------------------------------------------
+-- Validation types
+-- ----------------------------------------------------------------
+
+-- A validation collects all errors rather than failing on the first one.
+type Validation<a, e> = | Valid(a) | Invalid(List<e>)
+
+type FieldError = | FieldError(String, String) @# field name, error message #@
+
+-- ----------------------------------------------------------------
+-- Validation combinators
+-- ----------------------------------------------------------------
+
+fn map_valid<a, b, e>(f: (x: a) -> b ! pure, v: Validation<a, e>) -> Validation<b, e> ! pure {
+  match v with {
+    | Valid(x) => valid(f(x))
+    | Invalid(errs) => invalid(errs)
+  }
+}
+
+-- Combine two validations, accumulating errors from both.
+fn combine<a, b, e>(
+  va: Validation<a, e>,
+  vb: Validation<b, e>
+) -> Validation<Pair<a, b>, e> ! pure {
+  match va with {
+    | Invalid(ea) =>
+      match vb with {
+        | Invalid(eb) => invalid(append(ea, eb))
+        | Valid(_) => invalid(ea)
+      }
+    | Valid(a) =>
+      match vb with {
+        | Invalid(eb) => invalid(eb)
+        | Valid(b) => valid(pair(a, b))
+      }
+  }
+}
+
+-- Lift a predicate into a validation.
+fn check<a, e>(
+  pred: (x: a) -> Bool ! pure,
+  err: e,
+  value: a
+) -> Validation<a, e> ! pure {
+  if pred(value) { valid(value) } else { invalid(cons(err, nil())) }
+}
+
+-- Chain: run a second validation only if the first succeeds.
+fn and_then<a, b, e>(
+  f: (x: a) -> Validation<b, e> ! pure,
+  v: Validation<a, e>
+) -> Validation<b, e> ! pure {
+  match v with {
+    | Valid(x) => f(x)
+    | Invalid(errs) => invalid(errs)
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Domain: validating a user registration
+-- ----------------------------------------------------------------
+
+type UserInput = | UserInput(String, String, Int) @# name, email, age #@
+
+type ValidUser = | ValidUser(String, String, Int)
+
+fn validate_user(input: UserInput) -> Validation<ValidUser, FieldError> ! pure {
+  match input with {
+    | UserInput(name, email, age) =>
+      let v_name = validate_name(name) in
+      let v_email = validate_email(email) in
+      let v_age = validate_age(age) in
+      let v_name_email = combine(v_name, v_email) in
+      let v_all = combine(v_name_email, v_age) in
+      map_valid(
+        fn (p: Pair<Pair<String, String>, Int>) {
+          match p with {
+            | Pair(Pair(n, e), a) => valid_user(n, e, a)
+          }
+        },
+        v_all
+      )
+  }
+}
+
+fn validate_name(name: String) -> Validation<String, FieldError> ! pure {
+  let len = string_length(name) in
+  if lt(len, 1) {
+    invalid(cons(field_error("name", "must not be empty"), nil()))
+  } else {
+    if gt(len, 100) {
+      invalid(cons(field_error("name", "must be 100 characters or fewer"), nil()))
+    } else {
+      valid(name)
+    }
+  }
+}
+
+fn validate_email(email: String) -> Validation<String, FieldError> ! pure {
+  if contains(email, "@") {
+    valid(email)
+  } else {
+    invalid(cons(field_error("email", "must contain @"), nil()))
+  }
+}
+
+fn validate_age(age: Int) -> Validation<Int, FieldError> ! pure {
+  if lt(age, 0) {
+    invalid(cons(field_error("age", "must not be negative"), nil()))
+  } else {
+    if gt(age, 150) {
+      invalid(cons(field_error("age", "must be 150 or less"), nil()))
+    } else {
+      valid(age)
+    }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Reporting validation errors via effects
+-- ----------------------------------------------------------------
+
+effect Report {
+  report_error: (FieldError) -> Unit
+}
+
+fn report_validation<a>(
+  v: Validation<a, FieldError>
+) -> Option<a> ! {Report} {
+  match v with {
+    | Valid(x) => some(x)
+    | Invalid(errs) => do {
+        report_all(errs);
+        none()
+      }
+  }
+}
+
+fn report_all(errs: List<FieldError>) -> Unit ! {Report} {
+  match errs with {
+    | Nil => ()
+    | Cons(e, rest) => do {
+        perform Report.report_error(e);
+        report_all(rest)
+      }
+  }
+}
+
+-- Handler that collects reported errors into a list.
+fn collect_reports<a>(
+  computation: (u: Unit) -> a ! {Report}
+) -> a ! pure {
+  handle computation(()) with {
+    Report {
+      report_error(e) => resume(())
+    }
+  }
+}

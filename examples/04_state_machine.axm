@@ -1,0 +1,131 @@
+-- 04_state_machine.axm
+-- Modeling a connection state machine with types and effects.
+
+-- ----------------------------------------------------------------
+-- Types
+-- ----------------------------------------------------------------
+
+type ConnState
+  = | Disconnected
+  | Connecting(String)
+  | Connected(String, Int)
+  | Disconnecting
+
+type ConnEvent
+  = | Connect(String)
+  | ConnectionEstablished(Int)
+  | Disconnect
+  | ConnectionClosed
+  | ConnError(String)
+
+type ConnResult
+  = | Transitioned(ConnState)
+  | InvalidTransition(ConnState, ConnEvent)
+
+-- ----------------------------------------------------------------
+-- Effects
+-- ----------------------------------------------------------------
+
+effect ConnLog {
+  conn_log: (String) -> Unit
+}
+
+-- ----------------------------------------------------------------
+-- State transition function (pure core)
+-- ----------------------------------------------------------------
+
+fn transition(state: ConnState, event: ConnEvent) -> ConnResult ! pure {
+  match state with {
+    | Disconnected =>
+      match event with {
+        | Connect(addr) => transitioned(connecting(addr))
+        | _ => invalid_transition(state, event)
+      }
+    | Connecting(addr) =>
+      match event with {
+        | ConnectionEstablished(fd) => transitioned(connected(addr, fd))
+        | ConnError(_) => transitioned(disconnected())
+        | _ => invalid_transition(state, event)
+      }
+    | Connected(addr, fd) =>
+      match event with {
+        | Disconnect => transitioned(disconnecting())
+        | ConnError(_) => transitioned(disconnected())
+        | _ => invalid_transition(state, event)
+      }
+    | Disconnecting =>
+      match event with {
+        | ConnectionClosed => transitioned(disconnected())
+        | ConnError(_) => transitioned(disconnected())
+        | _ => invalid_transition(state, event)
+      }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Effectful state machine driver
+-- ----------------------------------------------------------------
+
+fn step(
+  state: ConnState,
+  event: ConnEvent
+) -> ConnState ! {ConnLog, Throw<String>} {
+  do {
+    perform ConnLog.conn_log(concat("Event: ", show_event(event)));
+    match transition(state, event) with {
+      | Transitioned(new_state) => do {
+          perform ConnLog.conn_log(concat("State: ", show_state(new_state)));
+          new_state
+        }
+      | InvalidTransition(s, e) =>
+        perform Throw.throw(concat("Invalid transition from ", show_state(s)))
+    }
+  }
+}
+
+fn run_events(
+  state: ConnState,
+  events: List<ConnEvent>
+) -> ConnState ! {ConnLog, Throw<String>} {
+  match events with {
+    | Nil => state
+    | Cons(e, rest) =>
+      let next = step(state, e) in
+      run_events(next, rest)
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Display helpers
+-- ----------------------------------------------------------------
+
+fn show_state(s: ConnState) -> String ! pure {
+  match s with {
+    | Disconnected => "Disconnected"
+    | Connecting(addr) => concat("Connecting(", concat(addr, ")"))
+    | Connected(addr, _) => concat("Connected(", concat(addr, ")"))
+    | Disconnecting => "Disconnecting"
+  }
+}
+
+fn show_event(e: ConnEvent) -> String ! pure {
+  match e with {
+    | Connect(addr) => concat("Connect(", concat(addr, ")"))
+    | ConnectionEstablished(_) => "ConnectionEstablished"
+    | Disconnect => "Disconnect"
+    | ConnectionClosed => "ConnectionClosed"
+    | ConnError(msg) => concat("Error(", concat(msg, ")"))
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Example: running a full connection lifecycle
+-- ----------------------------------------------------------------
+
+fn example_lifecycle() -> ConnState ! {ConnLog, Throw<String>} {
+  let events = cons(connect("127.0.0.1:8080"),
+               cons(connection_established(42),
+               cons(disconnect(),
+               cons(connection_closed(), nil())))) in
+  run_events(disconnected(), events)
+}

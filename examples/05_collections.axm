@@ -1,0 +1,208 @@
+-- 05_collections.axm
+-- List and Map operations. These guide what the stdlib should include.
+
+type List<a> = | Nil | Cons(a, List<a>)
+type Option<a> = | None | Some(a)
+type Pair<a, b> = | Pair(a, b)
+type Ordering = | LT | EQ | GT
+
+-- ----------------------------------------------------------------
+-- List utilities beyond the basics in 02_data_types
+-- ----------------------------------------------------------------
+
+-- Take the first n elements.
+fn take<a>(n: Int, xs: List<a>) -> List<a> ! pure {
+  if lte(n, 0) {
+    nil()
+  } else {
+    match xs with {
+      | Nil => nil()
+      | Cons(h, t) => cons(h, take(sub(n, 1), t))
+    }
+  }
+}
+
+-- Drop the first n elements.
+fn drop<a>(n: Int, xs: List<a>) -> List<a> ! pure {
+  if lte(n, 0) {
+    xs
+  } else {
+    match xs with {
+      | Nil => nil()
+      | Cons(_, t) => drop(sub(n, 1), t)
+    }
+  }
+}
+
+-- Zip two lists into a list of pairs.
+fn zip<a, b>(xs: List<a>, ys: List<b>) -> List<Pair<a, b>> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(x, xt) =>
+      match ys with {
+        | Nil => nil()
+        | Cons(y, yt) => cons(pair(x, y), zip(xt, yt))
+      }
+  }
+}
+
+-- Unzip a list of pairs.
+fn unzip<a, b>(ps: List<Pair<a, b>>) -> Pair<List<a>, List<b>> ! pure {
+  match ps with {
+    | Nil => pair(nil(), nil())
+    | Cons(Pair(x, y), rest) =>
+      let p = unzip(rest) in
+      match p with {
+        | Pair(xs, ys) => pair(cons(x, xs), cons(y, ys))
+      }
+  }
+}
+
+-- Find the first element satisfying a predicate.
+fn find<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Option<a> ! pure {
+  match xs with {
+    | Nil => none()
+    | Cons(h, t) => if pred(h) { some(h) } else { find(pred, t) }
+  }
+}
+
+-- Check if any element satisfies a predicate.
+fn any<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Bool ! pure {
+  match xs with {
+    | Nil => false
+    | Cons(h, t) => if pred(h) { true } else { any(pred, t) }
+  }
+}
+
+-- Check if all elements satisfy a predicate.
+fn all<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Bool ! pure {
+  match xs with {
+    | Nil => true
+    | Cons(h, t) => if pred(h) { all(pred, t) } else { false }
+  }
+}
+
+-- Flat-map over a list.
+fn flat_map<a, b>(f: (x: a) -> List<b> ! pure, xs: List<a>) -> List<b> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(h, t) => append(f(h), flat_map(f, t))
+  }
+}
+
+-- Intersperse a separator between elements.
+fn intersperse<a>(sep: a, xs: List<a>) -> List<a> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(h, Nil) => cons(h, nil())
+    | Cons(h, t) => cons(h, cons(sep, intersperse(sep, t)))
+  }
+}
+
+-- Sort using merge sort.
+fn sort<a>(cmp: (x: a, y: a) -> Ordering ! pure, xs: List<a>) -> List<a> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(_, Nil) => xs
+    | _ =>
+      let halves = split_half(xs) in
+      match halves with {
+        | Pair(left, right) => merge(cmp, sort(cmp, left), sort(cmp, right))
+      }
+  }
+}
+
+fn merge<a>(cmp: (x: a, y: a) -> Ordering ! pure, xs: List<a>, ys: List<a>) -> List<a> ! pure {
+  match xs with {
+    | Nil => ys
+    | Cons(x, xt) =>
+      match ys with {
+        | Nil => xs
+        | Cons(y, yt) =>
+          match cmp(x, y) with {
+            | GT => cons(y, merge(cmp, xs, yt))
+            | _ => cons(x, merge(cmp, xt, ys))
+          }
+      }
+  }
+}
+
+fn split_half<a>(xs: List<a>) -> Pair<List<a>, List<a>> ! pure {
+  let n = length(xs) in
+  let half = div(n, 2) in
+  pair(take(half, xs), drop(half, xs))
+}
+
+-- ----------------------------------------------------------------
+-- Association list (simple key-value map)
+-- ----------------------------------------------------------------
+
+type AssocList<k, v> = | AssocList(List<Pair<k, v>>)
+
+fn assoc_empty<k, v>() -> AssocList<k, v> ! pure {
+  assoc_list(nil())
+}
+
+fn assoc_insert<k, v>(
+  eq: (a: k, b: k) -> Bool ! pure,
+  key: k,
+  value: v,
+  m: AssocList<k, v>
+) -> AssocList<k, v> ! pure {
+  match m with {
+    | AssocList(entries) =>
+      assoc_list(cons(pair(key, value), assoc_remove_all(eq, key, entries)))
+  }
+}
+
+fn assoc_lookup<k, v>(
+  eq: (a: k, b: k) -> Bool ! pure,
+  key: k,
+  m: AssocList<k, v>
+) -> Option<v> ! pure {
+  match m with {
+    | AssocList(entries) => lookup_entries(eq, key, entries)
+  }
+}
+
+fn lookup_entries<k, v>(
+  eq: (a: k, b: k) -> Bool ! pure,
+  key: k,
+  entries: List<Pair<k, v>>
+) -> Option<v> ! pure {
+  match entries with {
+    | Nil => none()
+    | Cons(Pair(k, v), rest) =>
+      if eq(k, key) { some(v) } else { lookup_entries(eq, key, rest) }
+  }
+}
+
+fn assoc_remove_all<k, v>(
+  eq: (a: k, b: k) -> Bool ! pure,
+  key: k,
+  entries: List<Pair<k, v>>
+) -> List<Pair<k, v>> ! pure {
+  match entries with {
+    | Nil => nil()
+    | Cons(Pair(k, v), rest) =>
+      if eq(k, key) {
+        assoc_remove_all(eq, key, rest)
+      } else {
+        cons(pair(k, v), assoc_remove_all(eq, key, rest))
+      }
+  }
+}
+
+fn assoc_keys<k, v>(m: AssocList<k, v>) -> List<k> ! pure {
+  match m with {
+    | AssocList(entries) =>
+      map(fn (p: Pair<k, v>) { match p with { | Pair(k, _) => k } }, entries)
+  }
+}
+
+fn assoc_values<k, v>(m: AssocList<k, v>) -> List<v> ! pure {
+  match m with {
+    | AssocList(entries) =>
+      map(fn (p: Pair<k, v>) { match p with { | Pair(_, v) => v } }, entries)
+  }
+}

@@ -1,0 +1,170 @@
+-- 09_pipeline.axm
+-- Data transformation pipelines using function composition.
+-- Demonstrates higher-order functions and effect-polymorphic pipelines.
+
+type List<a> = | Nil | Cons(a, List<a>)
+type Option<a> = | None | Some(a)
+type Pair<a, b> = | Pair(a, b)
+
+-- ----------------------------------------------------------------
+-- Function composition
+-- ----------------------------------------------------------------
+
+-- Compose two pure functions: returns the result of f(g(x)).
+fn compose_apply<a, b, c>(
+  f: (x: b) -> c ! pure,
+  g: (x: a) -> b ! pure,
+  x: a
+) -> c ! pure {
+  f(g(x))
+}
+
+-- Pipe a value through a function (flip of application).
+fn pipe<a, b>(x: a, f: (x: a) -> b ! pure) -> b ! pure {
+  f(x)
+}
+
+-- ----------------------------------------------------------------
+-- Pipeline type: a reusable chain of transformations
+-- ----------------------------------------------------------------
+
+-- A Step is a named transformation.
+type Step<a, b> = | Step(String, (x: a) -> b ! pure)
+
+-- Apply a single step.
+fn apply_step<a, b>(step: Step<a, b>, input: a) -> b ! pure {
+  match step with {
+    | Step(_, f) => f(input)
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Effectful pipelines
+-- ----------------------------------------------------------------
+
+-- Run a logged step that can fail.
+fn run_step_logged<a, b>(
+  step: Step<a, b>,
+  input: a
+) -> b ! {Log, Throw<String>} {
+  match step with {
+    | Step(name, f) => do {
+        perform Log.log(debug(), concat("Running step: ", name));
+        let result = f(input);
+        perform Log.log(debug(), concat("Completed step: ", name));
+        result
+      }
+  }
+}
+
+-- Run a list of homogeneous steps in sequence.
+fn run_pipeline<a>(
+  steps: List<Step<a, a>>,
+  input: a
+) -> a ! {Log, Throw<String>} {
+  match steps with {
+    | Nil => input
+    | Cons(step, rest) =>
+      let output = run_step_logged(step, input) in
+      run_pipeline(rest, output)
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Example: text processing pipeline
+-- ----------------------------------------------------------------
+
+fn normalize_whitespace(s: String) -> String ! pure {
+  replace_all(s, "  ", " ")
+}
+
+fn strip_html_tags(s: String) -> String ! pure {
+  remove_between(s, "<", ">")
+}
+
+fn truncate(max_len: Int, s: String) -> String ! pure {
+  if lte(string_length(s), max_len) {
+    s
+  } else {
+    concat(string_take(max_len, s), "...")
+  }
+}
+
+fn text_pipeline() -> List<Step<String, String>> ! pure {
+  cons(step("strip_html", strip_html_tags),
+  cons(step("normalize_ws", normalize_whitespace),
+  cons(step("truncate", fn (s: String) -> String ! pure { truncate(200, s) }),
+  nil())))
+}
+
+-- ----------------------------------------------------------------
+-- Example: numeric data pipeline
+-- ----------------------------------------------------------------
+
+type DataPoint = | DataPoint(String, Float64) @# label, value #@
+
+fn scale_point(factor: Float64, dp: DataPoint) -> DataPoint ! pure {
+  match dp with {
+    | DataPoint(label, value) => data_point(label, mul_f(value, factor))
+  }
+}
+
+fn clamp_point(lo: Float64, hi: Float64, dp: DataPoint) -> DataPoint ! pure {
+  match dp with {
+    | DataPoint(label, value) =>
+      if lt_f(value, lo) {
+        data_point(label, lo)
+      } else {
+        if gt_f(value, hi) { data_point(label, hi) } else { dp }
+      }
+  }
+}
+
+fn label_point(prefix: String, dp: DataPoint) -> DataPoint ! pure {
+  match dp with {
+    | DataPoint(label, value) =>
+      data_point(concat(prefix, label), value)
+  }
+}
+
+fn numeric_pipeline() -> List<Step<DataPoint, DataPoint>> ! pure {
+  cons(step("scale", fn (dp: DataPoint) -> DataPoint ! pure { scale_point(2.0, dp) }),
+  cons(step("clamp", fn (dp: DataPoint) -> DataPoint ! pure { clamp_point(0.0, 100.0, dp) }),
+  cons(step("label", fn (dp: DataPoint) -> DataPoint ! pure { label_point("processed_", dp) }),
+  nil())))
+}
+
+-- ----------------------------------------------------------------
+-- Batch processing: apply pipeline to a collection
+-- ----------------------------------------------------------------
+
+fn process_batch<a>(
+  steps: List<Step<a, a>>,
+  items: List<a>
+) -> List<a> ! {Log, Throw<String>} {
+  match items with {
+    | Nil => nil()
+    | Cons(item, rest) =>
+      let processed = run_pipeline(steps, item) in
+      let remaining = process_batch(steps, rest) in
+      cons(processed, remaining)
+  }
+}
+
+-- Count items that pass a predicate after processing.
+fn count_matching<a>(
+  pred: (x: a) -> Bool ! pure,
+  steps: List<Step<a, a>>,
+  items: List<a>
+) -> Int ! {Log, Throw<String>} {
+  let processed = process_batch(steps, items) in
+  count_where(pred, processed)
+}
+
+fn count_where<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Int ! pure {
+  match xs with {
+    | Nil => 0
+    | Cons(h, t) =>
+      if pred(h) { add(1, count_where(pred, t)) } else { count_where(pred, t) }
+  }
+}

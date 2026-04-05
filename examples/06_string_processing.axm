@@ -1,0 +1,174 @@
+-- 06_string_processing.axm
+-- String manipulation and text transformation.
+-- Guides stdlib design for String and Char operations.
+
+type List<a> = | Nil | Cons(a, List<a>)
+type Option<a> = | None | Some(a)
+type Result<a, e> = | Ok(a) | Err(e)
+type Pair<a, b> = | Pair(a, b)
+
+-- ----------------------------------------------------------------
+-- Basic string operations (stdlib candidates)
+-- ----------------------------------------------------------------
+
+-- Join a list of strings with a separator.
+fn join(sep: String, parts: List<String>) -> String ! pure {
+  match parts with {
+    | Nil => ""
+    | Cons(h, Nil) => h
+    | Cons(h, t) => concat(h, concat(sep, join(sep, t)))
+  }
+}
+
+-- Repeat a string n times.
+fn repeat(s: String, n: Int) -> String ! pure {
+  if lte(n, 0) { "" } else { concat(s, repeat(s, sub(n, 1))) }
+}
+
+-- Pad a string on the left to a given width.
+fn pad_left(width: Int, pad_char: String, s: String) -> String ! pure {
+  let len = string_length(s) in
+  if gte(len, width) {
+    s
+  } else {
+    concat(repeat(pad_char, sub(width, len)), s)
+  }
+}
+
+-- Pad a string on the right.
+fn pad_right(width: Int, pad_char: String, s: String) -> String ! pure {
+  let len = string_length(s) in
+  if gte(len, width) {
+    s
+  } else {
+    concat(s, repeat(pad_char, sub(width, len)))
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Character classification (stdlib candidates)
+-- ----------------------------------------------------------------
+
+fn is_whitespace(c: Char) -> Bool ! pure {
+  if eq_char(c, space_char()) { true } else { eq_char(c, tab_char()) }
+}
+
+fn is_upper(c: Char) -> Bool ! pure {
+  let code = char_code(c) in
+  if lt(code, 65) { false } else { lte(code, 90) }
+}
+
+fn is_lower(c: Char) -> Bool ! pure {
+  let code = char_code(c) in
+  if lt(code, 97) { false } else { lte(code, 122) }
+}
+
+fn is_alpha(c: Char) -> Bool ! pure {
+  if is_upper(c) { true } else { is_lower(c) }
+}
+
+fn is_alphanumeric(c: Char) -> Bool ! pure {
+  if is_alpha(c) { true } else { is_digit(c) }
+}
+
+-- ----------------------------------------------------------------
+-- String transformations
+-- ----------------------------------------------------------------
+
+-- Convert a list of chars to a string.
+fn chars_to_string(cs: List<Char>) -> String ! pure {
+  match cs with {
+    | Nil => ""
+    | Cons(c, rest) => concat(char_to_string(c), chars_to_string(rest))
+  }
+}
+
+-- Convert to uppercase (operating on chars).
+fn to_upper_char(c: Char) -> Char ! pure {
+  if is_lower(c) {
+    code_to_char(sub(char_code(c), 32))
+  } else {
+    c
+  }
+}
+
+fn to_upper(s: String) -> String ! pure {
+  let cs = string_to_chars(s) in
+  chars_to_string(map_chars(to_upper_char, cs))
+}
+
+fn map_chars(f: (c: Char) -> Char ! pure, cs: List<Char>) -> List<Char> ! pure {
+  match cs with {
+    | Nil => nil()
+    | Cons(c, rest) => cons(f(c), map_chars(f, rest))
+  }
+}
+
+-- Trim leading whitespace.
+fn trim_left(s: String) -> String ! pure {
+  let cs = string_to_chars(s) in
+  chars_to_string(drop_while_chars(is_whitespace, cs))
+}
+
+fn drop_while_chars(pred: (c: Char) -> Bool ! pure, cs: List<Char>) -> List<Char> ! pure {
+  match cs with {
+    | Nil => nil()
+    | Cons(c, rest) =>
+      if pred(c) { drop_while_chars(pred, rest) } else { cons(c, rest) }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Simple template rendering
+-- ----------------------------------------------------------------
+
+-- A template is a list of segments: literal text or variable references.
+type Segment = | Literal(String) | Variable(String)
+type Template = | Template(List<Segment>)
+
+-- Render a template by looking up variables in an environment.
+fn render(
+  tmpl: Template,
+  env: List<Pair<String, String>>
+) -> String ! {Throw<String>} {
+  match tmpl with {
+    | Template(segments) => render_segments(segments, env)
+  }
+}
+
+fn render_segments(
+  segments: List<Segment>,
+  env: List<Pair<String, String>>
+) -> String ! {Throw<String>} {
+  match segments with {
+    | Nil => ""
+    | Cons(seg, rest) =>
+      let s = render_segment(seg, env) in
+      concat(s, render_segments(rest, env))
+  }
+}
+
+fn render_segment(
+  seg: Segment,
+  env: List<Pair<String, String>>
+) -> String ! {Throw<String>} {
+  match seg with {
+    | Literal(text) => text
+    | Variable(name) =>
+      match lookup_string(name, env) with {
+        | Some(value) => value
+        | None => perform Throw.throw(concat("Unknown variable: ", name))
+      }
+  }
+}
+
+fn lookup_string(
+  key: String,
+  env: List<Pair<String, String>>
+) -> Option<String> ! pure {
+  match env with {
+    | Nil => none()
+    | Cons(Pair(k, v), rest) =>
+      if string_eq(k, key) { some(v) } else { lookup_string(key, rest) }
+  }
+}

@@ -1,0 +1,238 @@
+-- 10_json.axm
+-- JSON-like data representation and traversal.
+-- Demonstrates recursive types, pattern matching, and effect-based error reporting.
+
+type List<a> = | Nil | Cons(a, List<a>)
+type Option<a> = | None | Some(a)
+type Pair<a, b> = | Pair(a, b)
+
+-- ----------------------------------------------------------------
+-- JSON value type
+-- ----------------------------------------------------------------
+
+type Json
+  = | JNull
+  | JBool(Bool)
+  | JInt(Int)
+  | JFloat(Float64)
+  | JString(String)
+  | JArray(List<Json>)
+  | JObject(List<Pair<String, Json>>)
+
+-- ----------------------------------------------------------------
+-- Constructors (ergonomic helpers — stdlib candidates)
+-- ----------------------------------------------------------------
+
+fn json_object(fields: List<Pair<String, Json>>) -> Json ! pure {
+  j_object(fields)
+}
+
+fn json_array(items: List<Json>) -> Json ! pure {
+  j_array(items)
+}
+
+fn json_string(s: String) -> Json ! pure {
+  j_string(s)
+}
+
+fn json_int(n: Int) -> Json ! pure {
+  j_int(n)
+}
+
+fn json_bool(b: Bool) -> Json ! pure {
+  j_bool(b)
+}
+
+fn json_null() -> Json ! pure {
+  j_null()
+}
+
+-- ----------------------------------------------------------------
+-- Accessors with error effects
+-- ----------------------------------------------------------------
+
+type JsonError
+  = | NotAnObject(Json)
+  | NotAnArray(Json)
+  | NotAString(Json)
+  | NotAnInt(Json)
+  | NotABool(Json)
+  | MissingField(String)
+  | IndexOutOfBounds(Int)
+
+fn get_field(key: String, j: Json) -> Json ! {Throw<JsonError>} {
+  match j with {
+    | JObject(fields) =>
+      match lookup_field(key, fields) with {
+        | Some(v) => v
+        | None => perform Throw.throw(missing_field(key))
+      }
+    | _ => perform Throw.throw(not_an_object(j))
+  }
+}
+
+fn get_index(idx: Int, j: Json) -> Json ! {Throw<JsonError>} {
+  match j with {
+    | JArray(items) =>
+      match list_nth(idx, items) with {
+        | Some(v) => v
+        | None => perform Throw.throw(index_out_of_bounds(idx))
+      }
+    | _ => perform Throw.throw(not_an_array(j))
+  }
+}
+
+fn as_string(j: Json) -> String ! {Throw<JsonError>} {
+  match j with {
+    | JString(s) => s
+    | _ => perform Throw.throw(not_a_string(j))
+  }
+}
+
+fn as_int(j: Json) -> Int ! {Throw<JsonError>} {
+  match j with {
+    | JInt(n) => n
+    | _ => perform Throw.throw(not_an_int(j))
+  }
+}
+
+fn as_bool(j: Json) -> Bool ! {Throw<JsonError>} {
+  match j with {
+    | JBool(b) => b
+    | _ => perform Throw.throw(not_a_bool(j))
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Traversal and transformation
+-- ----------------------------------------------------------------
+
+-- Map a function over all values in a JSON tree (post-order).
+fn json_map(f: (j: Json) -> Json ! pure, j: Json) -> Json ! pure {
+  match j with {
+    | JArray(items) =>
+      f(j_array(map_json_list(f, items)))
+    | JObject(fields) =>
+      f(j_object(map_json_fields(f, fields)))
+    | _ => f(j)
+  }
+}
+
+fn map_json_list(f: (j: Json) -> Json ! pure, items: List<Json>) -> List<Json> ! pure {
+  match items with {
+    | Nil => nil()
+    | Cons(h, t) => cons(json_map(f, h), map_json_list(f, t))
+  }
+}
+
+fn map_json_fields(
+  f: (j: Json) -> Json ! pure,
+  fields: List<Pair<String, Json>>
+) -> List<Pair<String, Json>> ! pure {
+  match fields with {
+    | Nil => nil()
+    | Cons(Pair(k, v), rest) =>
+      cons(pair(k, json_map(f, v)), map_json_fields(f, rest))
+  }
+}
+
+-- Collect all string values in a JSON tree.
+fn collect_strings(j: Json) -> List<String> ! pure {
+  match j with {
+    | JString(s) => cons(s, nil())
+    | JArray(items) => flat_map_json(collect_strings, items)
+    | JObject(fields) => flat_map_fields(collect_strings, fields)
+    | _ => nil()
+  }
+}
+
+fn flat_map_json(
+  f: (j: Json) -> List<String> ! pure,
+  items: List<Json>
+) -> List<String> ! pure {
+  match items with {
+    | Nil => nil()
+    | Cons(h, t) => append(f(h), flat_map_json(f, t))
+  }
+}
+
+fn flat_map_fields(
+  f: (j: Json) -> List<String> ! pure,
+  fields: List<Pair<String, Json>>
+) -> List<String> ! pure {
+  match fields with {
+    | Nil => nil()
+    | Cons(Pair(_, v), rest) => append(f(v), flat_map_fields(f, rest))
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Path-based access: "a.b.c" style dotted paths
+-- ----------------------------------------------------------------
+
+type Path = | Path(List<String>)
+
+fn get_path(path: Path, j: Json) -> Json ! {Throw<JsonError>} {
+  match path with {
+    | Path(segments) => follow_path(segments, j)
+  }
+}
+
+fn follow_path(segments: List<String>, j: Json) -> Json ! {Throw<JsonError>} {
+  match segments with {
+    | Nil => j
+    | Cons(key, rest) =>
+      let child = get_field(key, j) in
+      follow_path(rest, child)
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Helpers
+-- ----------------------------------------------------------------
+
+fn lookup_field(
+  key: String,
+  fields: List<Pair<String, Json>>
+) -> Option<Json> ! pure {
+  match fields with {
+    | Nil => none()
+    | Cons(Pair(k, v), rest) =>
+      if string_eq(k, key) { some(v) } else { lookup_field(key, rest) }
+  }
+}
+
+fn list_nth<a>(n: Int, xs: List<a>) -> Option<a> ! pure {
+  match xs with {
+    | Nil => none()
+    | Cons(h, t) =>
+      if eq(n, 0) { some(h) } else { list_nth(sub(n, 1), t) }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Example: extract data from a JSON structure
+-- ----------------------------------------------------------------
+
+fn example_json() -> Json ! pure {
+  j_object(
+    cons(pair("name", j_string("Alice")),
+    cons(pair("age", j_int(30)),
+    cons(pair("active", j_bool(true)),
+    cons(pair("scores", j_array(
+      cons(j_int(95),
+      cons(j_int(87),
+      cons(j_int(92), nil())))
+    )),
+    nil()))))
+  )
+}
+
+fn extract_name(j: Json) -> String ! {Throw<JsonError>} {
+  as_string(get_field("name", j))
+}
+
+fn extract_first_score(j: Json) -> Int ! {Throw<JsonError>} {
+  let scores = get_field("scores", j) in
+  as_int(get_index(0, scores))
+}

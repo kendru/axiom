@@ -200,7 +200,7 @@ let test_program_two_fns () =
 let test_fn_decl_comment () =
   check_decl "fn with comment"
     "fn foo(x: Int) { x } @# entry point #@"
-    { decl_kind = DeclFn { pub = false; fn_name = "foo"; type_params = []
+    { decl_desc = DeclFn { pub = false; fn_name = "foo"; type_params = []
                           ; params = [{ param_name = "x"; param_type = TyName "Int" }]
                           ; return_type = None; effects = None; decl_body = e (Var "x") }
     ; decl_comment = Some "entry point" }
@@ -209,7 +209,7 @@ let test_fn_decl_comment () =
 let test_type_decl_comment () =
   check_decl "type with comment"
     "type Bool = | True | False @# boolean type #@"
-    { decl_kind = DeclType { pub = false; type_name = "Bool"; type_params = []
+    { decl_desc = DeclType { pub = false; type_name = "Bool"; type_params = []
                             ; ctors = [ { ctor_name = "True"; ctor_params = [] }
                                        ; { ctor_name = "False"; ctor_params = [] } ] }
     ; decl_comment = Some "boolean type" }

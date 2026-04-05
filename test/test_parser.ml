@@ -411,39 +411,39 @@ let test_paren_var () =
 let test_comment_on_atom () =
   check_expr "comment on literal"
     "42 @# the answer #@"
-    { kind = IntLit 42; comment = Some "the answer" }
+    { desc = IntLit 42; comment = Some "the answer" }
 
 (* let x = 42 @# the answer #@ in x *)
 let test_comment_on_value () =
   check_expr "comment on let value"
     "let x = 42 @# the answer #@ in x"
     (e (Let { pat = p (PVar "x")
-            ; value = { kind = IntLit 42; comment = Some "the answer" }
+            ; value = { desc = IntLit 42; comment = Some "the answer" }
             ; body = e (Var "x") }))
 
 (* f(42) @# function call #@ *)
 let test_comment_on_app () =
   check_expr "comment on application"
     "f(42) @# function call #@"
-    { kind = App (e (Var "f"), [e (IntLit 42)]); comment = Some "function call" }
+    { desc = App (e (Var "f"), [e (IntLit 42)]); comment = Some "function call" }
 
 (* (x) @# grouped #@ *)
 let test_comment_on_paren () =
   check_expr "comment on parenthesised"
     "(x) @# grouped #@"
-    { kind = Var "x"; comment = Some "grouped" }
+    { desc = Var "x"; comment = Some "grouped" }
 
 (* f(42 @# the arg #@) *)
 let test_comment_on_arg () =
   check_expr "comment on arg"
     "f(42 @# the arg #@)"
-    (e (App (e (Var "f"), [{ kind = IntLit 42; comment = Some "the arg" }])))
+    (e (App (e (Var "f"), [{ desc = IntLit 42; comment = Some "the arg" }])))
 
 (* p.x @# field access #@ *)
 let test_comment_on_project () =
   check_expr "comment on projection"
     "p.x @# field access #@"
-    { kind = Project (e (Var "p"), "x"); comment = Some "field access" }
+    { desc = Project (e (Var "p"), "x"); comment = Some "field access" }
 
 let () =
   Alcotest.run "Parser"

@@ -40,11 +40,11 @@ type literal =
 (* ------------------------------------------------------------------ *)
 
 type pattern = {
-  pat_kind : pattern_kind;
+  pat_desc : pat_desc;
   pat_comment : string option;
 }
 
-and pattern_kind =
+and pat_desc =
   | PWild                               (** _ *)
   | PVar    of string                   (** x *)
   | PLit    of literal                  (** 42, true, "s", () *)
@@ -54,18 +54,18 @@ and pattern_kind =
   | POr     of pattern * pattern        (** p1 | p2 *)
 
 (** Build a pattern node with no comment. *)
-let pat k = { pat_kind = k; pat_comment = None }
+let pat k = { pat_desc = k; pat_comment = None }
 
 (* ------------------------------------------------------------------ *)
 (* Expression AST (mutually recursive)                                  *)
 (* ------------------------------------------------------------------ *)
 
 type expr = {
-  kind    : expr_kind;
+  desc    : expr_desc;
   comment : string option;
 }
 
-and expr_kind =
+and expr_desc =
   | Var       of string
   | IntLit    of int
   | FloatLit  of float
@@ -154,7 +154,7 @@ and handle_data = {
 }
 
 (** Build an expression node with no comment. *)
-let expr k = { kind = k; comment = None }
+let expr k = { desc = k; comment = None }
 
 (* ------------------------------------------------------------------ *)
 (* Pretty-printers                                                      *)
@@ -168,12 +168,12 @@ let pp_literal fmt = function
   | LUnit     -> Format.pp_print_string fmt "LUnit"
 
 let rec pp_pattern fmt p =
-  pp_pattern_kind fmt p.pat_kind;
+  pp_pattern_desc fmt p.pat_desc;
   match p.pat_comment with
   | None   -> ()
   | Some c -> Format.fprintf fmt " @#%s#@" c
 
-and pp_pattern_kind fmt = function
+and pp_pattern_desc fmt = function
   | PWild        -> Format.pp_print_string fmt "PWild"
   | PVar s       -> Format.fprintf fmt "PVar(%S)" s
   | PLit l       -> Format.fprintf fmt "PLit(%a)" pp_literal l
@@ -218,12 +218,12 @@ let pp_param fmt { param_name; param_type } =
   Format.fprintf fmt "%s: %a" param_name pp_type_expr param_type
 
 let rec pp_expr fmt e =
-  pp_expr_kind fmt e.kind;
+  pp_expr_desc fmt e.desc;
   match e.comment with
   | None   -> ()
   | Some c -> Format.fprintf fmt " @#%s#@" c
 
-and pp_expr_kind fmt = function
+and pp_expr_desc fmt = function
   | Var s       -> Format.fprintf fmt "Var(%S)" s
   | IntLit n    -> Format.fprintf fmt "IntLit(%d)" n
   | FloatLit f  -> Format.fprintf fmt "FloatLit(%g)" f
@@ -332,9 +332,9 @@ let equal_literal a b = match a, b with
 
 let rec equal_pattern a b =
   a.pat_comment = b.pat_comment &&
-  equal_pattern_kind a.pat_kind b.pat_kind
+  equal_pattern_desc a.pat_desc b.pat_desc
 
-and equal_pattern_kind a b = match a, b with
+and equal_pattern_desc a b = match a, b with
   | PWild,           PWild           -> true
   | PVar x,          PVar y          -> x = y
   | PLit la,         PLit lb         -> equal_literal la lb
@@ -376,9 +376,9 @@ let equal_param a b =
 
 let rec equal_expr a b =
   a.comment = b.comment &&
-  equal_expr_kind a.kind b.kind
+  equal_expr_desc a.desc b.desc
 
-and equal_expr_kind a b = match a, b with
+and equal_expr_desc a b = match a, b with
   | Var x,       Var y       -> x = y
   | IntLit m,    IntLit n    -> m = n
   | FloatLit f,  FloatLit g  -> f = g
@@ -473,11 +473,11 @@ type effect_op = {
 }
 
 type decl = {
-  decl_kind    : decl_kind;
+  decl_desc    : decl_desc;
   decl_comment : string option;
 }
 
-and decl_kind =
+and decl_desc =
   | DeclFn of {
       pub         : bool;
       fn_name     : string;
@@ -507,7 +507,7 @@ and decl_kind =
   | DeclRequire of type_expr
 
 (** Build a declaration node with no comment. *)
-let decl k = { decl_kind = k; decl_comment = None }
+let decl k = { decl_desc = k; decl_comment = None }
 
 type program = decl list
 
@@ -531,12 +531,12 @@ let pp_effect_op fmt { effect_op_name; effect_op_params; effect_op_return } =
     pp_type_expr effect_op_return
 
 let rec pp_decl fmt d =
-  pp_decl_kind fmt d.decl_kind;
+  pp_decl_desc fmt d.decl_desc;
   match d.decl_comment with
   | None   -> ()
   | Some c -> Format.fprintf fmt " @#%s#@" c
 
-and pp_decl_kind fmt = function
+and pp_decl_desc fmt = function
   | DeclFn { pub; fn_name; type_params; params; return_type; effects; decl_body } ->
     Format.fprintf fmt "%sFn %s%s(%a)%s%s { %a }"
       (if pub then "pub " else "")
@@ -589,9 +589,9 @@ let equal_effect_op a b =
 
 let rec equal_decl a b =
   a.decl_comment = b.decl_comment &&
-  equal_decl_kind a.decl_kind b.decl_kind
+  equal_decl_desc a.decl_desc b.decl_desc
 
-and equal_decl_kind a b = match a, b with
+and equal_decl_desc a b = match a, b with
   | DeclFn a, DeclFn b ->
     a.pub = b.pub && a.fn_name = b.fn_name
     && a.type_params = b.type_params

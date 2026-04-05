@@ -146,8 +146,11 @@ boundaries, with visual structure that aids scope recognition.
 - Visual chunk boundaries via indentation and keyword-delimited blocks.
 - Redundant semantic markers where they aid reasoning (e.g., `-> ReturnType`
   even when inferrable).
-- Named parameters at function boundaries, positional shorthand (`$0`, `$1`)
-  available within small closures.
+- Named parameters at function boundaries.
+
+> **Implementation note:** Positional shorthand (`$0`, `$1`) for closures is
+> described here as a design aspiration but is not yet implemented in the lexer
+> or parser.
 
 **The working form is not fixed.** Different LLMs, different tasks, and future
 research may reveal that alternative syntaxes are more effective. The three-layer
@@ -356,7 +359,7 @@ e ::=
   | C e₁ ... eₙ                             -- constructor application
   | perform E.op e₁ ... eₙ                  -- effect operation invocation
   | handle e with H                          -- effect handler (linear)
-  | literal                                  -- integer, float, string, byte
+  | literal                                  -- integer, float, string
   | { l₁ = e₁ , ... , lₙ = eₙ }            -- record construction
   | e.l                                      -- record projection
   | do { s₁ ; ... ; sₙ }                    -- sequencing (sugar)
@@ -381,14 +384,16 @@ Mutually recursive definitions are grouped explicitly with `letrec`:
 ```
 letrec {
   is_even = fn (n: Nat) -> Bool {
-    match n with
+    match n with {
     | Zero => true
     | Succ m => is_odd(m)
+    }
   },
   is_odd = fn (n: Nat) -> Bool {
-    match n with
+    match n with {
     | Zero => false
     | Succ m => is_even(m)
+    }
   }
 } in is_even(42)
 ```
@@ -422,6 +427,12 @@ primitives when needed.
   | { l₁: τ₁, ..., lₙ: τₙ | ρ }            -- extensible record (row poly)
   | forall α . τ                             -- universal quantification
   | rec α . τ                                -- recursive type
+
+> **Implementation status:** The current AST `type_expr` supports `TyName`,
+> `TyApp`, `TyTuple`, and `TyFun`. Row-polymorphic records (`{ ... | ρ }`)
+> and recursive types (`rec α . τ`) are not yet represented in the AST or
+> parser. The type checker's internal `ty` also lacks these forms. These are
+> planned features that will require AST and parser extensions.
 ```
 
 ### 4.2 Effect Types
@@ -431,6 +442,12 @@ primitives when needed.
   | pure                                     -- no effects
   | { E₁, ..., Eₙ | ε' }                   -- effect set with row variable
   | ε'                                       -- effect variable (polymorphism)
+
+> **Implementation status:** The current AST `effect_set` is
+> `Pure | Effects of type_expr list` — a closed set with no row variable slot.
+> Effect row polymorphism (the `| ε'` tail) is not yet implemented.
+> The type checker defers effect inference entirely, returning fresh meta
+> variables for all effect positions.
 ```
 
 Every function type carries an effect annotation. A function `A -> B ! pure` is
@@ -535,9 +552,10 @@ Code that needs an effect invokes it with `perform`:
 
 ```
 fn read_config(path: Path) -> Config ! {FileSystem, Throw<ParseError>} {
-  match perform FileSystem.read_file(path) with
+  match perform FileSystem.read_file(path) with {
   | Ok(bytes) => parse_config(bytes)
   | Err(e)    => perform Throw.throw(wrap_io_error(e))
+  }
 }
 ```
 
@@ -699,14 +717,16 @@ fn with_caching<A>(computation: () -> A ! {FileSystem, E}) -> A ! {FileSystem, E
   handle computation() with {
     FileSystem {
       read_file(path) =>
-        match Map.lookup(path, cache) with
-        | Some(cached) => resume Ok(cached)
+        match Map.lookup(path, cache) with {
+        | Some(cached) => resume(Ok(cached))
         | None => {
             let result = perform FileSystem.read_file(path)
-            match result with
-            | Ok(bytes) => { Map.insert(path, bytes, cache); resume result }
-            | err       => resume err
+            match result with {
+            | Ok(bytes) => { Map.insert(path, bytes, cache); resume(result) }
+            | err       => resume(err)
+            }
           }
+        }
     }
   }
 }
@@ -798,9 +818,10 @@ The standard iteration pattern is tail-recursive functions with accumulators:
 ```
 fn sum(xs: List<Int>) -> Int ! pure {
   fn go(acc: Int, rest: List<Int>) -> Int ! pure {
-    match rest with
+    match rest with {
     | Nil        => acc
     | Cons(h, t) => go(acc + h, t)    -- tail call, compiles to jump
+    }
   }
   go(0, xs)
 }
@@ -823,12 +844,13 @@ handle count_loop(1000000) with {
 }
 
 fn count_loop(n: Int) -> Int ! {State<Int>} {
-  match n with
+  match n with {
   | 0 => perform State.get()
   | _ => {
       perform State.put(perform State.get() + 1)
       count_loop(n - 1)    -- tail call, bounded stack even through handler
     }
+  }
 }
 ```
 
@@ -884,9 +906,10 @@ module json_parser {
   }
 
   pub fn parse_file(path: Path) -> JsonValue ! {FileSystem, Throw<ParseError>} {
-    match perform FileSystem.read_file(path) with
+    match perform FileSystem.read_file(path) with {
     | Ok(bytes)  => parse_string(bytes_to_string(bytes))
     | Err(e)     => perform Throw.throw(io_to_parse_error(e))
+    }
   }
 
   -- Private helper, not exported
@@ -912,6 +935,11 @@ This is the fundamental unit of abstraction. The LLM can compose modules
 without reading their implementations.
 
 ### 7.3 Module Imports and Composition
+
+> **Implementation status:** The `import` keyword and module import/aliasing
+> (`import X as Y`) are not yet implemented in the lexer, parser, or AST.
+> The examples below represent the planned design. Currently, only `require
+> effect` declarations exist for declaring module dependencies.
 
 ```
 module app {
@@ -1015,11 +1043,11 @@ The syntax prioritizes:
 ```
 -- Top-level structure
 
-program     ::= module_decl*
+program     ::= decl*
 
-module_decl ::= 'module' IDENT '{' module_item* '}'
+decl        ::= require_decl | type_decl | effect_decl | fn_decl | module_decl
 
-module_item ::= require_decl | type_decl | effect_decl | fn_decl
+module_decl ::= 'pub'? 'module' IDENT '{' decl* '}'
 
 require_decl ::= 'require' 'effect' type_expr
 
@@ -1029,8 +1057,10 @@ variant     ::= CTOR_IDENT | CTOR_IDENT '(' type_expr (',' type_expr)* ')'
 
 effect_decl ::= 'effect' type_head '{' op_decl* '}'
 op_decl     ::= IDENT ':' '(' type_expr (',' type_expr)* ')' '->' type_expr
+             -- Operations are comma-separated within the effect body.
 
-fn_decl     ::= 'pub'? 'fn' IDENT type_params? '(' params ')' '->' type_expr '!' effect_set '{' expr '}'
+fn_decl     ::= 'pub'? 'fn' IDENT type_params? '(' params ')' ('->' type_expr ('!' effect_set)?)? '{' expr '}'
+             -- Return type and effect annotations are optional in the implementation.
 
 -- Type-level
 
@@ -1074,7 +1104,8 @@ letrec_bind ::= IDENT '(' params ')' ':' type_expr '=' expr
 match_expr  ::= 'match' expr 'with' '{' ('|' pattern '=>' expr)+ '}'
 
 handle_expr ::= 'handle' expr 'with' '{' handler_clause+ '}'
-handler_clause ::= IDENT '{' op_handler+ '}'
+handler_clause ::= CTOR_IDENT '{' op_handler+ '}'
+             -- Effect names are uppercase-start (CtorIdent), e.g. State, Log.
 op_handler  ::= IDENT '(' params ')' '=>' expr
               | 'return' IDENT '=>' expr
               -- 'return' branch handles the normal completion value (see note below)
@@ -1163,9 +1194,10 @@ handle compute() with {
 branches. All bound names must have the same type in each branch.
 
 ```
-match shape with
+match shape with {
 | Circle(r) | Ellipse(r, r) => area_approx(r)
 | _                         => 0.0
+}
 ```
 
 ### 8.3 Complete Example: Key-Value Store
@@ -1183,9 +1215,10 @@ module kv_store {
   pub fn get_key(key: String) -> String ! {State<Map<String, String>>, Throw<KVError>, Log} {
     do {
       perform Log.log(Debug, "get: " ++ key);
-      match Map.lookup(key, perform State.get()) with
+      match Map.lookup(key, perform State.get()) with {
       | Some(v) => v
       | None    => perform Throw.throw(KeyNotFound(key))
+      }
     }
   }
 
@@ -1199,9 +1232,10 @@ module kv_store {
   pub fn delete_key(key: String) -> Unit ! {State<Map<String, String>>, Throw<KVError>, Log} {
     do {
       perform Log.log(Debug, "del: " ++ key);
-      match Map.lookup(key, perform State.get()) with
+      match Map.lookup(key, perform State.get()) with {
       | Some(_) => perform State.put(Map.remove(key, perform State.get()))
       | None    => perform Throw.throw(KeyNotFound(key))
+      }
     }
   }
 }

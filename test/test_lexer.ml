@@ -156,6 +156,35 @@ let test_lex_line_comment () =
     [ Let; In ]
 
 (* ------------------------------------------------------------------ *)
+(* Node-attached comment tests (@# ... #@)                              *)
+(* ------------------------------------------------------------------ *)
+
+let test_lex_comment_simple () =
+  check_tokens "simple comment"
+    "42 @# the answer #@"
+    [ IntLit 42; Comment "the answer" ]
+
+let test_lex_comment_multiword () =
+  check_tokens "multiword comment"
+    "x @# this is a longer comment #@"
+    [ Ident "x"; Comment "this is a longer comment" ]
+
+let test_lex_comment_whitespace_trimmed () =
+  check_tokens "comment whitespace trimmed"
+    "x @#   padded   #@"
+    [ Ident "x"; Comment "padded" ]
+
+let test_lex_comment_between_tokens () =
+  check_tokens "comment between tokens"
+    "let x = 42 @# the value #@ in x"
+    [ Let; Ident "x"; Equal; IntLit 42; Comment "the value"; In; Ident "x" ]
+
+let test_lex_comment_multiline () =
+  check_tokens "multiline comment"
+    "x @# line one\nline two #@"
+    [ Ident "x"; Comment "line one\nline two" ]
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -235,5 +264,12 @@ let () =
         ; Alcotest.test_case "newline ignored" `Quick test_lex_newline_ignored
         ; Alcotest.test_case "multi-token" `Quick test_lex_multi_token
         ; Alcotest.test_case "line comment" `Quick test_lex_line_comment
+        ] )
+    ; ( "node-comments",
+        [ Alcotest.test_case "simple"              `Quick test_lex_comment_simple
+        ; Alcotest.test_case "multiword"           `Quick test_lex_comment_multiword
+        ; Alcotest.test_case "whitespace trimmed"  `Quick test_lex_comment_whitespace_trimmed
+        ; Alcotest.test_case "between tokens"      `Quick test_lex_comment_between_tokens
+        ; Alcotest.test_case "multiline"           `Quick test_lex_comment_multiline
         ] )
     ]

@@ -28,6 +28,28 @@ let consume st expected =
                 pp_token expected)
 
 (* ------------------------------------------------------------------ *)
+(* Comment attachment helpers                                           *)
+(* ------------------------------------------------------------------ *)
+
+(** If the next token is a Comment, consume it and attach to the expr. *)
+let maybe_comment_expr st (e : Ast.expr) : Ast.expr =
+  match peek st with
+  | Some (Comment c) -> advance st; { e with comment = Some c }
+  | _ -> e
+
+(** If the next token is a Comment, consume it and attach to the pattern. *)
+let maybe_comment_pat st (p : Ast.pattern) : Ast.pattern =
+  match peek st with
+  | Some (Comment c) -> advance st; { p with pat_comment = Some c }
+  | _ -> p
+
+(** If the next token is a Comment, consume it and attach to the decl. *)
+let maybe_comment_decl st (d : Ast.decl) : Ast.decl =
+  match peek st with
+  | Some (Comment c) -> advance st; { d with decl_comment = Some c }
+  | _ -> d
+
+(* ------------------------------------------------------------------ *)
 (* Type expression, effect set, and param parsers (mutually recursive) *)
 (* ------------------------------------------------------------------ *)
 
@@ -130,53 +152,55 @@ and parse_params_rest (st : state) : param list =
 (* parse_pattern parses a single atomic pattern (no or-pattern at top level).
    Use parse_pattern_or in contexts that accept | inside a pattern. *)
 let rec parse_pattern (st : state) : pattern =
-  match peek st with
-  | Some (Ident "_")   -> advance st; Ast.PWild
-  | Some (Ident s)     -> advance st; Ast.PVar s
-  | Some (CtorIdent s) ->
-    advance st;
-    let sub_pats = match peek st with
-      | Some LParen ->
-        advance st;
-        (match peek st with
-         | Some RParen -> advance st; []
-         | _ ->
-           let first = parse_pattern_or st in
-           let rest  = parse_pat_args_rest st in
-           consume st RParen;
-           first :: rest)
-      | _ -> []
-    in
-    Ast.PCtor (s, sub_pats)
-  | Some (IntLit n)    -> advance st; Ast.PLit (LInt n)
-  | Some (FloatLit f)  -> advance st; Ast.PLit (LFloat f)
-  | Some (StringLit s) -> advance st; Ast.PLit (LString s)
-  | Some True          -> advance st; Ast.PLit (LBool true)
-  | Some False         -> advance st; Ast.PLit (LBool false)
-  | Some LParen ->
-    (match st.tokens with
-     | _ :: RParen :: _ -> advance st; advance st; Ast.PLit LUnit
-     | _ :: _ ->
-       (* Parenthesised pattern *)
-       advance st;
-       let p = parse_pattern_or st in
-       consume st RParen;
-       p
-     | _ -> failwith "Parser: unexpected '(' in pattern")
-  | Some LBrace ->
-    (* Record pattern: { f = p, g, .. } *)
-    advance st;
-    let (fields, open_) = parse_record_pat_fields st in
-    consume st RBrace;
-    Ast.PRecord (fields, open_)
-  | Some t ->
-    failwith (Format.asprintf "Parser: unexpected token in pattern: %a" pp_token t)
-  | None -> failwith "Parser: unexpected end of input in pattern"
+  let p = match peek st with
+    | Some (Ident "_")   -> advance st; Ast.pat PWild
+    | Some (Ident s)     -> advance st; Ast.pat (PVar s)
+    | Some (CtorIdent s) ->
+      advance st;
+      let sub_pats = match peek st with
+        | Some LParen ->
+          advance st;
+          (match peek st with
+           | Some RParen -> advance st; []
+           | _ ->
+             let first = parse_pattern_or st in
+             let rest  = parse_pat_args_rest st in
+             consume st RParen;
+             first :: rest)
+        | _ -> []
+      in
+      Ast.pat (PCtor (s, sub_pats))
+    | Some (IntLit n)    -> advance st; Ast.pat (PLit (LInt n))
+    | Some (FloatLit f)  -> advance st; Ast.pat (PLit (LFloat f))
+    | Some (StringLit s) -> advance st; Ast.pat (PLit (LString s))
+    | Some True          -> advance st; Ast.pat (PLit (LBool true))
+    | Some False         -> advance st; Ast.pat (PLit (LBool false))
+    | Some LParen ->
+      (match st.tokens with
+       | _ :: RParen :: _ -> advance st; advance st; Ast.pat (PLit LUnit)
+       | _ :: _ ->
+         (* Parenthesised pattern *)
+         advance st;
+         let p = parse_pattern_or st in
+         consume st RParen;
+         p
+       | _ -> failwith "Parser: unexpected '(' in pattern")
+    | Some LBrace ->
+      (* Record pattern: { f = p, g, .. } *)
+      advance st;
+      let (fields, open_) = parse_record_pat_fields st in
+      consume st RBrace;
+      Ast.pat (PRecord (fields, open_))
+    | Some t ->
+      failwith (Format.asprintf "Parser: unexpected token in pattern: %a" pp_token t)
+    | None -> failwith "Parser: unexpected end of input in pattern"
+  in
+  maybe_comment_pat st p
 
 and parse_pattern_or (st : state) : pattern =
   let p = parse_pattern st in
   match peek st with
-  | Some Pipe -> advance st; Ast.POr (p, parse_pattern_or st)
+  | Some Pipe -> advance st; Ast.pat (POr (p, parse_pattern_or st))
   | _ -> p
 
 and parse_pat_args_rest (st : state) : pattern list =
@@ -192,7 +216,7 @@ and parse_record_pat_fields (st : state) : (string * pattern) list * bool =
     advance st;
     let pat = match peek st with
       | Some Equal -> advance st; parse_pattern_or st
-      | _          -> Ast.PVar field   (* shorthand: field name as variable *)
+      | _          -> Ast.pat (PVar field)   (* shorthand: field name as variable *)
     in
     (match peek st with
      | Some Comma ->
@@ -340,7 +364,7 @@ and parse_expr_state (st : state) : expr =
     consume st RBrace;
     consume st In;
     let body = parse_expr_state st in
-    Ast.Letrec (first :: rest, body)
+    Ast.expr (Letrec (first :: rest, body))
 
   | Some Let ->
     advance st;
@@ -349,7 +373,7 @@ and parse_expr_state (st : state) : expr =
     let value = parse_expr_state st in
     consume st In;
     let body = parse_expr_state st in
-    Ast.Let { pat; value; body }
+    Ast.expr (Let { pat; value; body })
 
   | Some Handle ->
     advance st;
@@ -358,7 +382,7 @@ and parse_expr_state (st : state) : expr =
     consume st LBrace;
     let handlers = parse_effect_handlers st in
     consume st RBrace;
-    Ast.Handle { handled; handlers }
+    Ast.expr (Handle { handled; handlers })
 
   | Some Perform ->
     advance st;
@@ -379,14 +403,14 @@ and parse_expr_state (st : state) : expr =
     consume st LParen;
     let args = parse_args st in
     consume st RParen;
-    Ast.Perform { effect_name; op_name; args }
+    Ast.expr (Perform { effect_name; op_name; args })
 
   | Some Do ->
     advance st;
     consume st LBrace;
     let stmts = parse_do_stmts st in
     consume st RBrace;
-    Ast.Do stmts
+    Ast.expr (Do stmts)
 
   | Some If ->
     advance st;
@@ -398,7 +422,7 @@ and parse_expr_state (st : state) : expr =
     consume st LBrace;
     let else_ = parse_expr_state st in
     consume st RBrace;
-    Ast.If { cond; then_; else_ }
+    Ast.expr (If { cond; then_; else_ })
 
   | Some Match ->
     advance st;
@@ -407,7 +431,7 @@ and parse_expr_state (st : state) : expr =
     consume st LBrace;
     let arms = parse_match_arms st in
     consume st RBrace;
-    Ast.Match { scrutinee; arms }
+    Ast.expr (Match { scrutinee; arms })
 
   | Some Fn ->
     advance st;
@@ -427,7 +451,7 @@ and parse_expr_state (st : state) : expr =
     consume st LBrace;
     let fn_body = parse_expr_state st in
     consume st RBrace;
-    Ast.Fn { params; return_type; effects; fn_body }
+    Ast.expr (Fn { params; return_type; effects; fn_body })
 
   | _ ->
     parse_app st
@@ -442,12 +466,16 @@ and parse_app_rest (st : state) (f : expr) : expr =
     advance st;
     let args = parse_args st in
     consume st RParen;
-    parse_app_rest st (Ast.App (f, args))
+    let e = Ast.expr (App (f, args)) in
+    let e = maybe_comment_expr st e in
+    parse_app_rest st e
   | Some Dot ->
     (match st.tokens with
      | _ :: Ident field :: _ ->
        advance st; advance st;
-       parse_app_rest st (Ast.Project (f, field))
+       let e = Ast.expr (Project (f, field)) in
+       let e = maybe_comment_expr st e in
+       parse_app_rest st e
      | _ -> f)
   | _ -> f
 
@@ -469,39 +497,46 @@ and parse_record_fields (st : state) : (string * expr) list =
   | None -> failwith "Parser: expected field name in record, got end of input"
 
 and parse_atom (st : state) : expr =
-  match peek st with
-  | Some (IntLit n)    -> advance st; Ast.IntLit n
-  | Some (FloatLit f)  -> advance st; Ast.FloatLit f
-  | Some (StringLit s) -> advance st; Ast.StringLit s
-  | Some True          -> advance st; Ast.BoolLit true
-  | Some False         -> advance st; Ast.BoolLit false
-  | Some (Ident s)     -> advance st; Ast.Var s
-  | Some Resume        -> advance st; Ast.Var "resume"
-  | Some LBrace ->
-    (* { } empty record; { ident : ... } record literal; { expr with ... } update *)
-    (match st.tokens with
-     | _ :: RBrace :: _ ->
-       advance st; advance st; Ast.Record []
-     | _ :: Ident _ :: Colon :: _ ->
-       advance st;
-       let fields = parse_record_fields st in
-       consume st RBrace;
-       Ast.Record fields
-     | _ ->
-       advance st;
-       let base = parse_expr_state st in
-       consume st With;
-       let fields = parse_record_fields st in
-       consume st RBrace;
-       Ast.RecordUpdate (base, fields))
-  | Some LParen ->
-    (match st.tokens with
-     | _ :: RParen :: _ -> advance st; advance st; Ast.UnitLit
-     | _ -> failwith "Parser: unexpected '(' (use do-block for sequencing)")
-  | Some t ->
-    failwith (Format.asprintf "Parser: unexpected token %a" pp_token t)
-  | None ->
-    failwith "Parser: unexpected end of input"
+  let e = match peek st with
+    | Some (IntLit n)    -> advance st; Ast.expr (IntLit n)
+    | Some (FloatLit f)  -> advance st; Ast.expr (FloatLit f)
+    | Some (StringLit s) -> advance st; Ast.expr (StringLit s)
+    | Some True          -> advance st; Ast.expr (BoolLit true)
+    | Some False         -> advance st; Ast.expr (BoolLit false)
+    | Some (Ident s)     -> advance st; Ast.expr (Var s)
+    | Some Resume        -> advance st; Ast.expr (Var "resume")
+    | Some LBrace ->
+      (* { } empty record; { ident : ... } record literal; { expr with ... } update *)
+      (match st.tokens with
+       | _ :: RBrace :: _ ->
+         advance st; advance st; Ast.expr (Record [])
+       | _ :: Ident _ :: Colon :: _ ->
+         advance st;
+         let fields = parse_record_fields st in
+         consume st RBrace;
+         Ast.expr (Record fields)
+       | _ ->
+         advance st;
+         let base = parse_expr_state st in
+         consume st With;
+         let fields = parse_record_fields st in
+         consume st RBrace;
+         Ast.expr (RecordUpdate (base, fields)))
+    | Some LParen ->
+      (match st.tokens with
+       | _ :: RParen :: _ -> advance st; advance st; Ast.expr UnitLit
+       | _ ->
+         (* Parenthesised expression for grouping *)
+         advance st;
+         let inner = parse_expr_state st in
+         consume st RParen;
+         inner)
+    | Some t ->
+      failwith (Format.asprintf "Parser: unexpected token %a" pp_token t)
+    | None ->
+      failwith "Parser: unexpected end of input"
+  in
+  maybe_comment_expr st e
 
 (* ------------------------------------------------------------------ *)
 (* Public entry point — expressions                                     *)
@@ -601,92 +636,94 @@ let rec parse_decl (st : state) : Ast.decl =
     | Some Pub -> advance st; true
     | _        -> false
   in
-  match peek st with
-  | Some Fn ->
-    advance st;
-    let fn_name = match peek st with
-      | Some (Ident s) -> advance st; s
-      | Some t ->
-        failwith (Format.asprintf "Parser: expected fn name, got %a" pp_token t)
-      | None -> failwith "Parser: expected fn name"
-    in
-    let type_params = parse_type_params st in
-    consume st LParen;
-    let params = parse_params st in
-    consume st RParen;
-    let (return_type, effects) =
-      match peek st with
-      | Some Arrow ->
-        advance st;
-        let ret = parse_type_expr st in
-        consume st Bang;
-        let eff = parse_effect_set st in
-        (Some ret, Some eff)
-      | _ -> (None, None)
-    in
-    consume st LBrace;
-    let decl_body = parse_expr_state st in
-    consume st RBrace;
-    Ast.DeclFn { pub; fn_name; type_params; params; return_type; effects; decl_body }
+  let d = match peek st with
+    | Some Fn ->
+      advance st;
+      let fn_name = match peek st with
+        | Some (Ident s) -> advance st; s
+        | Some t ->
+          failwith (Format.asprintf "Parser: expected fn name, got %a" pp_token t)
+        | None -> failwith "Parser: expected fn name"
+      in
+      let type_params = parse_type_params st in
+      consume st LParen;
+      let params = parse_params st in
+      consume st RParen;
+      let (return_type, effects) =
+        match peek st with
+        | Some Arrow ->
+          advance st;
+          let ret = parse_type_expr st in
+          consume st Bang;
+          let eff = parse_effect_set st in
+          (Some ret, Some eff)
+        | _ -> (None, None)
+      in
+      consume st LBrace;
+      let decl_body = parse_expr_state st in
+      consume st RBrace;
+      Ast.decl (DeclFn { pub; fn_name; type_params; params; return_type; effects; decl_body })
 
-  | Some Type ->
-    advance st;
-    let type_name = match peek st with
-      | Some (CtorIdent s) -> advance st; s
-      | Some t ->
-        failwith (Format.asprintf "Parser: expected type name, got %a" pp_token t)
-      | None -> failwith "Parser: expected type name"
-    in
-    let type_params = parse_type_params st in
-    consume st Equal;
-    consume st Pipe;
-    let first = parse_ctor_decl st in
-    let rest  = parse_ctor_decls_rest st in
-    Ast.DeclType { pub; type_name; type_params; ctors = first :: rest }
+    | Some Type ->
+      advance st;
+      let type_name = match peek st with
+        | Some (CtorIdent s) -> advance st; s
+        | Some t ->
+          failwith (Format.asprintf "Parser: expected type name, got %a" pp_token t)
+        | None -> failwith "Parser: expected type name"
+      in
+      let type_params = parse_type_params st in
+      consume st Equal;
+      consume st Pipe;
+      let first = parse_ctor_decl st in
+      let rest  = parse_ctor_decls_rest st in
+      Ast.decl (DeclType { pub; type_name; type_params; ctors = first :: rest })
 
-  | Some Effect ->
-    advance st;
-    let effect_name = match peek st with
-      | Some (CtorIdent s) -> advance st; s
-      | Some t ->
-        failwith (Format.asprintf "Parser: expected effect name, got %a" pp_token t)
-      | None -> failwith "Parser: expected effect name"
-    in
-    let type_params = parse_type_params st in
-    consume st LBrace;
-    let ops = match peek st with
-      | Some RBrace -> []
-      | _ ->
-        let first = parse_effect_op_decl st in
-        let rest  = parse_effect_ops_rest st in
-        first :: rest
-    in
-    consume st RBrace;
-    Ast.DeclEffect { pub; effect_name; type_params; ops }
+    | Some Effect ->
+      advance st;
+      let effect_name = match peek st with
+        | Some (CtorIdent s) -> advance st; s
+        | Some t ->
+          failwith (Format.asprintf "Parser: expected effect name, got %a" pp_token t)
+        | None -> failwith "Parser: expected effect name"
+      in
+      let type_params = parse_type_params st in
+      consume st LBrace;
+      let ops = match peek st with
+        | Some RBrace -> []
+        | _ ->
+          let first = parse_effect_op_decl st in
+          let rest  = parse_effect_ops_rest st in
+          first :: rest
+      in
+      consume st RBrace;
+      Ast.decl (DeclEffect { pub; effect_name; type_params; ops })
 
-  | Some Module ->
-    advance st;
-    let module_name = match peek st with
-      | Some (Ident s) -> advance st; s
-      | Some t ->
-        failwith (Format.asprintf "Parser: expected module name, got %a" pp_token t)
-      | None -> failwith "Parser: expected module name"
-    in
-    consume st LBrace;
-    let body = parse_decls_until_rbrace st in
-    consume st RBrace;
-    Ast.DeclModule { pub; module_name; body }
+    | Some Module ->
+      advance st;
+      let module_name = match peek st with
+        | Some (Ident s) -> advance st; s
+        | Some t ->
+          failwith (Format.asprintf "Parser: expected module name, got %a" pp_token t)
+        | None -> failwith "Parser: expected module name"
+      in
+      consume st LBrace;
+      let body = parse_decls_until_rbrace st in
+      consume st RBrace;
+      Ast.decl (DeclModule { pub; module_name; body })
 
-  | Some Require ->
-    advance st;
-    consume st Effect;    (* require effect T — the 'effect' keyword is mandatory *)
-    let t = parse_type_expr st in
-    Ast.DeclRequire t
+    | Some Require ->
+      advance st;
+      consume st Effect;    (* require effect T — the 'effect' keyword is mandatory *)
+      let t = parse_type_expr st in
+      Ast.decl (DeclRequire t)
 
-  | Some t ->
-    failwith (Format.asprintf "Parser: expected declaration, got %a" pp_token t)
-  | None ->
-    failwith "Parser: expected declaration, got end of input"
+    | Some t ->
+      failwith (Format.asprintf "Parser: expected declaration, got %a" pp_token t)
+    | None ->
+      failwith "Parser: expected declaration, got end of input"
+  in
+  maybe_comment_decl st d
 
 and parse_decls_until_rbrace (st : state) : Ast.decl list =
   match peek st with

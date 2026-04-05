@@ -39,7 +39,12 @@ type literal =
 (* Patterns                                                             *)
 (* ------------------------------------------------------------------ *)
 
-type pattern =
+type pattern = {
+  pat_kind : pattern_kind;
+  pat_comment : string option;
+}
+
+and pattern_kind =
   | PWild                               (** _ *)
   | PVar    of string                   (** x *)
   | PLit    of literal                  (** 42, true, "s", () *)
@@ -48,11 +53,39 @@ type pattern =
                                         (** { f = p, .. }; bool = is_open *)
   | POr     of pattern * pattern        (** p1 | p2 *)
 
+(** Build a pattern node with no comment. *)
+let pat k = { pat_kind = k; pat_comment = None }
+
 (* ------------------------------------------------------------------ *)
 (* Expression AST (mutually recursive)                                  *)
 (* ------------------------------------------------------------------ *)
 
-type fn_data = {
+type expr = {
+  kind    : expr_kind;
+  comment : string option;
+}
+
+and expr_kind =
+  | Var       of string
+  | IntLit    of int
+  | FloatLit  of float
+  | StringLit of string
+  | BoolLit   of bool
+  | UnitLit
+  | Let       of let_binding
+  | App       of expr * expr list
+  | Fn        of fn_data
+  | Match     of match_data
+  | If        of if_data
+  | Do        of do_stmt list
+  | Letrec    of letrec_binding list * expr
+  | Record    of (string * expr) list
+  | RecordUpdate of expr * (string * expr) list
+  | Project   of expr * string
+  | Perform   of perform_data
+  | Handle    of handle_data
+
+and fn_data = {
   params      : param list;
   return_type : type_expr option;
   effects     : effect_set option;
@@ -92,26 +125,6 @@ and do_stmt =
   | StmtLet  of { pat : pattern; value : expr }
   | StmtExpr of expr
 
-and expr =
-  | Var       of string
-  | IntLit    of int
-  | FloatLit  of float
-  | StringLit of string
-  | BoolLit   of bool
-  | UnitLit
-  | Let       of let_binding
-  | App       of expr * expr list
-  | Fn        of fn_data
-  | Match     of match_data
-  | If        of if_data
-  | Do        of do_stmt list
-  | Letrec    of letrec_binding list * expr
-  | Record    of (string * expr) list
-  | RecordUpdate of expr * (string * expr) list
-  | Project   of expr * string
-  | Perform   of perform_data
-  | Handle    of handle_data
-
 and perform_data = {
   effect_name : string;
   op_name     : string;
@@ -140,6 +153,9 @@ and handle_data = {
   handlers : effect_handler list;
 }
 
+(** Build an expression node with no comment. *)
+let expr k = { kind = k; comment = None }
+
 (* ------------------------------------------------------------------ *)
 (* Pretty-printers                                                      *)
 (* ------------------------------------------------------------------ *)
@@ -151,7 +167,13 @@ let pp_literal fmt = function
   | LBool b   -> Format.fprintf fmt "LBool(%b)" b
   | LUnit     -> Format.pp_print_string fmt "LUnit"
 
-let rec pp_pattern fmt = function
+let rec pp_pattern fmt p =
+  pp_pattern_kind fmt p.pat_kind;
+  match p.pat_comment with
+  | None   -> ()
+  | Some c -> Format.fprintf fmt " @#%s#@" c
+
+and pp_pattern_kind fmt = function
   | PWild        -> Format.pp_print_string fmt "PWild"
   | PVar s       -> Format.fprintf fmt "PVar(%S)" s
   | PLit l       -> Format.fprintf fmt "PLit(%a)" pp_literal l
@@ -195,7 +217,13 @@ and pp_effect_set fmt = function
 let pp_param fmt { param_name; param_type } =
   Format.fprintf fmt "%s: %a" param_name pp_type_expr param_type
 
-let rec pp_expr fmt = function
+let rec pp_expr fmt e =
+  pp_expr_kind fmt e.kind;
+  match e.comment with
+  | None   -> ()
+  | Some c -> Format.fprintf fmt " @#%s#@" c
+
+and pp_expr_kind fmt = function
   | Var s       -> Format.fprintf fmt "Var(%S)" s
   | IntLit n    -> Format.fprintf fmt "IntLit(%d)" n
   | FloatLit f  -> Format.fprintf fmt "FloatLit(%g)" f
@@ -302,7 +330,11 @@ let equal_literal a b = match a, b with
   | LUnit,     LUnit     -> true
   | _,         _         -> false
 
-let rec equal_pattern a b = match a, b with
+let rec equal_pattern a b =
+  a.pat_comment = b.pat_comment &&
+  equal_pattern_kind a.pat_kind b.pat_kind
+
+and equal_pattern_kind a b = match a, b with
   | PWild,           PWild           -> true
   | PVar x,          PVar y          -> x = y
   | PLit la,         PLit lb         -> equal_literal la lb
@@ -342,7 +374,11 @@ and equal_effect_set a b = match a, b with
 let equal_param a b =
   a.param_name = b.param_name && equal_type_expr a.param_type b.param_type
 
-let rec equal_expr a b = match a, b with
+let rec equal_expr a b =
+  a.comment = b.comment &&
+  equal_expr_kind a.kind b.kind
+
+and equal_expr_kind a b = match a, b with
   | Var x,       Var y       -> x = y
   | IntLit m,    IntLit n    -> m = n
   | FloatLit f,  FloatLit g  -> f = g
@@ -436,7 +472,12 @@ type effect_op = {
   effect_op_return : type_expr;
 }
 
-type decl =
+type decl = {
+  decl_kind    : decl_kind;
+  decl_comment : string option;
+}
+
+and decl_kind =
   | DeclFn of {
       pub         : bool;
       fn_name     : string;
@@ -465,6 +506,9 @@ type decl =
     }
   | DeclRequire of type_expr
 
+(** Build a declaration node with no comment. *)
+let decl k = { decl_kind = k; decl_comment = None }
+
 type program = decl list
 
 (* ------------------------------------------------------------------ *)
@@ -486,7 +530,13 @@ let pp_effect_op fmt { effect_op_name; effect_op_params; effect_op_return } =
        pp_type_expr) effect_op_params
     pp_type_expr effect_op_return
 
-let rec pp_decl fmt = function
+let rec pp_decl fmt d =
+  pp_decl_kind fmt d.decl_kind;
+  match d.decl_comment with
+  | None   -> ()
+  | Some c -> Format.fprintf fmt " @#%s#@" c
+
+and pp_decl_kind fmt = function
   | DeclFn { pub; fn_name; type_params; params; return_type; effects; decl_body } ->
     Format.fprintf fmt "%sFn %s%s(%a)%s%s { %a }"
       (if pub then "pub " else "")
@@ -537,7 +587,11 @@ let equal_effect_op a b =
   && List.for_all2 equal_type_expr a.effect_op_params b.effect_op_params
   && equal_type_expr a.effect_op_return b.effect_op_return
 
-let rec equal_decl a b = match a, b with
+let rec equal_decl a b =
+  a.decl_comment = b.decl_comment &&
+  equal_decl_kind a.decl_kind b.decl_kind
+
+and equal_decl_kind a b = match a, b with
   | DeclFn a, DeclFn b ->
     a.pub = b.pub && a.fn_name = b.fn_name
     && a.type_params = b.type_params

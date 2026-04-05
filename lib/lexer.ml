@@ -41,6 +41,8 @@ type token =
   | Plus | Minus | Star | Slash | Percent
   | EqEq       (** == *)
   | BangEq     (** != *)
+  (* Comments *)
+  | Comment of string  (** @# ... #@ — node-attached comment *)
 
 (* ------------------------------------------------------------------ *)
 (* Pretty-printer and equality (used by tests via Alcotest)            *)
@@ -97,6 +99,7 @@ let pp_token fmt = function
   | Percent  -> Format.pp_print_string fmt "Percent"
   | EqEq     -> Format.pp_print_string fmt "EqEq"
   | BangEq   -> Format.pp_print_string fmt "BangEq"
+  | Comment s -> Format.fprintf fmt "Comment(%S)" s
 
 let equal_token a b = a = b
 
@@ -238,6 +241,27 @@ let scan_string st =
 let skip_line_comment st =
   while st.pos < st.len && st.src.[st.pos] <> '\n' do advance st done
 
+(** Scan a node-attached comment opened by '@#'.
+    Reads everything until the closing '#@' delimiter. *)
+let scan_comment st =
+  let buf = Buffer.create 64 in
+  let rec loop () =
+    if st.pos >= st.len then
+      failwith "Unterminated comment (expected #@)"
+    else if st.src.[st.pos] = '#'
+         && st.pos + 1 < st.len
+         && st.src.[st.pos + 1] = '@' then begin
+      advance st; advance st   (* consume '#@' *)
+    end else begin
+      Buffer.add_char buf st.src.[st.pos];
+      advance st;
+      loop ()
+    end
+  in
+  loop ();
+  let raw = Buffer.contents buf in
+  Comment (String.trim raw)
+
 (* ------------------------------------------------------------------ *)
 (* Main tokenizer                                                       *)
 (* ------------------------------------------------------------------ *)
@@ -308,6 +332,10 @@ let tokenize (src : string) : token list =
     | Some '*' -> advance st; push Star;    loop ()
     | Some '/' -> advance st; push Slash;   loop ()
     | Some '%' -> advance st; push Percent; loop ()
+
+    (* Node-attached comments: @# ... #@ *)
+    | Some '@' when peek2 st = Some '#' ->
+      advance st; advance st; push (scan_comment st); loop ()
 
     (* Skip unknown characters *)
     | Some _ -> advance st; loop ()

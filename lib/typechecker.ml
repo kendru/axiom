@@ -218,7 +218,7 @@ let rec ty_of_type_expr = function
 (** [infer_expr env e] infers the type of expression [e] under [env].
     Returns the inferred type. Raises [Failure] on type errors. *)
 let rec infer_expr (env : env) (e : expr) : ty =
-  match e with
+  match e.desc with
 
   | IntLit _    -> TyCon "Int"
   | FloatLit _  -> TyCon "Float64"
@@ -233,7 +233,7 @@ let rec infer_expr (env : env) (e : expr) : ty =
   | Let { pat; value; body } ->
     let ty_val = infer_expr env value in
     let scheme = generalize env ty_val in
-    let env'   = match pat with
+    let env'   = match pat.pat_desc with
       | PVar name -> env_extend name scheme env
       | _         -> env_from_pattern env pat ty_val
     in
@@ -351,7 +351,7 @@ let rec infer_expr (env : env) (e : expr) : ty =
       | StmtExpr e :: rest         -> ignore (infer_expr env e); go env rest
       | StmtLet { pat; value } :: rest ->
         let ty   = infer_expr env value in
-        let env' = match pat with
+        let env' = match pat.pat_desc with
           | PVar name -> env_extend name (generalize env ty) env
           | _         -> env_from_pattern env pat ty
         in
@@ -368,8 +368,8 @@ let rec infer_expr (env : env) (e : expr) : ty =
 
 (** Extend environment with bindings introduced by a pattern.
     Currently handles PWild and PVar; constructor patterns don't bind new scrutinee types. *)
-and env_from_pattern env pat scrut_ty =
-  match pat with
+and env_from_pattern env (p : pattern) scrut_ty =
+  match p.pat_desc with
   | PWild         -> env
   | PVar x        -> env_extend x (mono scrut_ty) env
   | PLit _        -> env

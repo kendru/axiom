@@ -384,12 +384,20 @@ meaningful — not mere decoration. Comments are preserved through the parse,
 elaboration, and binary IR round-trip.
 
 ```
-annotation ::= '@#' text '#@'     -- attaches to the following node
+annotation ::= '@#' text '#@'
 ```
 
-The `@#...#@` form is a token that the parser consumes and attaches to the
-immediately following expression, pattern, or declaration node. This means
-comments survive in the AST and binary IR, enabling tooling to display,
+A `@#...#@` comment is a **postfix** annotation: it attaches to the
+immediately *preceding* expression, pattern, or declaration node. This means
+the comment is parsed as part of the node it follows, not the node that comes
+after it. Parentheses can be used to control the attachment point:
+
+```
+x + 1 @# I attach to `1` #@
+(x + 1) @# I attach to `x + 1` #@
+```
+
+Comments survive in the AST and binary IR, enabling tooling to display,
 search, and reason about annotated code.
 
 ### 3.2 Mutual Recursion
@@ -1157,11 +1165,12 @@ field_pat   ::= IDENT '=' pattern   -- explicit field binding
              -- '..' in record patterns means "open" — remaining fields ignored.
              -- Without '..', the pattern must name every field (closed match).
 
--- Node-attached comments
+-- Node-attached comments (postfix)
 
 comment     ::= '@#' TEXT '#@'
-             -- Attaches to the immediately following expression, pattern, or
-             -- declaration. Preserved in the AST and binary IR. See Section 3.1.
+             -- Postfix annotation: attaches to the immediately preceding
+             -- expression, pattern, or declaration. Use parentheses to control
+             -- attachment. Preserved in the AST and binary IR. See Section 3.1.
 ```
 
 **Note — `let` in `do` blocks.** Inside a `do` block, `let` bindings omit the

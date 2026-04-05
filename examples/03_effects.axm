@@ -1,0 +1,160 @@
+-- 03_effects.axm
+-- Effect declarations, performing effects, and writing handlers.
+-- Effects are Axiom's central mechanism for managing side effects.
+
+-- ----------------------------------------------------------------
+-- Effect declarations
+-- ----------------------------------------------------------------
+
+-- Console I/O: printing text and reading input.
+effect Console {
+  print: (String) -> Unit,
+  read_line: () -> String
+}
+
+-- Mutable state parameterized by the state type.
+effect State<s> {
+  get: () -> s,
+  put: (s) -> Unit
+}
+
+-- Throwing errors (aborting computation).
+effect Throw<e> {
+  throw: (e) -> Nothing
+}
+
+-- Logging with severity levels.
+type LogLevel = | Debug | Info | Warn | Error
+
+effect Log {
+  log: (LogLevel, String) -> Unit
+}
+
+-- ----------------------------------------------------------------
+-- Performing effects
+-- ----------------------------------------------------------------
+
+-- A function that reads a name and prints a greeting.
+fn greet_user() -> Unit ! {Console} {
+  do {
+    perform Console.print("What is your name?");
+    let name = perform Console.read_line();
+    let greeting = concat("Hello, ", name);
+    perform Console.print(greeting)
+  }
+}
+
+-- A function that uses state to count.
+fn count_up(n: Int) -> Int ! {State<Int>} {
+  do {
+    let current = perform State.get();
+    if gte(current, n) {
+      current
+    } else {
+      do {
+        perform State.put(add(current, 1));
+        count_up(n)
+      }
+    }
+  }
+}
+
+-- A function that logs its steps.
+fn process_item(item: String) -> String ! {Log} {
+  do {
+    perform Log.log(info(), concat("Processing: ", item));
+    let result = transform(item);
+    perform Log.log(debug(), concat("Result: ", result));
+    result
+  }
+}
+
+-- A function that can fail.
+type ParseError = | UnexpectedChar(Char) | UnexpectedEnd
+
+fn parse_digit(input: String) -> Int ! {Throw<ParseError>} {
+  match string_head(input) with {
+    | None => perform Throw.throw(unexpected_end())
+    | Some(c) =>
+      if is_digit(c) {
+        char_to_digit(c)
+      } else {
+        perform Throw.throw(unexpected_char(c))
+      }
+  }
+}
+
+-- Combining multiple effects.
+fn interactive_sum() -> Int ! {Console, State<Int>, Throw<String>} {
+  do {
+    perform Console.print("Enter numbers (empty line to stop):");
+    perform State.put(0);
+    read_loop()
+  }
+}
+
+fn read_loop() -> Int ! {Console, State<Int>, Throw<String>} {
+  do {
+    let line = perform Console.read_line();
+    if string_empty(line) {
+      perform State.get()
+    } else {
+      do {
+        let n = parse_int_or_throw(line);
+        let total = perform State.get();
+        perform State.put(add(total, n));
+        read_loop()
+      }
+    }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Handlers
+-- ----------------------------------------------------------------
+
+-- Handle Throw by converting to Result.
+fn catch<a, e>(computation: (u: Unit) -> a ! {Throw<e>}) -> Result<a, e> ! pure {
+  handle computation(()) with {
+    Throw {
+      throw(e) => err(e)
+      return v => ok(v)
+    }
+  }
+}
+
+-- Handle State with an initial value, returning the final result.
+fn run_state<a, s>(init: s, computation: (u: Unit) -> a ! {State<s>}) -> a ! pure {
+  handle computation(()) with {
+    State {
+      get() => resume(init)
+      put(s) => resume(())
+    }
+  }
+}
+
+-- Handle Log by printing to the console (translating one effect to another).
+fn log_to_console<a>(computation: (u: Unit) -> a ! {Log}) -> a ! {Console} {
+  handle computation(()) with {
+    Log {
+      log(level, msg) => do {
+        let formatted = concat(show_log_level(level), concat(": ", msg));
+        perform Console.print(formatted);
+        resume(())
+      }
+    }
+  }
+}
+
+-- ----------------------------------------------------------------
+-- Helper declarations (would be in stdlib)
+-- ----------------------------------------------------------------
+
+fn show_log_level(level: LogLevel) -> String ! pure {
+  match level with {
+    | Debug => "DEBUG"
+    | Info  => "INFO"
+    | Warn  => "WARN"
+    | Error => "ERROR"
+  }
+}

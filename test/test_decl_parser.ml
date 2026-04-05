@@ -26,12 +26,6 @@ let check_decl label src expected =
 let check_prog label src expected =
   Alcotest.(check program_testable) label expected (parse_prog_of src)
 
-(** Shorthand: build an expression node with no comment. *)
-let e k = expr k
-
-(** Shorthand: build a declaration node with no comment. *)
-let d k = decl k
-
 (* ------------------------------------------------------------------ *)
 (* fn declarations                                                      *)
 (* ------------------------------------------------------------------ *)
@@ -40,50 +34,50 @@ let d k = decl k
 let test_fn_decl_simple () =
   check_decl "fn simple"
     "fn identity(x: Int) -> Int ! pure { x }"
-    (d (DeclFn { pub         = false
+    (decl (DeclFn { pub         = false
                ; fn_name     = "identity"
                ; type_params = []
                ; params      = [{ param_name = "x"; param_type = TyName "Int" }]
                ; return_type = Some (TyName "Int")
                ; effects     = Some Pure
-               ; decl_body   = e (Var "x") }))
+               ; decl_body   = expr (Var "x") }))
 
 (* pub fn add(x: Int, y: Int) -> Int ! pure { x } *)
 let test_fn_decl_pub () =
   check_decl "fn pub"
     "pub fn add(x: Int, y: Int) -> Int ! pure { x }"
-    (d (DeclFn { pub         = true
+    (decl (DeclFn { pub         = true
                ; fn_name     = "add"
                ; type_params = []
                ; params      = [ { param_name = "x"; param_type = TyName "Int" }
                                 ; { param_name = "y"; param_type = TyName "Int" } ]
                ; return_type = Some (TyName "Int")
                ; effects     = Some Pure
-               ; decl_body   = e (Var "x") }))
+               ; decl_body   = expr (Var "x") }))
 
 (* fn id<a>(x: a) -> a ! pure { x } -- type params *)
 let test_fn_decl_type_params () =
   check_decl "fn type params"
     "fn id<a>(x: a) -> a ! pure { x }"
-    (d (DeclFn { pub         = false
+    (decl (DeclFn { pub         = false
                ; fn_name     = "id"
                ; type_params = ["a"]
                ; params      = [{ param_name = "x"; param_type = TyName "a" }]
                ; return_type = Some (TyName "a")
                ; effects     = Some Pure
-               ; decl_body   = e (Var "x") }))
+               ; decl_body   = expr (Var "x") }))
 
 (* fn noop() { () } -- no return type annotation *)
 let test_fn_decl_no_annotation () =
   check_decl "fn no annotation"
     "fn noop() { () }"
-    (d (DeclFn { pub         = false
+    (decl (DeclFn { pub         = false
                ; fn_name     = "noop"
                ; type_params = []
                ; params      = []
                ; return_type = None
                ; effects     = None
-               ; decl_body   = e UnitLit }))
+               ; decl_body   = expr UnitLit }))
 
 (* ------------------------------------------------------------------ *)
 (* type declarations                                                    *)
@@ -93,7 +87,7 @@ let test_fn_decl_no_annotation () =
 let test_type_decl_option () =
   check_decl "type Option"
     "type Option<a> = | None | Some(a)"
-    (d (DeclType { pub         = false
+    (decl (DeclType { pub         = false
                  ; type_name   = "Option"
                  ; type_params = ["a"]
                  ; ctors       = [ { ctor_name = "None"; ctor_params = [] }
@@ -103,7 +97,7 @@ let test_type_decl_option () =
 let test_type_decl_bool () =
   check_decl "type Bool"
     "type Bool = | True | False"
-    (d (DeclType { pub         = false
+    (decl (DeclType { pub         = false
                  ; type_name   = "Bool"
                  ; type_params = []
                  ; ctors       = [ { ctor_name = "True";  ctor_params = [] }
@@ -113,7 +107,7 @@ let test_type_decl_bool () =
 let test_type_decl_result () =
   check_decl "type Result"
     "pub type Result<a, e> = | Ok(a) | Err(e)"
-    (d (DeclType { pub         = true
+    (decl (DeclType { pub         = true
                  ; type_name   = "Result"
                  ; type_params = ["a"; "e"]
                  ; ctors       = [ { ctor_name = "Ok";  ctor_params = [TyName "a"] }
@@ -127,7 +121,7 @@ let test_type_decl_result () =
 let test_effect_decl_state () =
   check_decl "effect State"
     "effect State<s> { get: () -> s, put: (s) -> Unit }"
-    (d (DeclEffect { pub         = false
+    (decl (DeclEffect { pub         = false
                    ; effect_name = "State"
                    ; type_params = ["s"]
                    ; ops         = [ { effect_op_name   = "get"
@@ -141,7 +135,7 @@ let test_effect_decl_state () =
 let test_effect_decl_log () =
   check_decl "effect Log"
     "effect Log { log: (String) -> Unit }"
-    (d (DeclEffect { pub         = false
+    (decl (DeclEffect { pub         = false
                    ; effect_name = "Log"
                    ; type_params = []
                    ; ops         = [ { effect_op_name   = "log"
@@ -156,16 +150,16 @@ let test_effect_decl_log () =
 let test_module_decl () =
   check_decl "module"
     "module math { fn square(x: Int) { x } }"
-    (d (DeclModule { pub         = false
+    (decl (DeclModule { pub         = false
                    ; module_name = "math"
                    ; body        =
-                       [ d (DeclFn { pub         = false
+                       [ decl (DeclFn { pub         = false
                                    ; fn_name     = "square"
                                    ; type_params = []
                                    ; params      = [{ param_name = "x"; param_type = TyName "Int" }]
                                    ; return_type = None
                                    ; effects     = None
-                                   ; decl_body   = e (Var "x") }) ] }))
+                                   ; decl_body   = expr (Var "x") }) ] }))
 
 (* ------------------------------------------------------------------ *)
 (* require declarations                                                 *)
@@ -175,7 +169,7 @@ let test_module_decl () =
 let test_require_decl () =
   check_decl "require"
     "require effect Log"
-    (d (DeclRequire (TyName "Log")))
+    (decl (DeclRequire (TyName "Log")))
 
 (* ------------------------------------------------------------------ *)
 (* Multi-declaration programs                                           *)
@@ -185,12 +179,12 @@ let test_require_decl () =
 let test_program_two_fns () =
   check_prog "two fns"
     "fn foo(x: Int) { x }  fn bar(y: Bool) { y }"
-    [ d (DeclFn { pub = false; fn_name = "foo"; type_params = []
+    [ decl (DeclFn { pub = false; fn_name = "foo"; type_params = []
                 ; params = [{ param_name = "x"; param_type = TyName "Int" }]
-                ; return_type = None; effects = None; decl_body = e (Var "x") })
-    ; d (DeclFn { pub = false; fn_name = "bar"; type_params = []
+                ; return_type = None; effects = None; decl_body = expr (Var "x") })
+    ; decl (DeclFn { pub = false; fn_name = "bar"; type_params = []
                 ; params = [{ param_name = "y"; param_type = TyName "Bool" }]
-                ; return_type = None; effects = None; decl_body = e (Var "y") }) ]
+                ; return_type = None; effects = None; decl_body = expr (Var "y") }) ]
 
 (* ------------------------------------------------------------------ *)
 (* Comment attachment on declarations                                   *)
@@ -202,7 +196,7 @@ let test_fn_decl_comment () =
     "fn foo(x: Int) { x } @# entry point #@"
     { decl_desc = DeclFn { pub = false; fn_name = "foo"; type_params = []
                           ; params = [{ param_name = "x"; param_type = TyName "Int" }]
-                          ; return_type = None; effects = None; decl_body = e (Var "x") }
+                          ; return_type = None; effects = None; decl_body = expr (Var "x") }
     ; decl_comment = Some "entry point" }
 
 (* type Bool = | True | False @# boolean type #@ *)

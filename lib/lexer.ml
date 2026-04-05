@@ -19,7 +19,7 @@ type token =
   | Ident of string       (** lowercase-start or underscore-start *)
   | CtorIdent of string   (** uppercase-start — constructor / type name *)
   (* Literals *)
-  | IntLit of int
+  | IntLit of int64
   | FloatLit of float
   | StringLit of string
   (* Punctuation *)
@@ -72,7 +72,7 @@ let pp_token fmt = function
   | False    -> Format.pp_print_string fmt "False"
   | Ident s       -> Format.fprintf fmt "Ident(%S)" s
   | CtorIdent s   -> Format.fprintf fmt "CtorIdent(%S)" s
-  | IntLit n      -> Format.fprintf fmt "IntLit(%d)" n
+  | IntLit n      -> Format.fprintf fmt "IntLit(%Ld)" n
   | FloatLit f    -> Format.fprintf fmt "FloatLit(%g)" f
   | StringLit s   -> Format.fprintf fmt "StringLit(%S)" s
   | Arrow    -> Format.pp_print_string fmt "Arrow"
@@ -184,7 +184,7 @@ let scan_number st =
     advance st; (* '0' *)
     advance st; (* 'x' *)
     let digits = scan_hex_digits st in
-    IntLit (int_of_string ("0x" ^ digits))
+    IntLit (Int64.of_string ("0x" ^ digits))
   end else begin
     let int_part = scan_decimal_digits st in
     (* Check for fractional or exponent part → float *)
@@ -212,7 +212,7 @@ let scan_number st =
       FloatLit (float_of_string (int_part ^ "." ^ !frac_part ^
                                   (if !exp_part = "" then "" else "e" ^ !exp_part)))
     else
-      IntLit (int_of_string int_part)
+      IntLit (Int64.of_string int_part)
   end
 
 (** Scan a string literal. The opening '"' has already been consumed. *)

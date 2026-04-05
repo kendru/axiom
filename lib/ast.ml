@@ -28,13 +28,6 @@ type param = {
 (* Literal values                                                       *)
 (* ------------------------------------------------------------------ *)
 
-type literal =
-  | LInt    of int
-  | LFloat  of float
-  | LString of string
-  | LBool   of bool
-  | LUnit
-
 (* ------------------------------------------------------------------ *)
 (* Patterns                                                             *)
 (* ------------------------------------------------------------------ *)
@@ -47,7 +40,12 @@ type pattern = {
 and pat_desc =
   | PWild                               (** _ *)
   | PVar    of string                   (** x *)
-  | PLit    of literal                  (** 42, true, "s", () *)
+  | PLitInt    of int64                 (** 42 *)
+  | PLitFloat  of float                 (** 3.14 *)
+  | PLitString of string               (** "hello" *)
+  | PLitTrue                            (** true *)
+  | PLitFalse                           (** false *)
+  | PLitUnit                            (** () *)
   | PCtor   of string * pattern list    (** Some(p), Cons(h, t) *)
   | PRecord of (string * pattern) list * bool
                                         (** { f = p, .. }; bool = is_open *)
@@ -67,7 +65,7 @@ type expr = {
 
 and expr_desc =
   | Var       of string
-  | IntLit    of int
+  | IntLit    of int64
   | FloatLit  of float
   | StringLit of string
   | BoolLit   of bool
@@ -160,13 +158,6 @@ let expr k = { desc = k; comment = None }
 (* Pretty-printers                                                      *)
 (* ------------------------------------------------------------------ *)
 
-let pp_literal fmt = function
-  | LInt n    -> Format.fprintf fmt "LInt(%d)" n
-  | LFloat f  -> Format.fprintf fmt "LFloat(%g)" f
-  | LString s -> Format.fprintf fmt "LString(%S)" s
-  | LBool b   -> Format.fprintf fmt "LBool(%b)" b
-  | LUnit     -> Format.pp_print_string fmt "LUnit"
-
 let rec pp_pattern fmt p =
   pp_pattern_desc fmt p.pat_desc;
   match p.pat_comment with
@@ -176,7 +167,12 @@ let rec pp_pattern fmt p =
 and pp_pattern_desc fmt = function
   | PWild        -> Format.pp_print_string fmt "PWild"
   | PVar s       -> Format.fprintf fmt "PVar(%S)" s
-  | PLit l       -> Format.fprintf fmt "PLit(%a)" pp_literal l
+  | PLitInt n    -> Format.fprintf fmt "PLitInt(%Ld)" n
+  | PLitFloat f  -> Format.fprintf fmt "PLitFloat(%g)" f
+  | PLitString s -> Format.fprintf fmt "PLitString(%S)" s
+  | PLitTrue     -> Format.pp_print_string fmt "PLitTrue"
+  | PLitFalse    -> Format.pp_print_string fmt "PLitFalse"
+  | PLitUnit     -> Format.pp_print_string fmt "PLitUnit"
   | PCtor (s, ps) ->
     Format.fprintf fmt "PCtor(%S, [%a])" s
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f "; ")
@@ -225,7 +221,7 @@ let rec pp_expr fmt e =
 
 and pp_expr_desc fmt = function
   | Var s       -> Format.fprintf fmt "Var(%S)" s
-  | IntLit n    -> Format.fprintf fmt "IntLit(%d)" n
+  | IntLit n    -> Format.fprintf fmt "IntLit(%Ld)" n
   | FloatLit f  -> Format.fprintf fmt "FloatLit(%g)" f
   | StringLit s -> Format.fprintf fmt "StringLit(%S)" s
   | BoolLit b   -> Format.fprintf fmt "BoolLit(%b)" b
@@ -322,14 +318,6 @@ and pp_expr_desc fmt = function
 (* Structural equality                                                  *)
 (* ------------------------------------------------------------------ *)
 
-let equal_literal a b = match a, b with
-  | LInt m,    LInt n    -> m = n
-  | LFloat f,  LFloat g  -> f = g
-  | LString s, LString t -> s = t
-  | LBool p,   LBool q   -> p = q
-  | LUnit,     LUnit     -> true
-  | _,         _         -> false
-
 let rec equal_pattern a b =
   a.pat_comment = b.pat_comment &&
   equal_pattern_desc a.pat_desc b.pat_desc
@@ -337,7 +325,12 @@ let rec equal_pattern a b =
 and equal_pattern_desc a b = match a, b with
   | PWild,           PWild           -> true
   | PVar x,          PVar y          -> x = y
-  | PLit la,         PLit lb         -> equal_literal la lb
+  | PLitInt m,       PLitInt n       -> m = n
+  | PLitFloat f,     PLitFloat g     -> f = g
+  | PLitString s,    PLitString t    -> s = t
+  | PLitTrue,        PLitTrue        -> true
+  | PLitFalse,       PLitFalse       -> true
+  | PLitUnit,        PLitUnit        -> true
   | PCtor (a, pa),   PCtor (b, pb)   ->
     a = b && List.length pa = List.length pb
     && List.for_all2 equal_pattern pa pb
@@ -380,7 +373,7 @@ let rec equal_expr a b =
 
 and equal_expr_desc a b = match a, b with
   | Var x,       Var y       -> x = y
-  | IntLit m,    IntLit n    -> m = n
+  | IntLit m,    IntLit n    -> Int64.equal m n
   | FloatLit f,  FloatLit g  -> f = g
   | StringLit s, StringLit t -> s = t
   | BoolLit p,   BoolLit q   -> p = q

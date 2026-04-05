@@ -39,6 +39,15 @@ encode to identical bytes, therefore have identical hashes, and are stored
 exactly once. No explicit string-interning or deduplication mechanism is
 needed.
 
+**Comments are encoded and hashed.**
+Node-attached comments (`@# ... #@`) are part of the binary IR. They are
+encoded as `opt(lstr)` in the inline data of every expression and declaration
+node, and as `opt(lstr)` in each inline pattern. Comments are the primary
+means by which LLMs store context alongside code; they must survive a
+working form → IR → working form round-trip without loss. Changing a comment
+changes the node's hash, which is the correct behavior: a comment change is
+a meaningful edit.
+
 **No desugaring before encoding.**
 The binary IR preserves source structure faithfully. `If` is stored as `If`,
 not lowered to `Match`. `Let` with a pattern stays `Let { pat; ... }`.
@@ -79,6 +88,9 @@ addressable in the store.
 
 ### Pattern (`pat`)
 
+Each pattern begins with its tag byte, followed by tag-specific data,
+followed by `comment:opt(lstr)`.
+
 ```
 [tag : u8]
 0x00  PWild        — (no further data)
@@ -93,6 +105,7 @@ addressable in the store.
 0x09  PRecord      — is_open:bool  fields:list(str ‖ pat)
                      (each field entry is: field_name:str  field_pat:pat)
 0x0A  POr          — left:pat  right:pat
+[comment : opt(lstr)]   ← always present after tag-specific data
 ```
 
 ### Type Expression (`ty`)
@@ -128,27 +141,32 @@ Every IR node is stored as a self-contained payload:
 ```
 [tag        : u8 ]
 [n_children : u16]    number of child hashes that follow
-[n_inline   : u32]    byte length of inline data that follows
+[len_inline : u32]    byte length of inline data that follows
 [child_0    : 32 bytes]
 ...
 [child_N    : 32 bytes]
-[inline     : n_inline bytes]
+[inline     : len_inline bytes]
 ```
+
+The inline data for every expression and declaration node **ends with** the
+node's comment encoded as `opt(lstr)`. This trailing comment field is not
+repeated in each node's encoding reference below to avoid clutter, but it
+is always present and included in the hash.
 
 **Hash computation:**
 ```
 hash = Blake3(payload)
 ```
 
-The hash is computed over the complete payload — tag, n_children, n_inline,
+The hash is computed over the complete payload — tag, n_children, len_inline,
 all child hashes, and all inline bytes. Because the encoding is fully
 deterministic (canonical byte order, no padding, no optional fields
 represented ambiguously), the hash is stable for any given AST node.
 
 The payload length is:
 ```
-length = 1 + 2 + 4 + (32 × n_children) + n_inline
-       = 7 + 32 × n_children + n_inline
+length = 1 + 2 + 4 + (32 × n_children) + len_inline
+       = 7 + 32 × n_children + len_inline
 ```
 
 The stored record in a segment's `.bin` file is:
@@ -276,8 +294,8 @@ inline:   (none)
 An anonymous function (lambda). The body is a child; parameter names, types,
 return type annotation, and effect annotation are inline.
 ```
-children: [0: body_expr]
-inline:   params:list(param)  ret:opt(ty)  eff:opt(eff_set)
+children: [0: fn_body]
+inline:   params:list(param)  return_type:opt(ty)  effects:opt(eff_set)
 ```
 
 ---
@@ -416,14 +434,14 @@ self-describing so no separate length fields are needed to locate children.
 #### `0x50 DeclFn`
 A top-level function declaration. The body is the sole child.
 ```
-children: [0: body_expr]
+children: [0: decl_body]
 inline:
   pub:bool
-  name:str
+  fn_name:str
   type_params:list(str)
   params:list(param)
-  ret:opt(ty)
-  eff:opt(eff_set)
+  return_type:opt(ty)
+  effects:opt(eff_set)
 ```
 
 ---
@@ -435,7 +453,7 @@ are small and carry no independently-addressable children.
 children: (none)
 inline:
   pub:bool
-  name:str
+  type_name:str
   type_params:list(str)
   [n_ctors : u16]
   for each constructor in order:
@@ -451,7 +469,7 @@ An effect declaration.
 children: (none)
 inline:
   pub:bool
-  name:str
+  effect_name:str
   type_params:list(str)
   [n_ops : u16]
   for each op in order:
@@ -469,7 +487,7 @@ structural sharing across modules that contain identical declarations).
 children: [0..n_decls−1: decl_hashes]
 inline:
   pub:bool
-  name:str
+  module_name:str
 ```
 
 ---
@@ -505,11 +523,12 @@ fn double(x: Int) -> Int { x }
 ```
 tag:        01
 n_children: 00 00          (0)
-n_inline:   03 00 00 00    (3)
+len_inline:   04 00 00 00    (4)
 inline:     01 00          (str len = 1)
             78             ("x")
+            00             (comment: None)
 ```
-Payload (10 bytes): `01 00 00 03 00 00 00 01 00 78`
+Payload (11 bytes): `01 00 00 04 00 00 00 01 00 78 00`
 Hash: `Blake3(payload)` → call this **H_var_x**
 
 ---
@@ -519,30 +538,32 @@ Hash: `Blake3(payload)` → call this **H_var_x**
 ```
 tag:        50
 n_children: 01 00          (1 child: H_var_x)
-n_inline:   1e 00 00 00    (30 bytes)
+len_inline:   1f 00 00 00    (31 bytes)
 child[0]:   [H_var_x : 32 bytes]
 
 inline:
   00                       pub = false
-  06 00 64 6f 75 62 6c 65  name = "double"
+  06 00 64 6f 75 62 6c 65  fn_name = "double"
   00 00                    type_params: [] (n=0)
   01 00                    params: [1 param]
     01 00 78               param name = "x"
     00 03 00 49 6e 74      param type = TyName "Int"
-  01                       ret: Some
+  01                       return_type: Some
     00 03 00 49 6e 74        TyName "Int"
-  00                       eff: None
+  00                       effects: None
+  00                       comment: None
 ```
 
 Inline byte count:
 - pub: 1
-- name "double": 2 + 6 = 8
+- fn_name "double": 2 + 6 = 8
 - type_params: 2
 - params list header: 2
 - param "x: Int": (2+1) + (1+2+3) = 9
-- ret Some(TyName "Int"): 1 + (1+2+3) = 7
-- eff None: 1
-- **total inline: 30**  ✓
+- return_type Some(TyName "Int"): 1 + (1+2+3) = 7
+- effects None: 1
+- comment None: 1
+- **total inline: 31**  ✓
 
 Hash: `Blake3(payload)` → **H_declfn_double**
 
@@ -552,28 +573,28 @@ Hash: `Blake3(payload)` → **H_declfn_double**
 
 | Node        | Children | Minimum inline | Notes                             |
 |-------------|----------|----------------|-----------------------------------|
-| `Var`       | 0        | ≥ 3            | name str (2 len + ≥1 char)        |
-| `IntLit`    | 0        | 8              | fixed i64                         |
-| `FloatLit`  | 0        | 8              | fixed f64                         |
-| `StringLit` | 0        | 4              | lstr (u32 len, may be empty)      |
-| `BoolTrue`  | 0        | 0              | —                                 |
-| `BoolFalse` | 0        | 0              | —                                 |
-| `UnitLit`   | 0        | 0              | —                                 |
-| `Let`       | 2        | 1              | at least PWild (1 byte pat tag)   |
-| `App`       | ≥ 1      | 0              | n_children encodes arity          |
-| `Fn`        | 1        | 2              | empty param list + no ret + no eff|
-| `Match`     | ≥ 1      | 2              | arm_pats list header (n=0 valid)  |
-| `If`        | 3        | 0              | —                                 |
-| `Do`        | ≥ 0      | 2              | n_stmts header                    |
-| `Letrec`    | ≥ 1      | 2              | n_bindings header                 |
-| `Record`    | ≥ 0      | 2              | field_names list header           |
-| `RecordUpdate` | ≥ 1   | 2              | field_names list header           |
-| `Project`   | 1        | ≥ 3            | field name str                    |
-| `Perform`   | ≥ 0      | ≥ 6            | two name strs                     |
-| `Handle`    | ≥ 1      | 2              | n_handlers header                 |
-| `DeclFn`    | 1        | ≥ 5            | pub + name + 3 empty lists        |
-| `DeclType`  | 0        | ≥ 5            | pub + name + type_params + ctors  |
-| `DeclEffect`| 0        | ≥ 5            | pub + name + type_params + ops    |
-| `DeclModule`| ≥ 0      | ≥ 3            | pub + name                        |
-| `DeclRequire`| 0       | ≥ 2            | TyName ty (tag + name str)        |
-| `Program`   | ≥ 0      | 0              | —                                 |
+| `Var`       | 0        | ≥ 4            | name str + comment (None=1 byte)  |
+| `IntLit`    | 0        | 9              | fixed i64 + comment               |
+| `FloatLit`  | 0        | 9              | fixed f64 + comment               |
+| `StringLit` | 0        | 5              | lstr + comment                    |
+| `BoolTrue`  | 0        | 1              | comment only                      |
+| `BoolFalse` | 0        | 1              | comment only                      |
+| `UnitLit`   | 0        | 1              | comment only                      |
+| `Let`       | 2        | ≥ 3            | pat (PWild=1 tag + 1 comment) + comment |
+| `App`       | ≥ 1      | 1              | comment only                      |
+| `Fn`        | 1        | 4              | empty params + no ret + no eff + comment |
+| `Match`     | ≥ 1      | 3              | arm_pats list header + comment    |
+| `If`        | 3        | 1              | comment only                      |
+| `Do`        | ≥ 0      | 3              | n_stmts header + comment          |
+| `Letrec`    | ≥ 1      | 3              | n_bindings header + comment       |
+| `Record`    | ≥ 0      | 3              | field_names list header + comment |
+| `RecordUpdate` | ≥ 1   | 3              | field_names list header + comment |
+| `Project`   | 1        | ≥ 4            | field name str + comment          |
+| `Perform`   | ≥ 0      | ≥ 7            | two name strs + comment           |
+| `Handle`    | ≥ 1      | 3              | n_handlers header + comment       |
+| `DeclFn`    | 1        | ≥ 6            | pub + fn_name + 3 empty lists + comment |
+| `DeclType`  | 0        | ≥ 6            | pub + type_name + type_params + ctors + comment |
+| `DeclEffect`| 0        | ≥ 6            | pub + effect_name + type_params + ops + comment |
+| `DeclModule`| ≥ 0      | ≥ 4            | pub + module_name + comment       |
+| `DeclRequire`| 0       | ≥ 3            | TyName ty + comment               |
+| `Program`   | ≥ 0      | 1              | comment only                      |

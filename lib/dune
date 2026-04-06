@@ -1,3 +1,5 @@
 (library
  (name axiom_lib)
- (modules lexer ast parser typechecker node_hash node_encoding))
+ (modules lexer ast parser typechecker node_hash node_encoding node_decoding)
+ (foreign_stubs (language c) (names node_hash_stubs))
+ (c_library_flags (-lcrypto)))

@@ -237,10 +237,6 @@ let scan_string st =
   loop ();
   StringLit (Buffer.contents buf)
 
-(** Skip a line comment started with '--'. *)
-let skip_line_comment st =
-  while st.pos < st.len && st.src.[st.pos] <> '\n' do advance st done
-
 (** Scan a node-attached comment opened by '@#'.
     Reads everything until the closing '#@' delimiter. *)
 let scan_comment st =
@@ -276,10 +272,6 @@ let tokenize (src : string) : token list =
 
     (* Whitespace *)
     | Some ch when is_whitespace ch -> advance st; loop ()
-
-    (* Line comments: -- *)
-    | Some '-' when peek2 st = Some '-' ->
-      advance st; advance st; skip_line_comment st; loop ()
 
     (* Identifiers / keywords *)
     | Some ch when is_ident_start ch ->

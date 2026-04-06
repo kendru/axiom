@@ -356,7 +356,7 @@ e ::=
   | C e₁ ... eₙ                             -- constructor application
   | perform E.op e₁ ... eₙ                  -- effect operation invocation
   | handle e with H                          -- effect handler (linear)
-  | literal                                  -- integer, float, string, byte
+  | literal                                  -- integer, float, string
   | { l₁ = e₁ , ... , lₙ = eₙ }            -- record construction
   | e.l                                      -- record projection
   | do { s₁ ; ... ; sₙ }                    -- sequencing (sugar)
@@ -374,6 +374,32 @@ p ::=
   | p₁ | p₂                   -- or-pattern
 ```
 
+**Node-attached comments:**
+
+Every expression, pattern, and declaration node in the AST carries an optional
+comment annotation. This is a deliberate design choice: because LLMs are the
+primary authors and consumers of Axiom code, textual context that explains
+intent, records reasoning, or captures design rationale is semantically
+meaningful — not mere decoration. Comments are preserved through the parse,
+elaboration, and binary IR round-trip.
+
+```
+annotation ::= '@#' text '#@'
+```
+
+A `@#...#@` comment is a **postfix** annotation: it attaches to the
+immediately *preceding* expression, pattern, or declaration node. This means
+the comment is parsed as part of the node it follows, not the node that comes
+after it. Parentheses can be used to control the attachment point:
+
+```
+x + 1 @# I attach to `1` #@
+(x + 1) @# I attach to `x + 1` #@
+```
+
+Comments survive in the AST and binary IR, enabling tooling to display,
+search, and reason about annotated code.
+
 ### 3.2 Mutual Recursion
 
 Mutually recursive definitions are grouped explicitly with `letrec`:
@@ -381,14 +407,16 @@ Mutually recursive definitions are grouped explicitly with `letrec`:
 ```
 letrec {
   is_even = fn (n: Nat) -> Bool {
-    match n with
+    match n with {
     | Zero => true
     | Succ m => is_odd(m)
+    }
   },
   is_odd = fn (n: Nat) -> Bool {
-    match n with
+    match n with {
     | Zero => false
     | Succ m => is_even(m)
+    }
   }
 } in is_even(42)
 ```
@@ -535,9 +563,10 @@ Code that needs an effect invokes it with `perform`:
 
 ```
 fn read_config(path: Path) -> Config ! {FileSystem, Throw<ParseError>} {
-  match perform FileSystem.read_file(path) with
+  match perform FileSystem.read_file(path) with {
   | Ok(bytes) => parse_config(bytes)
   | Err(e)    => perform Throw.throw(wrap_io_error(e))
+  }
 }
 ```
 
@@ -606,7 +635,7 @@ handle
 with {
   Throw<String> {
     return x      => Ok(x)
-    throw(msg)    => Err(msg)        -- no resume: abort on throw
+    throw(msg)    => Err(msg)        @# no resume: abort on throw #@
   }
 }
 ```
@@ -666,8 +695,11 @@ handle app_logic() with {
     transaction(f)  => resume real_db.with_transaction(f)
   }
 }
+```
 
--- In tests:
+In tests, the same code runs with a mock handler:
+
+```
 handle app_logic() with {
   Database {
     query(sql)      => resume mock_db.record_and_return(sql)
@@ -684,7 +716,7 @@ handle file_processing() with {
     read_file(path) => {
       let handle = os_open(path)
       let result = os_read(handle)
-      os_close(handle)        -- cleanup always runs
+      os_close(handle)        @# cleanup always runs #@
       resume result
     }
   }
@@ -699,14 +731,16 @@ fn with_caching<A>(computation: () -> A ! {FileSystem, E}) -> A ! {FileSystem, E
   handle computation() with {
     FileSystem {
       read_file(path) =>
-        match Map.lookup(path, cache) with
-        | Some(cached) => resume Ok(cached)
+        match Map.lookup(path, cache) with {
+        | Some(cached) => resume(Ok(cached))
         | None => {
             let result = perform FileSystem.read_file(path)
-            match result with
-            | Ok(bytes) => { Map.insert(path, bytes, cache); resume result }
-            | err       => resume err
+            match result with {
+            | Ok(bytes) => { Map.insert(path, bytes, cache); resume(result) }
+            | err       => resume(err)
+            }
           }
+        }
     }
   }
 }
@@ -798,9 +832,10 @@ The standard iteration pattern is tail-recursive functions with accumulators:
 ```
 fn sum(xs: List<Int>) -> Int ! pure {
   fn go(acc: Int, rest: List<Int>) -> Int ! pure {
-    match rest with
+    match rest with {
     | Nil        => acc
-    | Cons(h, t) => go(acc + h, t)    -- tail call, compiles to jump
+    | Cons(h, t) => go(acc + h, t)    @# tail call, compiles to jump #@
+    }
   }
   go(0, xs)
 }
@@ -823,12 +858,13 @@ handle count_loop(1000000) with {
 }
 
 fn count_loop(n: Int) -> Int ! {State<Int>} {
-  match n with
+  match n with {
   | 0 => perform State.get()
   | _ => {
       perform State.put(perform State.get() + 1)
-      count_loop(n - 1)    -- tail call, bounded stack even through handler
+      count_loop(n - 1)    @# tail call, bounded stack even through handler #@
     }
+  }
 }
 ```
 
@@ -840,7 +876,7 @@ Sequential effects use `do` blocks. The last expression is in tail position:
 do {
   perform Log.log(Info, "starting");
   let data = perform FileSystem.read_file(path);
-  process(data)    -- tail position
+  process(data)    @# tail position #@
 }
 ```
 
@@ -884,15 +920,15 @@ module json_parser {
   }
 
   pub fn parse_file(path: Path) -> JsonValue ! {FileSystem, Throw<ParseError>} {
-    match perform FileSystem.read_file(path) with
+    match perform FileSystem.read_file(path) with {
     | Ok(bytes)  => parse_string(bytes_to_string(bytes))
     | Err(e)     => perform Throw.throw(io_to_parse_error(e))
+    }
   }
 
-  -- Private helper, not exported
   fn parse_value(tokens: List<Token>, pos: Int) -> (JsonValue, Int) ! {Throw<ParseError>} {
     ...
-  }
+  } @# Private helper, not exported #@
 }
 ```
 
@@ -902,10 +938,10 @@ The `pub` interface of a module is designed so that an LLM can reason about
 the module's behavior by reading **only** the public signatures:
 
 ```
--- An LLM sees this and knows:
--- "json_parser needs file access and may throw ParseError.
---  It provides parse_string (pure except for errors) and
---  parse_file (needs filesystem, may error)."
+@# An LLM sees this and knows:
+   json_parser needs file access and may throw ParseError.
+   It provides parse_string (pure except for errors) and
+   parse_file (needs filesystem, may error). #@
 ```
 
 This is the fundamental unit of abstraction. The LLM can compose modules
@@ -937,7 +973,6 @@ Modules can define new effects and export them, enabling framework patterns:
 
 ```
 module web_framework {
-  -- Framework-defined effects that user code performs
   effect Route {
     get:  (String, Handler) -> Unit
     post: (String, Handler) -> Unit
@@ -957,10 +992,9 @@ module web_framework {
 
   type Handler = () -> Unit ! {Request, Response, Throw<HttpError>}
 
-  -- Framework provides the handler that wires effects to the runtime
   pub fn serve(port: Int, setup: () -> Unit ! {Route}) -> Unit ! {Net, Log} {
     ...
-  }
+  } @# Wires framework effects to the runtime #@
 }
 ```
 
@@ -1015,11 +1049,11 @@ The syntax prioritizes:
 ```
 -- Top-level structure
 
-program     ::= module_decl*
+program     ::= decl*
 
-module_decl ::= 'module' IDENT '{' module_item* '}'
+decl        ::= require_decl | type_decl | effect_decl | fn_decl | module_decl
 
-module_item ::= require_decl | type_decl | effect_decl | fn_decl
+module_decl ::= 'pub'? 'module' IDENT '{' decl* '}'
 
 require_decl ::= 'require' 'effect' type_expr
 
@@ -1029,8 +1063,10 @@ variant     ::= CTOR_IDENT | CTOR_IDENT '(' type_expr (',' type_expr)* ')'
 
 effect_decl ::= 'effect' type_head '{' op_decl* '}'
 op_decl     ::= IDENT ':' '(' type_expr (',' type_expr)* ')' '->' type_expr
+             -- Operations are comma-separated within the effect body.
 
-fn_decl     ::= 'pub'? 'fn' IDENT type_params? '(' params ')' '->' type_expr '!' effect_set '{' expr '}'
+fn_decl     ::= 'pub'? 'fn' IDENT type_params? '(' params ')' ('->' type_expr ('!' effect_set)?)? '{' expr '}'
+             -- Return type and effect annotations are optional in the implementation.
 
 -- Type-level
 
@@ -1074,7 +1110,8 @@ letrec_bind ::= IDENT '(' params ')' ':' type_expr '=' expr
 match_expr  ::= 'match' expr 'with' '{' ('|' pattern '=>' expr)+ '}'
 
 handle_expr ::= 'handle' expr 'with' '{' handler_clause+ '}'
-handler_clause ::= IDENT '{' op_handler+ '}'
+handler_clause ::= CTOR_IDENT '{' op_handler+ '}'
+             -- Effect names are uppercase-start (CtorIdent), e.g. State, Log.
 op_handler  ::= IDENT '(' params ')' '=>' expr
               | 'return' IDENT '=>' expr
               -- 'return' branch handles the normal completion value (see note below)
@@ -1127,6 +1164,13 @@ field_pat   ::= IDENT '=' pattern   -- explicit field binding
               | IDENT               -- shorthand: field name bound as variable
              -- '..' in record patterns means "open" — remaining fields ignored.
              -- Without '..', the pattern must name every field (closed match).
+
+-- Node-attached comments (postfix)
+
+comment     ::= '@#' TEXT '#@'
+             -- Postfix annotation: attaches to the immediately preceding
+             -- expression, pattern, or declaration. Use parentheses to control
+             -- attachment. Preserved in the AST and binary IR. See Section 3.1.
 ```
 
 **Note — `let` in `do` blocks.** Inside a `do` block, `let` bindings omit the
@@ -1137,9 +1181,9 @@ the block is a statement binding; the final item must be a plain expression
 
 ```
 do {
-  let x = foo();       -- statement binding: no 'in'
-  let y = bar(x);      -- statement binding: no 'in'
-  baz(x, y)            -- final expression: value of the block
+  let x = foo();       @# statement binding: no 'in' #@
+  let y = bar(x);      @# statement binding: no 'in' #@
+  baz(x, y)            @# final expression: value of the block #@
 }
 ```
 
@@ -1154,7 +1198,7 @@ handle compute() with {
   State {
     get()  => resume(current_state, current_state)
     put(s) => resume((), s)
-    return v => v    -- computation finished; v is its result value
+    return v => v    @# computation finished; v is its result value #@
   }
 }
 ```
@@ -1163,9 +1207,10 @@ handle compute() with {
 branches. All bound names must have the same type in each branch.
 
 ```
-match shape with
+match shape with {
 | Circle(r) | Ellipse(r, r) => area_approx(r)
 | _                         => 0.0
+}
 ```
 
 ### 8.3 Complete Example: Key-Value Store
@@ -1183,9 +1228,10 @@ module kv_store {
   pub fn get_key(key: String) -> String ! {State<Map<String, String>>, Throw<KVError>, Log} {
     do {
       perform Log.log(Debug, "get: " ++ key);
-      match Map.lookup(key, perform State.get()) with
+      match Map.lookup(key, perform State.get()) with {
       | Some(v) => v
       | None    => perform Throw.throw(KeyNotFound(key))
+      }
     }
   }
 
@@ -1199,9 +1245,10 @@ module kv_store {
   pub fn delete_key(key: String) -> Unit ! {State<Map<String, String>>, Throw<KVError>, Log} {
     do {
       perform Log.log(Debug, "del: " ++ key);
-      match Map.lookup(key, perform State.get()) with
+      match Map.lookup(key, perform State.get()) with {
       | Some(_) => perform State.put(Map.remove(key, perform State.get()))
       | None    => perform Throw.throw(KeyNotFound(key))
+      }
     }
   }
 }
@@ -1885,7 +1932,7 @@ module kv_store_test {
         throw(other)            => fail("unexpected error")
       }
       Log {
-        log(_, _) => resume ()    -- discard logs in tests
+        log(_, _) => resume ()    @# discard logs in tests #@
       }
     }
   }

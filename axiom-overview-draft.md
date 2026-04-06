@@ -695,8 +695,11 @@ handle app_logic() with {
     transaction(f)  => resume real_db.with_transaction(f)
   }
 }
+```
 
-@# In tests: #@
+In tests, the same code runs with a mock handler:
+
+```
 handle app_logic() with {
   Database {
     query(sql)      => resume mock_db.record_and_return(sql)
@@ -923,10 +926,9 @@ module json_parser {
     }
   }
 
-  @# Private helper, not exported #@
   fn parse_value(tokens: List<Token>, pos: Int) -> (JsonValue, Int) ! {Throw<ParseError>} {
     ...
-  }
+  } @# Private helper, not exported #@
 }
 ```
 
@@ -971,7 +973,6 @@ Modules can define new effects and export them, enabling framework patterns:
 
 ```
 module web_framework {
-  @# Framework-defined effects that user code performs #@
   effect Route {
     get:  (String, Handler) -> Unit
     post: (String, Handler) -> Unit
@@ -991,10 +992,9 @@ module web_framework {
 
   type Handler = () -> Unit ! {Request, Response, Throw<HttpError>}
 
-  @# Framework provides the handler that wires effects to the runtime #@
   pub fn serve(port: Int, setup: () -> Unit ! {Route}) -> Unit ! {Net, Log} {
     ...
-  }
+  } @# Wires framework effects to the runtime #@
 }
 ```
 

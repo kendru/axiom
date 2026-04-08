@@ -60,11 +60,11 @@ let test_lex_ctor_with_digits () =
 (* Integer literal tests                                                *)
 (* ------------------------------------------------------------------ *)
 
-let test_lex_int_zero () = check_tokens "int 0" "0" [ IntLit 0 ]
-let test_lex_int_pos () = check_tokens "int 42" "42" [ IntLit 42 ]
+let test_lex_int_zero () = check_tokens "int 0" "0" [ IntLit 0L ]
+let test_lex_int_pos () = check_tokens "int 42" "42" [ IntLit 42L ]
 
 let test_lex_int_hex () =
-  check_tokens "hex 0xFF" "0xFF" [ IntLit 255 ]
+  check_tokens "hex 0xFF" "0xFF" [ IntLit 255L ]
 
 (* ------------------------------------------------------------------ *)
 (* Float literal tests                                                  *)
@@ -144,7 +144,7 @@ let test_lex_newline_ignored () =
 let test_lex_multi_token () =
   check_tokens "let x = 42 in x"
     "let x = 42 in x"
-    [ Let; Ident "x"; Equal; IntLit 42; In; Ident "x" ]
+    [ Let; Ident "x"; Equal; IntLit 42L; In; Ident "x" ]
 
 (* ------------------------------------------------------------------ *)
 (* Node-attached comment tests (@# ... #@)                              *)
@@ -153,7 +153,7 @@ let test_lex_multi_token () =
 let test_lex_comment_simple () =
   check_tokens "simple comment"
     "42 @# the answer #@"
-    [ IntLit 42; Comment "the answer" ]
+    [ IntLit 42L; Comment "the answer" ]
 
 let test_lex_comment_multiword () =
   check_tokens "multiword comment"
@@ -168,7 +168,7 @@ let test_lex_comment_whitespace_trimmed () =
 let test_lex_comment_between_tokens () =
   check_tokens "comment between tokens"
     "let x = 42 @# the value #@ in x"
-    [ Let; Ident "x"; Equal; IntLit 42; Comment "the value"; In; Ident "x" ]
+    [ Let; Ident "x"; Equal; IntLit 42L; Comment "the value"; In; Ident "x" ]
 
 let test_lex_comment_multiline () =
   check_tokens "multiline comment"

@@ -17,3 +17,13 @@
  (name test_decl_parser)
  (modules test_decl_parser)
  (libraries axiom_lib alcotest))
+
+(test
+ (name test_node_encoding)
+ (modules test_node_encoding)
+ (libraries axiom_lib alcotest))
+
+(test
+ (name test_roundtrip)
+ (modules test_roundtrip)
+ (libraries axiom_lib alcotest))

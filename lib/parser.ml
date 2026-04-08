@@ -170,14 +170,14 @@ let rec parse_pattern (st : state) : pattern =
         | _ -> []
       in
       Ast.pat (PCtor (s, sub_pats))
-    | Some (IntLit n)    -> advance st; Ast.pat (PLit (LInt n))
-    | Some (FloatLit f)  -> advance st; Ast.pat (PLit (LFloat f))
-    | Some (StringLit s) -> advance st; Ast.pat (PLit (LString s))
-    | Some True          -> advance st; Ast.pat (PLit (LBool true))
-    | Some False         -> advance st; Ast.pat (PLit (LBool false))
+    | Some (IntLit n)    -> advance st; Ast.pat (PLitInt n)
+    | Some (FloatLit f)  -> advance st; Ast.pat (PLitFloat f)
+    | Some (StringLit s) -> advance st; Ast.pat (PLitString s)
+    | Some True          -> advance st; Ast.pat PLitTrue
+    | Some False         -> advance st; Ast.pat PLitFalse
     | Some LParen ->
       (match st.tokens with
-       | _ :: RParen :: _ -> advance st; advance st; Ast.pat (PLit LUnit)
+       | _ :: RParen :: _ -> advance st; advance st; Ast.pat PLitUnit
        | _ :: _ ->
          (* Parenthesised pattern *)
          advance st;

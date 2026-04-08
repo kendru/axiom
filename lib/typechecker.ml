@@ -372,7 +372,8 @@ and env_from_pattern env (p : pattern) scrut_ty =
   match p.pat_desc with
   | PWild         -> env
   | PVar x        -> env_extend x (mono scrut_ty) env
-  | PLit _        -> env
+  | PLitInt _ | PLitFloat _ | PLitString _
+  | PLitTrue | PLitFalse | PLitUnit -> env
   | PCtor (_, sub_pats) ->
     List.fold_left (fun e p -> env_from_pattern e p (fresh_meta ())) env sub_pats
   | PRecord (fields, _) ->

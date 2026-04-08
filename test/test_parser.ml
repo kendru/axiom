@@ -20,7 +20,7 @@ let check_expr label src expected =
 let test_let_int_body_var () =
   check_expr "let x = 42 in x"
     "let x = 42 in x"
-    (expr (Let { pat = pat (PVar "x"); value = expr (IntLit 42); body = expr (Var "x") }))
+    (expr (Let { pat = pat (PVar "x"); value = expr (IntLit 42L); body = expr (Var "x") }))
 
 let test_let_bool () =
   check_expr "let x = true in x"
@@ -40,8 +40,8 @@ let test_let_unit () =
 let test_let_nested () =
   check_expr "nested let"
     "let x = 1 in let y = 2 in x"
-    (expr (Let { pat = pat (PVar "x"); value = expr (IntLit 1)
-            ; body = expr (Let { pat = pat (PVar "y"); value = expr (IntLit 2)
+    (expr (Let { pat = pat (PVar "x"); value = expr (IntLit 1L)
+            ; body = expr (Let { pat = pat (PVar "y"); value = expr (IntLit 2L)
                             ; body = expr (Var "x") }) }))
 
 let test_let_var_value () =
@@ -52,7 +52,7 @@ let test_let_var_value () =
 let test_let_chain_var () =
   check_expr "chained var binding"
     "let a = 1 in let b = a in b"
-    (expr (Let { pat = pat (PVar "a"); value = expr (IntLit 1)
+    (expr (Let { pat = pat (PVar "a"); value = expr (IntLit 1L)
             ; body = expr (Let { pat = pat (PVar "b"); value = expr (Var "a")
                             ; body = expr (Var "b") }) }))
 
@@ -63,7 +63,7 @@ let test_let_chain_var () =
 let test_app_single_arg () =
   check_expr "f(42)"
     "f(42)"
-    (expr (App (expr (Var "f"), [expr (IntLit 42)])))
+    (expr (App (expr (Var "f"), [expr (IntLit 42L)])))
 
 let test_app_multi_arg () =
   check_expr "f(x, y)"
@@ -83,7 +83,7 @@ let test_app_nested () =
 let test_app_in_let () =
   check_expr "let x = f(42) in x"
     "let x = f(42) in x"
-    (expr (Let { pat = pat (PVar "x"); value = expr (App (expr (Var "f"), [expr (IntLit 42)]))
+    (expr (Let { pat = pat (PVar "x"); value = expr (App (expr (Var "f"), [expr (IntLit 42L)]))
             ; body = expr (Var "x") }))
 
 (* ------------------------------------------------------------------ *)
@@ -144,7 +144,7 @@ let test_fn_generic_param () =
                              ; param_type = TyApp ("List", [TyName "Int"]) }]
            ; return_type = Some (TyName "Int")
            ; effects     = Some Pure
-           ; fn_body     = expr (IntLit 0) }))
+           ; fn_body     = expr (IntLit 0L) }))
 
 (* Effect set with named effects: fn (x: Int) -> Int ! {Log, Throw<E>} { x } *)
 let test_fn_effect_set () =
@@ -164,15 +164,15 @@ let test_match_bool_arms () =
   check_expr "match bool"
     "match x with { | true => 1 | false => 0 }"
     (expr (Match { scrutinee = expr (Var "x")
-              ; arms = [ { pattern = pat (PLit (LBool true));  arm_body = expr (IntLit 1) }
-                       ; { pattern = pat (PLit (LBool false)); arm_body = expr (IntLit 0) } ] }))
+              ; arms = [ { pattern = pat (PLitTrue);  arm_body = expr (IntLit 1L) }
+                       ; { pattern = pat (PLitFalse); arm_body = expr (IntLit 0L) } ] }))
 
 (* match n with { | 0 => true | _ => false } *)
 let test_match_wildcard () =
   check_expr "match with wildcard"
     "match n with { | 0 => true | _ => false }"
     (expr (Match { scrutinee = expr (Var "n")
-              ; arms = [ { pattern = pat (PLit (LInt 0)); arm_body = expr (BoolLit true) }
+              ; arms = [ { pattern = pat (PLitInt 0L); arm_body = expr (BoolLit true) }
                        ; { pattern = pat PWild;            arm_body = expr (BoolLit false) } ] }))
 
 (* match opt with { | Some(x) => x | None => 0 } *)
@@ -181,7 +181,7 @@ let test_match_constructor () =
     "match opt with { | Some(x) => x | None => 0 }"
     (expr (Match { scrutinee = expr (Var "opt")
               ; arms = [ { pattern = pat (PCtor ("Some", [pat (PVar "x")])); arm_body = expr (Var "x") }
-                       ; { pattern = pat (PCtor ("None", []));              arm_body = expr (IntLit 0) } ] }))
+                       ; { pattern = pat (PCtor ("None", []));              arm_body = expr (IntLit 0L) } ] }))
 
 (* match x with { | y => y }  -- variable binding pattern *)
 let test_match_var_pattern () =
@@ -198,7 +198,7 @@ let test_match_var_pattern () =
 let test_if_basic () =
   check_expr "if basic"
     "if b { 1 } else { 0 }"
-    (expr (If { cond = expr (Var "b"); then_ = expr (IntLit 1); else_ = expr (IntLit 0) }))
+    (expr (If { cond = expr (Var "b"); then_ = expr (IntLit 1L); else_ = expr (IntLit 0L) }))
 
 (* if cond { f(x) } else { g(x) } *)
 let test_if_app_body () =
@@ -213,8 +213,8 @@ let test_if_nested () =
   check_expr "nested if"
     "if a { if b { 1 } else { 2 } } else { 3 }"
     (expr (If { cond  = expr (Var "a")
-           ; then_ = expr (If { cond = expr (Var "b"); then_ = expr (IntLit 1); else_ = expr (IntLit 2) })
-           ; else_ = expr (IntLit 3) }))
+           ; then_ = expr (If { cond = expr (Var "b"); then_ = expr (IntLit 1L); else_ = expr (IntLit 2L) })
+           ; else_ = expr (IntLit 3L) }))
 
 (* ------------------------------------------------------------------ *)
 (* handle expressions                                                   *)
@@ -309,14 +309,14 @@ let test_do_effect_then_result () =
 let test_do_let_stmt () =
   check_expr "do let stmt"
     "do { let x = 42; x }"
-    (expr (Do [StmtLet { pat = pat (PVar "x"); value = expr (IntLit 42) }; StmtExpr (expr (Var "x"))]))
+    (expr (Do [StmtLet { pat = pat (PVar "x"); value = expr (IntLit 42L) }; StmtExpr (expr (Var "x"))]))
 
 (* do { let a = 1; let b = 2; a }  -- multiple let stmts *)
 let test_do_multi_let () =
   check_expr "do multi let"
     "do { let a = 1; let b = 2; a }"
-    (expr (Do [ StmtLet { pat = pat (PVar "a"); value = expr (IntLit 1) }
-           ; StmtLet { pat = pat (PVar "b"); value = expr (IntLit 2) }
+    (expr (Do [ StmtLet { pat = pat (PVar "a"); value = expr (IntLit 1L) }
+           ; StmtLet { pat = pat (PVar "b"); value = expr (IntLit 2L) }
            ; StmtExpr (expr (Var "a")) ]))
 
 (* ------------------------------------------------------------------ *)
@@ -332,7 +332,7 @@ let test_letrec_single () =
            ; letrec_params = [{ param_name = "x"; param_type = TyName "Int" }]
            ; letrec_return_type = TyName "Int"
            ; letrec_body = expr (Var "x") } ]
-       , expr (App (expr (Var "f"), [expr (IntLit 42)])) )))
+       , expr (App (expr (Var "f"), [expr (IntLit 42L)])) )))
 
 (* letrec { even(n: Int): Bool = n, odd(n: Int): Bool = n } in even(0) *)
 let test_letrec_mutual () =
@@ -347,7 +347,7 @@ let test_letrec_mutual () =
            ; letrec_params = [{ param_name = "n"; param_type = TyName "Int" }]
            ; letrec_return_type = TyName "Bool"
            ; letrec_body = expr (Var "n") } ]
-       , expr (App (expr (Var "even"), [expr (IntLit 0)])) )))
+       , expr (App (expr (Var "even"), [expr (IntLit 0L)])) )))
 
 (* ------------------------------------------------------------------ *)
 (* Record literals, updates, and projection                            *)
@@ -363,13 +363,13 @@ let test_record_empty () =
 let test_record_literal () =
   check_expr "record literal"
     "{ x: 1, y: 2 }"
-    (expr (Record [("x", expr (IntLit 1)); ("y", expr (IntLit 2))]))
+    (expr (Record [("x", expr (IntLit 1L)); ("y", expr (IntLit 2L))]))
 
 (* { p with x: 3 } -- record update *)
 let test_record_update () =
   check_expr "record update"
     "{ p with x: 3 }"
-    (expr (RecordUpdate (expr (Var "p"), [("x", expr (IntLit 3))])))
+    (expr (RecordUpdate (expr (Var "p"), [("x", expr (IntLit 3L))])))
 
 (* p.x -- field projection *)
 let test_project_field () =
@@ -390,7 +390,7 @@ let test_project_chain () =
 let test_paren_grouping () =
   check_expr "parenthesised expression"
     "(42)"
-    (expr (IntLit 42))
+    (expr (IntLit 42L))
 
 let test_paren_var () =
   check_expr "parenthesised var"
@@ -405,21 +405,21 @@ let test_paren_var () =
 let test_comment_on_atom () =
   check_expr "comment on literal"
     "42 @# the answer #@"
-    { desc = IntLit 42; comment = Some "the answer" }
+    { desc = IntLit 42L; comment = Some "the answer" }
 
 (* let x = 42 @# the answer #@ in x *)
 let test_comment_on_value () =
   check_expr "comment on let value"
     "let x = 42 @# the answer #@ in x"
     (expr (Let { pat = pat (PVar "x")
-            ; value = { desc = IntLit 42; comment = Some "the answer" }
+            ; value = { desc = IntLit 42L; comment = Some "the answer" }
             ; body = expr (Var "x") }))
 
 (* f(42) @# function call #@ *)
 let test_comment_on_app () =
   check_expr "comment on application"
     "f(42) @# function call #@"
-    { desc = App (expr (Var "f"), [expr (IntLit 42)]); comment = Some "function call" }
+    { desc = App (expr (Var "f"), [expr (IntLit 42L)]); comment = Some "function call" }
 
 (* (x) @# grouped #@ *)
 let test_comment_on_paren () =
@@ -431,7 +431,7 @@ let test_comment_on_paren () =
 let test_comment_on_arg () =
   check_expr "comment on arg"
     "f(42 @# the arg #@)"
-    (expr (App (expr (Var "f"), [{ desc = IntLit 42; comment = Some "the arg" }])))
+    (expr (App (expr (Var "f"), [{ desc = IntLit 42L; comment = Some "the arg" }])))
 
 (* p.x @# field access #@ *)
 let test_comment_on_project () =

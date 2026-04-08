@@ -1,3 +1,7 @@
 (library
  (name axiom_lib)
- (modules lexer ast parser typechecker))
+ (modules lexer ast parser typechecker node_hash node_tag node_encoding node_decoding)
+ (foreign_stubs
+  (language c)
+  (names node_hash_stubs blake3 blake3_dispatch blake3_portable)
+  (flags (:standard -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0))))

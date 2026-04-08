@@ -423,6 +423,37 @@ let test_project_encoding () =
   Alcotest.(check int) "n_children" 1 (get_u16 payload 1)
 
 (* ------------------------------------------------------------------ *)
+(* Hash algorithm: BLAKE3 test vectors                                 *)
+(* ------------------------------------------------------------------ *)
+
+(** Hex-encode bytes for readable assertions. *)
+let to_hex b =
+  let n = Bytes.length b in
+  let buf = Buffer.create (n * 2) in
+  for i = 0 to n - 1 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Char.code (Bytes.get b i)))
+  done;
+  Buffer.contents buf
+
+(** Official BLAKE3 test vector: hash of empty input.
+    Source: https://github.com/BLAKE3-team/BLAKE3/blob/master/test_vectors/test_vectors.json *)
+let test_blake3_empty () =
+  let h = Axiom_lib.Node_hash.digest Bytes.empty in
+  Alcotest.(check string)
+    "BLAKE3 of empty input"
+    "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    (to_hex h)
+
+(** Official BLAKE3 test vector: hash of input_len = 1, [0x00].
+    The BLAKE3 test vectors use inputs of the form 0,1,2,...,250 mod 251. *)
+let test_blake3_single_byte () =
+  let h = Axiom_lib.Node_hash.digest (Bytes.of_string "\x00") in
+  Alcotest.(check string)
+    "BLAKE3 of single zero byte"
+    "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
+    (to_hex h)
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                         *)
 (* ------------------------------------------------------------------ *)
 
@@ -466,4 +497,8 @@ let () =
         [ Alcotest.test_case "DeclFn structure"   `Quick test_decl_fn_structure
         ; Alcotest.test_case "DeclType structure"  `Quick test_decl_type_structure
         ; Alcotest.test_case "Program structure"   `Quick test_program_structure
+        ] )
+    ; ( "blake3",
+        [ Alcotest.test_case "empty input vector"  `Quick test_blake3_empty
+        ; Alcotest.test_case "single byte vector"  `Quick test_blake3_single_byte
         ] ) ]

@@ -7,7 +7,7 @@
     All multi-byte integers are little-endian. *)
 
 open Ast
-open Node_encoding
+open Node_tag
 
 (* ================================================================== *)
 (* Cursor: a mutable read position over a bytes buffer                 *)

@@ -157,24 +157,113 @@ let test_root_hash_persists () =
 (* Segment sealing                                                      *)
 (* ------------------------------------------------------------------ *)
 
-let test_seal_and_lookup () =
-  (* Write enough nodes to trigger sealing (threshold is 65536, so just test
-     that we can seal explicitly by manipulating a small threshold via many
-     distinct payloads — instead we just test via the public API with the
-     real threshold, writing directly through the encoding adapter). *)
+(* Nodes written before an explicit seal live in a sealed segment;
+   nodes written after live in the new active segment.
+   Both must be readable from the same store handle. *)
+let test_cross_segment_lookup () =
   with_store (fun dir ->
     let t = open_store dir in
-    (* Write 200 nodes, close (seal does not happen), reopen, verify. *)
-    let payloads = small_payloads 200 in
-    let hashes = Array.map (write t) payloads in
+    let before = small_payloads 50 in
+    let h_before = Array.map (write t) before in
+    seal t;  (* force seal: seg-000001 sealed, seg-000002 becomes active *)
+    let after = small_payloads 50 in  (* fresh payloads, different content *)
+    (* Make after payloads distinct from before by prepending "B-" *)
+    let after = Array.map (fun p ->
+      Bytes.cat (Bytes.of_string "B-") p
+    ) after in
+    let h_after = Array.map (write t) after in
+    (* All nodes readable without closing *)
+    Array.iteri (fun i h ->
+      Alcotest.(check bytes) (Printf.sprintf "sealed seg, node %d" i)
+        before.(i) (lookup t h)
+    ) h_before;
+    Array.iteri (fun i h ->
+      Alcotest.(check bytes) (Printf.sprintf "active seg, node %d" i)
+        after.(i) (lookup t h)
+    ) h_after;
+    close_store t
+  )
+
+(* After sealing and closing, reopen and verify both segments are readable. *)
+let test_multi_segment_resume () =
+  with_store (fun dir ->
+    let before = small_payloads 30 in
+    let after  = Array.map (fun p -> Bytes.cat (Bytes.of_string "C-") p)
+                            (small_payloads 30) in
+    let h_before, h_after =
+      let t = open_store dir in
+      let hb = Array.map (write t) before in
+      seal t;
+      let ha = Array.map (write t) after in
+      close_store t;
+      (hb, ha)
+    in
+    let t = open_store dir in
+    Array.iteri (fun i h ->
+      Alcotest.(check bytes) (Printf.sprintf "resume sealed %d" i)
+        before.(i) (lookup t h)
+    ) h_before;
+    Array.iteri (fun i h ->
+      Alcotest.(check bytes) (Printf.sprintf "resume active %d" i)
+        after.(i) (lookup t h)
+    ) h_after;
+    close_store t
+  )
+
+(* Nodes already in a sealed segment are not re-written on the active segment. *)
+let test_cross_segment_dedup () =
+  with_store (fun dir ->
+    let t = open_store dir in
+    let p = payload "deduped across segments" in
+    let h1 = write t p in
+    seal t;
+    let h2 = write t p in  (* same payload — must deduplicate against sealed seg *)
+    Alcotest.(check bytes) "same hash across seal" h1 h2;
+    (* Only one copy should exist — check via lookup on both sides *)
+    Alcotest.(check bytes) "readable from active store" p (lookup t h1);
+    close_store t
+  )
+
+(* Three segments: seg1 sealed, seg2 sealed, seg3 active. *)
+let test_three_segments () =
+  with_store (fun dir ->
+    let mk n prefix =
+      Array.map (fun p -> Bytes.cat (Bytes.of_string prefix) p)
+                (small_payloads n)
+    in
+    let p1 = mk 20 "S1-" in
+    let p2 = mk 20 "S2-" in
+    let p3 = mk 20 "S3-" in
+    let t = open_store dir in
+    let h1 = Array.map (write t) p1 in
+    seal t;
+    let h2 = Array.map (write t) p2 in
+    seal t;
+    let h3 = Array.map (write t) p3 in
+    let check_all () =
+      Array.iteri (fun i h ->
+        Alcotest.(check bytes) (Printf.sprintf "seg1 node %d" i) p1.(i) (lookup t h)
+      ) h1;
+      Array.iteri (fun i h ->
+        Alcotest.(check bytes) (Printf.sprintf "seg2 node %d" i) p2.(i) (lookup t h)
+      ) h2;
+      Array.iteri (fun i h ->
+        Alcotest.(check bytes) (Printf.sprintf "seg3 node %d" i) p3.(i) (lookup t h)
+      ) h3
+    in
+    check_all ();
     close_store t;
+    (* Verify after resume *)
     let t2 = open_store dir in
     Array.iteri (fun i h ->
-      Alcotest.(check bytes)
-        (Printf.sprintf "after-resume payload %d" i)
-        payloads.(i)
-        (lookup t2 h)
-    ) hashes;
+      Alcotest.(check bytes) (Printf.sprintf "resume seg1 node %d" i) p1.(i) (lookup t2 h)
+    ) h1;
+    Array.iteri (fun i h ->
+      Alcotest.(check bytes) (Printf.sprintf "resume seg2 node %d" i) p2.(i) (lookup t2 h)
+    ) h2;
+    Array.iteri (fun i h ->
+      Alcotest.(check bytes) (Printf.sprintf "resume seg3 node %d" i) p3.(i) (lookup t2 h)
+    ) h3;
     close_store t2
   )
 
@@ -258,7 +347,12 @@ let () =
       Alcotest.test_case "resume after close"         `Quick test_resume;
       Alcotest.test_case "root hash default"          `Quick test_root_hash_default;
       Alcotest.test_case "root hash persists"         `Quick test_root_hash_persists;
-      Alcotest.test_case "seal and lookup"            `Quick test_seal_and_lookup;
+    ];
+    "multi-segment", [
+      Alcotest.test_case "cross-segment lookup"       `Quick test_cross_segment_lookup;
+      Alcotest.test_case "multi-segment resume"       `Quick test_multi_segment_resume;
+      Alcotest.test_case "cross-segment dedup"        `Quick test_cross_segment_dedup;
+      Alcotest.test_case "three segments"             `Quick test_three_segments;
     ];
     "adapters", [
       Alcotest.test_case "encoding adapter"           `Quick test_encoding_adapter;

@@ -408,6 +408,10 @@ let do_seal t =
   let all_ids = List.map (fun s -> s.ss_id) t.sealed @ [new_id] in
   write_manifest t.dir t.root_hash all_ids
 
+(** Seal the active segment and open a fresh one.
+    Useful for forcing a seal before archiving, or in tests. *)
+let seal = do_seal
+
 (* ================================================================== *)
 (* Opening / creating                                                   *)
 (* ================================================================== *)

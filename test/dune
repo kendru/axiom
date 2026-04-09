@@ -27,3 +27,8 @@
  (name test_roundtrip)
  (modules test_roundtrip)
  (libraries axiom_lib alcotest))
+
+(test
+ (name test_node_store)
+ (modules test_node_store)
+ (libraries axiom_lib alcotest unix))

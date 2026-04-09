@@ -23,6 +23,7 @@ started in the OCaml compiler frontend.
 | Records (construction, update, projection) | parser, AST |
 | `do` blocks with statement sequencing | parser, AST |
 | Node-attached comments (`@#...#@`) on exprs, patterns, decls | lexer, parser, AST |
+| Binary IR node encoding with BLAKE3 content-addressing | `lib/node_encoding.ml`, `lib/node_decoding.ml`, `lib/node_tag.ml`, `lib/node_hash.ml` |
 
 ## Partially Implemented
 
@@ -42,7 +43,6 @@ started in the OCaml compiler frontend.
 | **Module imports** | §7.3 (`import X`, `import X as Y`) | `import` is not a keyword in the lexer. Only `require effect` exists for module dependencies. |
 | **Positional shorthand** | §2.2 (`$0`, `$1` in closures) | Not in lexer or parser. |
 | **Byte literals** | §10.1 (`Char` type) | No `Char` or byte literal in AST or lexer. |
-| **Binary IR encoding** | §2.1 | Specified in `docs/implementation/node-encoding.md` but not yet implemented in code. |
 | **Node store** | §2.5 | Specified in `docs/implementation/node-store.md` but not yet implemented in code. |
 | **Code generation** | §9 | No backend. Compiler pipeline stops at type checking. |
 | **Standard library** | §10 | No built-in functions or runtime. |

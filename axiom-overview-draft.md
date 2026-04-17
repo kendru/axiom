@@ -2069,6 +2069,39 @@ written in Axiom, compiled to WASM, and runs on the Zig runtime.
 4. **Stage 3:** The Axiom compiler is fully self-hosting. The OCaml
    implementation becomes a historical artifact.
 
+### 12.8 Durable Execution Primitives
+
+Axiom's effect system may be a natural fit for expressing durable execution
+patterns — workflows that survive process crashes, machine failures, and
+arbitrary delays. This is a topic for further study.
+
+Durable execution frameworks (e.g., Temporal, Restate, DBOS) make long-running
+workflows resilient by persisting execution state and replaying code from
+checkpoints. The key insight is that the "what happened" (event log) is
+separated from the "what to do next" (user code), and the runtime reconstructs
+current state by replaying the log.
+
+Axiom's typed effect system is a potentially promising foundation for this:
+
+- **Checkpointing as an effect.** Durable suspension points could be modeled
+  as a `Durable` effect, making workflow boundaries explicit in function
+  signatures rather than implicit in framework annotations.
+- **Replay semantics.** The effect handler for `Durable` in a replay context
+  could short-circuit side-effectful operations by returning recorded results,
+  without any changes to user-authored workflow code.
+- **Serializability.** The binary IR's content-addressed representation of
+  continuations and closures may simplify the serialization problem that
+  durable execution runtimes face when persisting in-flight workflow state.
+- **Effect isolation.** The type system's effect tracking would make it
+  statically visible which operations inside a durable workflow are
+  non-deterministic or have external side effects, aiding both correctness
+  reasoning and checkpoint design.
+
+Open questions include how durable suspension interacts with the structured
+concurrency model (Section 12.1), whether workflow identity and versioning
+can be expressed in the type system, and how replay semantics compose with
+other effect handlers.
+
 ---
 
 *This specification is a living document. It defines the semantic foundation

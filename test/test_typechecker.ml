@@ -229,6 +229,161 @@ let test_body_return_mismatch () =
       }
     |}
 
+(* ------------------------------------------------------------------ *)
+(* Handler clauses                                                      *)
+(* ------------------------------------------------------------------ *)
+
+(* A Console handler whose op returns Unit. With no return clause the
+   handled expression's type (Unit) coincides with the handle result. *)
+let test_handle_console_ok () =
+  check_program_ok "handle Console.print"
+    {|
+      effect Console {
+        print: (String) -> Unit
+      }
+
+      fn silence(body: (u: Unit) -> Unit ! {Console}) -> Unit ! pure {
+        handle body(()) with {
+          Console {
+            print(msg) => resume(())
+          }
+        }
+      }
+    |}
+
+(* A State<s> handler with a return clause that transforms the handled
+   computation's result. The effect type parameter s is instantiated once
+   per handler clause so get and put share it. *)
+let test_handle_state_with_return () =
+  check_program_ok "handle State with return"
+    {|
+      effect State<s> {
+        get: () -> s,
+        put: (s) -> Unit
+      }
+
+      fn run_state(body: (u: Unit) -> Int ! {State<Int>}) -> Int ! pure {
+        handle body(()) with {
+          State {
+            get() => resume(0)
+            put(s) => resume(())
+            return v => v
+          }
+        }
+      }
+    |}
+
+(* Handler references an unknown effect. *)
+let test_handle_unknown_effect () =
+  check_program_error "unknown effect in handler"
+    {|
+      fn go() -> Unit ! pure {
+        handle () with {
+          Nope {
+            boom() => resume(())
+          }
+        }
+      }
+    |}
+
+(* Handler clause references an unknown operation on a known effect. *)
+let test_handle_unknown_op () =
+  check_program_error "unknown op in handler"
+    {|
+      effect Console {
+        print: (String) -> Unit
+      }
+
+      fn go(body: (u: Unit) -> Unit ! {Console}) -> Unit ! pure {
+        handle body(()) with {
+          Console {
+            froodle() => resume(())
+          }
+        }
+      }
+    |}
+
+(* Handler clause binds the wrong number of parameter names. *)
+let test_handle_wrong_arity () =
+  check_program_error "handler arity mismatch"
+    {|
+      effect Console {
+        print: (String) -> Unit
+      }
+
+      fn go(body: (u: Unit) -> Unit ! {Console}) -> Unit ! pure {
+        handle body(()) with {
+          Console {
+            print() => resume(())
+          }
+        }
+      }
+    |}
+
+(* resume is called with a value of the wrong type for the op.
+   `print : (String) -> Unit`, so `resume` has type `Unit -> result`.
+   Calling `resume(42)` forces Int = Unit and fails. *)
+let test_handle_resume_wrong_type () =
+  check_program_error "resume wrong type"
+    {|
+      effect Console {
+        print: (String) -> Unit,
+        read_line: () -> String
+      }
+
+      fn bad(body: (u: Unit) -> String ! {Console}) -> String ! pure {
+        handle body(()) with {
+          Console {
+            print(msg) => resume(42)
+            read_line() => resume("hi")
+          }
+        }
+      }
+    |}
+
+(* Op handlers in the same handler must agree on the result type.
+   `get()` returns 1 (Int) — becomes the result type — but `put` returns
+   "oops" (String). *)
+let test_handle_ops_disagree () =
+  check_program_error "op handlers disagree"
+    {|
+      effect State<s> {
+        get: () -> s,
+        put: (s) -> Unit
+      }
+
+      fn bad(body: (u: Unit) -> Int ! {State<Int>}) -> Int ! pure {
+        handle body(()) with {
+          State {
+            get() => 1
+            put(s) => "oops"
+            return v => v
+          }
+        }
+      }
+    |}
+
+(* Return-clause body must have the handle's result type; here return
+   contradicts the declared Int return of the enclosing function. *)
+let test_handle_return_clause_mismatch () =
+  check_program_error "return clause body mismatch"
+    {|
+      effect State<s> {
+        get: () -> s,
+        put: (s) -> Unit
+      }
+
+      fn bad(body: (u: Unit) -> Int ! {State<Int>}) -> Int ! pure {
+        handle body(()) with {
+          State {
+            get() => resume(0)
+            put(s) => resume(())
+            return v => "not-an-int"
+          }
+        }
+      }
+    |}
+
 (* Mutual recursion across two top-level functions resolves via pass-1
    signatures registered before bodies are checked. *)
 let test_program_mutual_recursion () =
@@ -290,6 +445,16 @@ let () =
         ; Alcotest.test_case "unknown operation"         `Quick test_perform_unknown_op
         ; Alcotest.test_case "wrong arity"               `Quick test_perform_wrong_arity
         ; Alcotest.test_case "wrong arg type"            `Quick test_perform_wrong_arg_type
+        ] )
+    ; ( "handlers",
+        [ Alcotest.test_case "Console handler"           `Quick test_handle_console_ok
+        ; Alcotest.test_case "State with return clause"  `Quick test_handle_state_with_return
+        ; Alcotest.test_case "unknown effect"            `Quick test_handle_unknown_effect
+        ; Alcotest.test_case "unknown op"                `Quick test_handle_unknown_op
+        ; Alcotest.test_case "wrong arity"               `Quick test_handle_wrong_arity
+        ; Alcotest.test_case "resume wrong type"         `Quick test_handle_resume_wrong_type
+        ; Alcotest.test_case "op handlers disagree"      `Quick test_handle_ops_disagree
+        ; Alcotest.test_case "return clause mismatch"    `Quick test_handle_return_clause_mismatch
         ] )
     ; ( "program",
         [ Alcotest.test_case "body vs return mismatch"   `Quick test_body_return_mismatch

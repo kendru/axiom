@@ -148,6 +148,10 @@ let rec unify a b =
   | TyVar x, TyVar y when x = y -> ()
   | TyFun (a1, b1), TyFun (a2, b2) ->
     unify a1 a2; unify b1 b2
+  (* Same uninstantiated meta on both sides: nothing to do. Without this
+     case, the occurs check below would spuriously fail, since a meta
+     trivially "occurs" in itself. *)
+  | TyMeta m1, TyMeta m2 when m1.id = m2.id -> ()
   | TyMeta mv, t | t, TyMeta mv ->
     if occurs_check mv t
     then failwith "Typechecker: occurs check failed (infinite type)"
@@ -420,11 +424,84 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
       args param_tys;
     deref ret_ty
 
-  | Handle { handled; handlers = _ } ->
-    (* Handler clauses carry richer structure (operations, resume, return-clause)
-       which will be type-checked once the effect-row layer lands. For now we
-       just infer the handled expression and return its type. *)
-    infer_expr_in eenv env handled
+  | Handle { handled; handlers } ->
+    (* Type-check a linear (single-shot) handler.
+
+       Model: each handler clause consumes one effect from the handled
+       computation and produces a value of the overall `handle` result
+       type [result_ty].
+
+       - The handled expression has some value type [handled_ty]. Without a
+         return clause this is also the final result; a return clause
+         transforms [handled_ty] into [result_ty].
+       - Each op handler receives the operation's arguments at their declared
+         types (after fresh instantiation of the effect's type parameters)
+         and must produce a value of [result_ty].
+       - [resume] is bound in the op handler body with type
+         [op_return_ty -> result_ty]. Calling it continues the handled
+         computation; linear handlers resume at most once.
+
+       Effect-row tracking on function types — and the constraint that the
+       handled expression actually performs the effect being handled — is a
+       follow-on in the next layer. *)
+    let handled_ty = infer_expr_in eenv env handled in
+    let result_ty  = fresh_meta () in
+    List.iter (fun (h : effect_handler) ->
+        let scheme =
+          match List.assoc_opt h.effect_handler eenv with
+          | Some s -> s
+          | None ->
+            failwith (Printf.sprintf
+                        "Typechecker: unknown effect '%s' in handler"
+                        h.effect_handler)
+        in
+        (* Each handler clause instantiates the effect's type parameters
+           with fresh metas. These are shared across the op clauses of
+           this handler so that, e.g. for State<s>, both get: () -> s and
+           put: (s) -> Unit refer to the same s. *)
+        let subs = List.map (fun v -> (v, fresh_meta ())) scheme.eff_type_params in
+        List.iter (fun (oh : op_handler) ->
+            let op =
+              try List.find (fun o -> o.op_name = oh.op_handler_name) scheme.eff_ops
+              with Not_found ->
+                failwith (Printf.sprintf
+                            "Typechecker: effect '%s' has no operation '%s' \
+                             (in handler clause)"
+                            h.effect_handler oh.op_handler_name)
+            in
+            let op_param_tys = List.map (subst_tyvars subs) op.op_params in
+            let op_ret_ty    = subst_tyvars subs op.op_return in
+            let n_params = List.length op_param_tys in
+            let n_names  = List.length oh.op_handler_params in
+            if n_params <> n_names then
+              failwith (Printf.sprintf
+                          "Typechecker: handler for '%s.%s' binds %d param(s), \
+                           but the operation declares %d"
+                          h.effect_handler oh.op_handler_name n_names n_params);
+            (* Bind each param name to the declared op param type. *)
+            let env_params =
+              List.fold_left2 (fun acc name t -> env_extend name (mono t) acc)
+                env oh.op_handler_params op_param_tys
+            in
+            (* Bind `resume` : op_return_ty -> result_ty. Linear handlers
+               resume at most once, so we type it as a function from the
+               op's return value to the overall handle result. *)
+            let resume_ty  = TyFun (op_ret_ty, result_ty) in
+            let env_resume = env_extend "resume" (mono resume_ty) env_params in
+            let body_ty    = infer_expr_in eenv env_resume oh.op_handler_body in
+            unify body_ty result_ty)
+          h.op_handlers;
+        (* Return clause (if present) transforms the handled value into the
+           final handle result. Without one, the two types coincide. *)
+        (match h.return_handler with
+         | None ->
+           unify handled_ty result_ty
+         | Some { return_var; return_body } ->
+           let env_ret = env_extend return_var (mono handled_ty) env in
+           let body_ty = infer_expr_in eenv env_ret return_body in
+           unify body_ty result_ty))
+      handlers;
+    deref result_ty
 
   | Do stmts ->
     (* Each StmtExpr is inferred and discarded; StmtLet extends the env.

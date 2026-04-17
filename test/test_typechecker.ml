@@ -121,6 +121,132 @@ let test_unbound_var () =
   check_ty_error "unbound var" "x"
 
 (* ------------------------------------------------------------------ *)
+(* Effect operations and program-level checking                         *)
+(* ------------------------------------------------------------------ *)
+
+let parse_program src =
+  Axiom_lib.Parser.parse_program (Axiom_lib.Lexer.tokenize src)
+
+let check_program_of src = check_program (parse_program src)
+
+let check_program_ok label src =
+  match check_program_of src with
+  | _ -> ()
+  | exception Failure msg ->
+    Alcotest.failf "%s: unexpected type error: %s" label msg
+
+let check_program_error label src =
+  match check_program_of src with
+  | exception _ -> ()
+  | _ ->
+    Alcotest.failf "%s: expected type error but program checked cleanly" label
+
+(* A function that performs a mono-typed effect op correctly. *)
+let test_perform_console_ok () =
+  check_program_ok "Console.print"
+    {|
+      effect Console {
+        print: (String) -> Unit,
+        read_line: () -> String
+      }
+
+      fn greet() -> Unit ! {Console} {
+        perform Console.print("hi")
+      }
+    |}
+
+(* A function that reads via a generic State effect. *)
+let test_perform_state_get_ok () =
+  check_program_ok "State.get"
+    {|
+      effect State<s> {
+        get: () -> s,
+        put: (s) -> Unit
+      }
+
+      fn use_state() -> Int ! {State<Int>} {
+        do {
+          perform State.put(42);
+          perform State.get()
+        }
+      }
+    |}
+
+(* Unknown effect name *)
+let test_perform_unknown_effect () =
+  check_program_error "unknown effect"
+    {|
+      fn go() -> Unit ! pure {
+        perform Nope.boom()
+      }
+    |}
+
+(* Unknown operation on a known effect *)
+let test_perform_unknown_op () =
+  check_program_error "unknown operation"
+    {|
+      effect Console {
+        print: (String) -> Unit
+      }
+
+      fn go() -> Unit ! {Console} {
+        perform Console.froodle()
+      }
+    |}
+
+(* Wrong arity *)
+let test_perform_wrong_arity () =
+  check_program_error "wrong arity"
+    {|
+      effect Console {
+        print: (String) -> Unit
+      }
+
+      fn go() -> Unit ! {Console} {
+        perform Console.print("a", "b")
+      }
+    |}
+
+(* Wrong argument type *)
+let test_perform_wrong_arg_type () =
+  check_program_error "wrong arg type"
+    {|
+      effect Console {
+        print: (String) -> Unit
+      }
+
+      fn go() -> Unit ! {Console} {
+        perform Console.print(42)
+      }
+    |}
+
+(* Body's inferred type disagrees with the declared return type *)
+let test_body_return_mismatch () =
+  check_program_error "body vs return"
+    {|
+      fn bad() -> Int ! pure {
+        true
+      }
+    |}
+
+(* Mutual recursion across two top-level functions resolves via pass-1
+   signatures registered before bodies are checked. *)
+let test_program_mutual_recursion () =
+  check_program_ok "mutual recursion"
+    {|
+      fn even(n: Int) -> Bool ! pure {
+        if eq(n, 0) { true } else { odd(sub(n, 1)) }
+      }
+
+      fn odd(n: Int) -> Bool ! pure {
+        if eq(n, 0) { false } else { even(sub(n, 1)) }
+      }
+
+      fn eq(a: Int, b: Int) -> Bool ! pure { true }
+      fn sub(a: Int, b: Int) -> Int ! pure { a }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -156,4 +282,16 @@ let () =
         ] )
     ; ( "errors",
         [ Alcotest.test_case "unbound var"       `Quick test_unbound_var
+        ] )
+    ; ( "effects",
+        [ Alcotest.test_case "perform Console.print"     `Quick test_perform_console_ok
+        ; Alcotest.test_case "perform State.get"         `Quick test_perform_state_get_ok
+        ; Alcotest.test_case "unknown effect"            `Quick test_perform_unknown_effect
+        ; Alcotest.test_case "unknown operation"         `Quick test_perform_unknown_op
+        ; Alcotest.test_case "wrong arity"               `Quick test_perform_wrong_arity
+        ; Alcotest.test_case "wrong arg type"            `Quick test_perform_wrong_arg_type
+        ] )
+    ; ( "program",
+        [ Alcotest.test_case "body vs return mismatch"   `Quick test_body_return_mismatch
+        ; Alcotest.test_case "mutual recursion"          `Quick test_program_mutual_recursion
         ] ) ]

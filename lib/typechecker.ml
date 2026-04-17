@@ -6,8 +6,14 @@
       declaration checker).
     - Let-generalization: the type of a let-bound expression is generalized
       over all free type variables not in the environment.
-    - Effects are ignored in this pass; only value types are inferred.
-      Effect checking is a future layer. *)
+    - Program-level checking via [check_program]: a two-pass walk collects
+      top-level effect and function declarations, then checks each function
+      body against its declared signature.
+    - Effect operations are looked up in the program's effect environment
+      and their types are instantiated at each [perform] site. Effect-row
+      tracking on function types is a future layer — this pass only checks
+      that every performed operation resolves to a declared one and that
+      argument/return types agree. *)
 
 open Ast
 
@@ -107,6 +113,29 @@ let env_free_metas env =
   List.concat_map (fun (_, { body; _ }) -> free_metas [] body) env
 
 (* ------------------------------------------------------------------ *)
+(* Effect environment                                                   *)
+(* ------------------------------------------------------------------ *)
+
+(** A single operation in an effect declaration, after conversion to [ty].
+    Effect-level type parameters appear as [TyVar] and are instantiated
+    afresh at each [perform] site. *)
+type effect_op_scheme = {
+  op_name   : string;
+  op_params : ty list;
+  op_return : ty;
+}
+
+(** A declared effect: its quantified type parameters and its operations. *)
+type effect_scheme = {
+  eff_type_params : string list;
+  eff_ops         : effect_op_scheme list;
+}
+
+type effect_env = (string * effect_scheme) list
+
+let empty_effect_env : effect_env = []
+
+(* ------------------------------------------------------------------ *)
 (* Unification                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -119,6 +148,10 @@ let rec unify a b =
   | TyVar x, TyVar y when x = y -> ()
   | TyFun (a1, b1), TyFun (a2, b2) ->
     unify a1 a2; unify b1 b2
+  (* Same uninstantiated meta on both sides: nothing to do. Without this
+     case, the occurs check below would spuriously fail, since a meta
+     trivially "occurs" in itself. *)
+  | TyMeta m1, TyMeta m2 when m1.id = m2.id -> ()
   | TyMeta mv, t | t, TyMeta mv ->
     if occurs_check mv t
     then failwith "Typechecker: occurs check failed (infinite type)"
@@ -215,9 +248,34 @@ let rec ty_of_type_expr = function
 (* Inference                                                            *)
 (* ------------------------------------------------------------------ *)
 
-(** [infer_expr env e] infers the type of expression [e] under [env].
-    Returns the inferred type. Raises [Failure] on type errors. *)
-let rec infer_expr (env : env) (e : expr) : ty =
+(** Substitute the TyVars listed in [subs] with the paired types.
+    Used to instantiate an effect operation's quantified type parameters
+    with fresh metas. *)
+let subst_tyvars subs =
+  let rec go = function
+    | TyVar v as t ->
+      (match List.assoc_opt v subs with Some u -> u | None -> t)
+    | TyCon _ as c -> c
+    | TyFun (a, b) -> TyFun (go a, go b)
+    | TyForall (v, t) ->
+      let subs' = List.filter (fun (x, _) -> x <> v) subs in
+      let rec go' = function
+        | TyVar x as t ->
+          (match List.assoc_opt x subs' with Some u -> u | None -> t)
+        | TyCon _ as c -> c
+        | TyFun (a, b) -> TyFun (go' a, go' b)
+        | TyForall (w, u) -> TyForall (w, go' u)
+        | TyMeta _ as m -> m
+      in
+      TyForall (v, go' t)
+    | TyMeta _ as m -> m
+  in
+  go
+
+(** [infer_expr_in eenv env e] infers the type of [e] under the value
+    environment [env] and effect environment [eenv]. Raises [Failure] on
+    type errors. *)
+let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
   match e.desc with
 
   | IntLit _    -> TyCon "Int"
@@ -231,13 +289,13 @@ let rec infer_expr (env : env) (e : expr) : ty =
     instantiate scheme
 
   | Let { pat; value; body } ->
-    let ty_val = infer_expr env value in
+    let ty_val = infer_expr_in eenv env value in
     let scheme = generalize env ty_val in
     let env'   = match pat.pat_desc with
       | PVar name -> env_extend name scheme env
       | _         -> env_from_pattern env pat ty_val
     in
-    infer_expr env' body
+    infer_expr_in eenv env' body
 
   | Letrec (bindings, body) ->
     (* Compute annotated types for each binding: param types + return type -> fun_ty *)
@@ -257,14 +315,14 @@ let rec infer_expr (env : env) (e : expr) : ty =
             (fun acc p pt -> env_extend p.param_name (mono pt) acc)
             env_rec b.letrec_params param_tys
         in
-        let body_ty = infer_expr env_params b.letrec_body in
+        let body_ty = infer_expr_in eenv env_params b.letrec_body in
         unify body_ty ret_ty
       ) binding_info;
     (* Generalize and build the env for the continuation *)
     let env' = List.fold_left (fun acc (b, _, _, fun_ty) ->
         env_extend b.letrec_name (generalize env fun_ty) acc
       ) env binding_info in
-    infer_expr env' body
+    infer_expr_in eenv env' body
 
   | Fn { params; return_type; fn_body; _ } ->
     (* Replace type variable names with fresh metas so that let-generalization
@@ -291,7 +349,7 @@ let rec infer_expr (env : env) (e : expr) : ty =
         (fun acc p ty -> env_extend p.param_name (mono ty) acc)
         env params param_tys
     in
-    let body_ty = infer_expr env' fn_body in
+    let body_ty = infer_expr_in eenv env' fn_body in
     (* Unify body type with return annotation if present *)
     (match return_type with
      | Some ann_ty -> unify body_ty (freshen_type_expr ann_ty)
@@ -300,21 +358,21 @@ let rec infer_expr (env : env) (e : expr) : ty =
     List.fold_right (fun pt acc -> TyFun (pt, acc)) param_tys body_ty
 
   | App (f, args) ->
-    let f_ty   = infer_expr env f in
+    let f_ty   = infer_expr_in eenv env f in
     let ret_ty = fresh_meta () in
     (* Build the expected function type from the arguments *)
-    let arg_tys = List.map (infer_expr env) args in
+    let arg_tys = List.map (infer_expr_in eenv env) args in
     let expected = List.fold_right (fun at acc -> TyFun (at, acc)) arg_tys ret_ty in
     unify f_ty expected;
     deref ret_ty
 
   | Match { scrutinee; arms } ->
-    let _scrut_ty = infer_expr env scrutinee in
+    let _scrut_ty = infer_expr_in eenv env scrutinee in
     let result_ty = fresh_meta () in
     List.iter (fun arm ->
         (* Extend env with pattern bindings — conservative: only PVar binds *)
         let env' = env_from_pattern env arm.pattern _scrut_ty in
-        let arm_ty = infer_expr env' arm.arm_body in
+        let arm_ty = infer_expr_in eenv env' arm.arm_body in
         unify result_ty arm_ty
       ) arms;
     deref result_ty
@@ -322,35 +380,138 @@ let rec infer_expr (env : env) (e : expr) : ty =
   | Record fields ->
     (* Record types are nominal/structural — deferred until kind system.
        Infer field types for side-effects (catches unbound vars), return a fresh meta. *)
-    List.iter (fun (_, e) -> ignore (infer_expr env e)) fields;
+    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env e)) fields;
     fresh_meta ()
 
   | RecordUpdate (base, fields) ->
-    let _base_ty = infer_expr env base in
-    List.iter (fun (_, e) -> ignore (infer_expr env e)) fields;
+    let _base_ty = infer_expr_in eenv env base in
+    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env e)) fields;
     fresh_meta ()
 
   | Project (e, _field) ->
-    ignore (infer_expr env e);
+    ignore (infer_expr_in eenv env e);
     fresh_meta ()
 
-  | Perform _ ->
-    (* Effect typing deferred — return a fresh meta for now *)
-    fresh_meta ()
+  | Perform { effect_name; op_name; args } ->
+    let scheme =
+      match List.assoc_opt effect_name eenv with
+      | Some s -> s
+      | None ->
+        failwith (Printf.sprintf
+                    "Typechecker: unknown effect '%s' at 'perform %s.%s'"
+                    effect_name effect_name op_name)
+    in
+    let op =
+      try List.find (fun o -> o.op_name = op_name) scheme.eff_ops
+      with Not_found ->
+        failwith (Printf.sprintf
+                    "Typechecker: effect '%s' has no operation '%s'"
+                    effect_name op_name)
+    in
+    (* Each perform instantiates the effect's type parameters afresh. *)
+    let subs = List.map (fun v -> (v, fresh_meta ())) scheme.eff_type_params in
+    let param_tys = List.map (subst_tyvars subs) op.op_params in
+    let ret_ty    = subst_tyvars subs op.op_return in
+    let n_params = List.length param_tys in
+    let n_args   = List.length args in
+    if n_params <> n_args then
+      failwith (Printf.sprintf
+                  "Typechecker: effect operation '%s.%s' expects %d arg(s), got %d"
+                  effect_name op_name n_params n_args);
+    List.iter2 (fun a pt ->
+        let at = infer_expr_in eenv env a in
+        unify at pt)
+      args param_tys;
+    deref ret_ty
 
-  | Handle { handled; handlers = _ } ->
-    (* Effect typing deferred — infer the handled expression's type for now *)
-    infer_expr env handled
+  | Handle { handled; handlers } ->
+    (* Type-check a linear (single-shot) handler.
+
+       Model: each handler clause consumes one effect from the handled
+       computation and produces a value of the overall `handle` result
+       type [result_ty].
+
+       - The handled expression has some value type [handled_ty]. Without a
+         return clause this is also the final result; a return clause
+         transforms [handled_ty] into [result_ty].
+       - Each op handler receives the operation's arguments at their declared
+         types (after fresh instantiation of the effect's type parameters)
+         and must produce a value of [result_ty].
+       - [resume] is bound in the op handler body with type
+         [op_return_ty -> result_ty]. Calling it continues the handled
+         computation; linear handlers resume at most once.
+
+       Effect-row tracking on function types — and the constraint that the
+       handled expression actually performs the effect being handled — is a
+       follow-on in the next layer. *)
+    let handled_ty = infer_expr_in eenv env handled in
+    let result_ty  = fresh_meta () in
+    List.iter (fun (h : effect_handler) ->
+        let scheme =
+          match List.assoc_opt h.effect_handler eenv with
+          | Some s -> s
+          | None ->
+            failwith (Printf.sprintf
+                        "Typechecker: unknown effect '%s' in handler"
+                        h.effect_handler)
+        in
+        (* Each handler clause instantiates the effect's type parameters
+           with fresh metas. These are shared across the op clauses of
+           this handler so that, e.g. for State<s>, both get: () -> s and
+           put: (s) -> Unit refer to the same s. *)
+        let subs = List.map (fun v -> (v, fresh_meta ())) scheme.eff_type_params in
+        List.iter (fun (oh : op_handler) ->
+            let op =
+              try List.find (fun o -> o.op_name = oh.op_handler_name) scheme.eff_ops
+              with Not_found ->
+                failwith (Printf.sprintf
+                            "Typechecker: effect '%s' has no operation '%s' \
+                             (in handler clause)"
+                            h.effect_handler oh.op_handler_name)
+            in
+            let op_param_tys = List.map (subst_tyvars subs) op.op_params in
+            let op_ret_ty    = subst_tyvars subs op.op_return in
+            let n_params = List.length op_param_tys in
+            let n_names  = List.length oh.op_handler_params in
+            if n_params <> n_names then
+              failwith (Printf.sprintf
+                          "Typechecker: handler for '%s.%s' binds %d param(s), \
+                           but the operation declares %d"
+                          h.effect_handler oh.op_handler_name n_names n_params);
+            (* Bind each param name to the declared op param type. *)
+            let env_params =
+              List.fold_left2 (fun acc name t -> env_extend name (mono t) acc)
+                env oh.op_handler_params op_param_tys
+            in
+            (* Bind `resume` : op_return_ty -> result_ty. Linear handlers
+               resume at most once, so we type it as a function from the
+               op's return value to the overall handle result. *)
+            let resume_ty  = TyFun (op_ret_ty, result_ty) in
+            let env_resume = env_extend "resume" (mono resume_ty) env_params in
+            let body_ty    = infer_expr_in eenv env_resume oh.op_handler_body in
+            unify body_ty result_ty)
+          h.op_handlers;
+        (* Return clause (if present) transforms the handled value into the
+           final handle result. Without one, the two types coincide. *)
+        (match h.return_handler with
+         | None ->
+           unify handled_ty result_ty
+         | Some { return_var; return_body } ->
+           let env_ret = env_extend return_var (mono handled_ty) env in
+           let body_ty = infer_expr_in eenv env_ret return_body in
+           unify body_ty result_ty))
+      handlers;
+    deref result_ty
 
   | Do stmts ->
     (* Each StmtExpr is inferred and discarded; StmtLet extends the env.
        The final stmt must be a StmtExpr whose type is the block's type. *)
     let rec go env = function
       | []                         -> TyCon "Unit"
-      | [StmtExpr e]               -> infer_expr env e
-      | StmtExpr e :: rest         -> ignore (infer_expr env e); go env rest
+      | [StmtExpr e]               -> infer_expr_in eenv env e
+      | StmtExpr e :: rest         -> ignore (infer_expr_in eenv env e); go env rest
       | StmtLet { pat; value } :: rest ->
-        let ty   = infer_expr env value in
+        let ty   = infer_expr_in eenv env value in
         let env' = match pat.pat_desc with
           | PVar name -> env_extend name (generalize env ty) env
           | _         -> env_from_pattern env pat ty
@@ -360,9 +521,9 @@ let rec infer_expr (env : env) (e : expr) : ty =
     go env stmts
 
   | If { cond; then_; else_ } ->
-    unify (infer_expr env cond) (TyCon "Bool");
-    let t = infer_expr env then_ in
-    let e = infer_expr env else_ in
+    unify (infer_expr_in eenv env cond) (TyCon "Bool");
+    let t = infer_expr_in eenv env then_ in
+    let e = infer_expr_in eenv env else_ in
     unify t e;
     deref t
 
@@ -381,3 +542,90 @@ and env_from_pattern env (p : pattern) scrut_ty =
   | POr (p1, _p2) ->
     (* Both branches bind the same variables; use p1 *)
     env_from_pattern env p1 scrut_ty
+
+(** [infer_expr env e] infers the type of [e] with no effects declared.
+    Program-level inference — with declared effects in scope — uses
+    [check_program] or [infer_expr_in] directly. *)
+let infer_expr (env : env) (e : expr) : ty =
+  infer_expr_in empty_effect_env env e
+
+(* ------------------------------------------------------------------ *)
+(* Program-level checking                                              *)
+(* ------------------------------------------------------------------ *)
+
+(** Build an effect scheme from an AST effect declaration. *)
+let effect_scheme_of_decl (type_params : string list) (ops : Ast.effect_op list)
+  : effect_scheme =
+  let eff_ops = List.map (fun (o : Ast.effect_op) ->
+      { op_name   = o.effect_op_name
+      ; op_params = List.map ty_of_type_expr o.effect_op_params
+      ; op_return = ty_of_type_expr o.effect_op_return
+      }) ops
+  in
+  { eff_type_params = type_params; eff_ops }
+
+(** Build a top-level function scheme from its declared parameter types
+    and return type. Type parameters named on the declaration become the
+    scheme's bound variables so callers instantiate them with fresh metas. *)
+let fn_scheme_of_decl
+    (type_params : string list)
+    (params      : param list)
+    (return_type : type_expr option)
+  : scheme =
+  let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
+  let ret_ty = match return_type with
+    | Some t -> ty_of_type_expr t
+    | None   -> fresh_meta ()
+  in
+  let fun_ty = List.fold_right (fun pt acc -> TyFun (pt, acc)) param_tys ret_ty in
+  { bound = type_params; body = fun_ty }
+
+(** [check_program prog] type-checks a whole program in two passes:
+
+    Pass 1 walks every declaration and builds:
+    - the value environment, seeded with each [DeclFn]'s declared signature
+      (as a scheme over its type parameters), so that bodies can reference
+      one another regardless of declaration order;
+    - the effect environment, one entry per [DeclEffect], carrying the
+      operation signatures to be instantiated at each [perform] site.
+
+    Pass 2 walks [DeclFn]s again and type-checks each body under the seeded
+    environment extended with the function's own parameter bindings; the
+    body's inferred type is then unified with the declared return type.
+
+    [DeclType], [DeclModule], [DeclRequire]: not yet handled by this pass.
+    Constructors remain unbound in the value env and module bodies are
+    not recursed into — those are follow-on work items.
+
+    Returns the populated [(env, effect_env)] for reuse in tests and
+    downstream tooling. Raises [Failure] on type errors. *)
+let check_program (prog : program) : env * effect_env =
+  let collect (env, eenv) d =
+    match d.decl_desc with
+    | DeclEffect { effect_name; type_params; ops; _ } ->
+      let scheme = effect_scheme_of_decl type_params ops in
+      (env, (effect_name, scheme) :: eenv)
+    | DeclFn { fn_name; type_params; params; return_type; _ } ->
+      let scheme = fn_scheme_of_decl type_params params return_type in
+      ((fn_name, scheme) :: env, eenv)
+    | DeclType _ | DeclModule _ | DeclRequire _ ->
+      (env, eenv)
+  in
+  let env0, eenv0 =
+    List.fold_left collect (empty_env, empty_effect_env) prog
+  in
+  List.iter (fun d ->
+      match d.decl_desc with
+      | DeclFn { params; return_type; decl_body; _ } ->
+        let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
+        let body_env =
+          List.fold_left2 (fun acc p t -> env_extend p.param_name (mono t) acc)
+            env0 params param_tys
+        in
+        let body_ty = infer_expr_in eenv0 body_env decl_body in
+        (match return_type with
+         | Some t -> unify body_ty (ty_of_type_expr t)
+         | None   -> ())
+      | _ -> ())
+    prog;
+  (env0, eenv0)

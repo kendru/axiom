@@ -556,6 +556,105 @@ let test_row_handler_translates_effect () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* DeclType — constructor registration                                  *)
+(* ------------------------------------------------------------------ *)
+
+(* Nullary constructors from a type declaration are in scope as patterns. *)
+let test_decl_type_nullary_ctors () =
+  check_program_ok "nullary constructors in scope"
+    {|
+      type Color = | Red | Green | Blue
+
+      fn is_red(c: Color) -> Bool ! pure {
+        match c with {
+          | Red   => true
+          | Green => false
+          | Blue  => false
+        }
+      }
+    |}
+
+(* Constructor with a parameter: the bound variable gets the declared arg type. *)
+let test_decl_type_ctor_param_type () =
+  check_program_ok "ctor pattern binds correct type"
+    {|
+      type Wrapper = | Wrap(Int)
+
+      fn unwrap(w: Wrapper) -> Int ! pure {
+        match w with {
+          | Wrap(n) => n
+        }
+      }
+    |}
+
+(* Bound variable from a ctor pattern has the wrong type for the arm body. *)
+let test_decl_type_ctor_wrong_arg () =
+  check_program_error "ctor pattern body type mismatch"
+    {|
+      type Wrapper = | Wrap(Int)
+
+      fn bad(w: Wrapper) -> String ! pure {
+        match w with {
+          | Wrap(n) => n
+        }
+      }
+    |}
+
+(* Parametric type: sub-pattern bindings get consistent inferred types. *)
+let test_decl_type_parametric_ctor () =
+  check_program_ok "parametric ctor pattern"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn get_or_zero(opt: Option) -> Int ! pure {
+        match opt with {
+          | Some(x) => x
+          | None    => 0
+        }
+      }
+    |}
+
+(* Arity mismatch in a constructor pattern is a type error. *)
+let test_decl_type_ctor_pattern_arity () =
+  check_program_error "ctor pattern arity mismatch"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn bad(opt: Option) -> Int ! pure {
+        match opt with {
+          | Some(x, y) => 0
+          | None       => 1
+        }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
+(* DeclModule — body collected into flat env                            *)
+(* ------------------------------------------------------------------ *)
+
+(* Functions declared inside a module are accessible from outside. *)
+let test_module_body_collected () =
+  check_program_ok "module body declarations collected"
+    {|
+      module math {
+        fn add(a: Int, b: Int) -> Int ! pure { a }
+      }
+
+      fn use_add() -> Int ! pure {
+        add(1, 2)
+      }
+    |}
+
+(* Type errors in module body functions are caught. *)
+let test_module_body_type_error () =
+  check_program_error "module body type error"
+    {|
+      module bad {
+        fn wrong() -> Int ! pure { true }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -613,6 +712,17 @@ let () =
     ; ( "program",
         [ Alcotest.test_case "body vs return mismatch"   `Quick test_body_return_mismatch
         ; Alcotest.test_case "mutual recursion"          `Quick test_program_mutual_recursion
+        ] )
+    ; ( "decl-type",
+        [ Alcotest.test_case "nullary ctors"             `Quick test_decl_type_nullary_ctors
+        ; Alcotest.test_case "ctor param type"           `Quick test_decl_type_ctor_param_type
+        ; Alcotest.test_case "ctor wrong arg"            `Quick test_decl_type_ctor_wrong_arg
+        ; Alcotest.test_case "parametric ctor"           `Quick test_decl_type_parametric_ctor
+        ; Alcotest.test_case "ctor pattern arity"        `Quick test_decl_type_ctor_pattern_arity
+        ] )
+    ; ( "modules",
+        [ Alcotest.test_case "body collected"            `Quick test_module_body_collected
+        ; Alcotest.test_case "body type error"           `Quick test_module_body_type_error
         ] )
     ; ( "effect rows",
         [ Alcotest.test_case "perform in declared row"      `Quick test_row_perform_in_declared_row

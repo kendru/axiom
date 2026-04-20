@@ -804,8 +804,29 @@ and env_from_pattern env (p : pattern) scrut_ty =
   | PVar x        -> env_extend x (mono scrut_ty) env
   | PLitInt _ | PLitFloat _ | PLitString _
   | PLitTrue | PLitFalse | PLitUnit -> env
-  | PCtor (_, sub_pats) ->
-    List.fold_left (fun e p -> env_from_pattern e p (fresh_meta ())) env sub_pats
+  | PCtor (name, sub_pats) ->
+    (match List.assoc_opt name env with
+     | None ->
+       List.fold_left (fun e p -> env_from_pattern e p (fresh_meta ())) env sub_pats
+     | Some scheme ->
+       let ctor_ty = instantiate scheme in
+       let rec extract_args t = match deref t with
+         | TyFun (arg, ret, _) ->
+           let args, result = extract_args ret in
+           (arg :: args, result)
+         | t -> ([], t)
+       in
+       let arg_tys, ret_ty = extract_args ctor_ty in
+       unify scrut_ty ret_ty;
+       let n_args = List.length arg_tys in
+       let n_pats = List.length sub_pats in
+       if n_args <> n_pats then
+         failwith (Printf.sprintf
+                     "Typechecker: constructor '%s' expects %d argument(s), \
+                      pattern has %d"
+                     name n_args n_pats);
+       List.fold_left2 (fun e p t -> env_from_pattern e p t)
+         env sub_pats arg_tys)
   | PRecord (fields, _) ->
     List.fold_left (fun e (_, p) -> env_from_pattern e p (fresh_meta ())) env fields
   | POr (p1, _p2) ->
@@ -860,6 +881,27 @@ let fn_scheme_of_decl
   in
   { bound = type_params; body = fun_ty }
 
+(** Build a scheme for a single constructor of a type declaration.
+    The return type is [TyCon type_name]; each constructor parameter is
+    converted via [ty_of_type_expr], so type-parameter names (lowercase)
+    become [TyVar]s that are generalized under [type_params]. *)
+let ctor_scheme_of_type
+    (type_name   : string)
+    (type_params : string list)
+    (ctor        : Ast.ctor_decl)
+  : scheme =
+  let ret_ty    = TyCon type_name in
+  let param_tys = List.map ty_of_type_expr ctor.ctor_params in
+  let body = match List.rev param_tys with
+    | [] -> ret_ty
+    | last :: rest_rev ->
+      let innermost = TyFun (last, ret_ty, RPure) in
+      List.fold_left
+        (fun acc pt -> TyFun (pt, acc, RPure))
+        innermost rest_rev
+  in
+  { bound = type_params; body }
+
 (** [check_program prog] type-checks a whole program in two passes:
 
     Pass 1 walks every declaration and builds:
@@ -869,18 +911,23 @@ let fn_scheme_of_decl
     - the effect environment, one entry per [DeclEffect], carrying the
       operation signatures to be instantiated at each [perform] site.
 
-    Pass 2 walks [DeclFn]s again and type-checks each body under the seeded
-    environment extended with the function's own parameter bindings; the
-    body's inferred type is then unified with the declared return type.
+    Pass 2 walks [DeclFn]s (and [DeclFn]s nested inside [DeclModule]s)
+    and type-checks each body under the seeded environment extended with
+    the function's own parameter bindings; the body's inferred type is
+    then unified with the declared return type.
 
-    [DeclType], [DeclModule], [DeclRequire]: not yet handled by this pass.
-    Constructors remain unbound in the value env and module bodies are
-    not recursed into — those are follow-on work items.
+    [DeclType]: each constructor is added to the value environment as a
+    scheme generalized over the type's parameters, so constructors may be
+    called like functions and matched in patterns.
+
+    [DeclModule]: declarations in module bodies are collected into the
+    flat value/effect environments (no namespace support yet) and module
+    function bodies are type-checked in pass 2.
 
     Returns the populated [(env, effect_env)] for reuse in tests and
     downstream tooling. Raises [Failure] on type errors. *)
 let check_program (prog : program) : env * effect_env =
-  let collect (env, eenv) d =
+  let rec collect (env, eenv) d =
     match d.decl_desc with
     | DeclEffect { effect_name; type_params; ops; _ } ->
       let scheme = effect_scheme_of_decl type_params ops in
@@ -888,28 +935,40 @@ let check_program (prog : program) : env * effect_env =
     | DeclFn { fn_name; type_params; params; return_type; effects; _ } ->
       let scheme = fn_scheme_of_decl type_params params return_type effects in
       ((fn_name, scheme) :: env, eenv)
-    | DeclType _ | DeclModule _ | DeclRequire _ ->
+    | DeclType { type_name; type_params; ctors; _ } ->
+      let env' = List.fold_left (fun acc ctor ->
+          env_extend ctor.Ast.ctor_name
+            (ctor_scheme_of_type type_name type_params ctor)
+            acc
+        ) env ctors in
+      (env', eenv)
+    | DeclModule { body; _ } ->
+      List.fold_left collect (env, eenv) body
+    | DeclRequire _ ->
       (env, eenv)
   in
   let env0, eenv0 =
     List.fold_left collect (empty_env, empty_effect_env) prog
   in
-  List.iter (fun d ->
-      match d.decl_desc with
-      | DeclFn { params; return_type; effects; decl_body; _ } ->
-        let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
-        let body_env =
-          List.fold_left2 (fun acc p t -> env_extend p.param_name (mono t) acc)
-            env0 params param_tys
-        in
-        (* The body runs in the ambient row declared on the signature. If
-           the signature omits the effect annotation, use a fresh open row
-           so inference can discover the effects performed. *)
-        let ambient = row_of_effect_set_opt effects in
-        let body_ty = infer_expr_in eenv0 body_env ambient decl_body in
-        (match return_type with
-         | Some t -> unify body_ty (ty_of_type_expr t)
-         | None   -> ())
-      | _ -> ())
-    prog;
+  let rec check_decl d =
+    match d.decl_desc with
+    | DeclFn { params; return_type; effects; decl_body; _ } ->
+      let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
+      let body_env =
+        List.fold_left2 (fun acc p t -> env_extend p.param_name (mono t) acc)
+          env0 params param_tys
+      in
+      (* The body runs in the ambient row declared on the signature. If
+         the signature omits the effect annotation, use a fresh open row
+         so inference can discover the effects performed. *)
+      let ambient = row_of_effect_set_opt effects in
+      let body_ty = infer_expr_in eenv0 body_env ambient decl_body in
+      (match return_type with
+       | Some t -> unify body_ty (ty_of_type_expr t)
+       | None   -> ())
+    | DeclModule { body; _ } ->
+      List.iter check_decl body
+    | _ -> ()
+  in
+  List.iter check_decl prog;
   (env0, eenv0)

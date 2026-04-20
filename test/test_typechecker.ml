@@ -6,6 +6,16 @@ open Axiom_lib.Typechecker
 
 let ty_testable = Alcotest.testable pp_ty equal_ty
 
+(* Normalize a type so that every [TyFun] row becomes [RPure]. Tests that
+   only care about the value shape can compare modulo rows by running
+   both sides through this first. *)
+let rec strip_rows = function
+  | TyCon _ | TyVar _ as t -> t
+  | TyFun (a, b, _) -> TyFun (strip_rows a, strip_rows b, RPure)
+  | TyForall (v, t) -> TyForall (v, strip_rows t)
+  | TyMeta { inst = Some t; _ } -> strip_rows t
+  | TyMeta _ as m -> m
+
 let infer_of src =
   let tokens = Axiom_lib.Lexer.tokenize src in
   let expr   = Axiom_lib.Parser.parse_expr tokens in
@@ -13,6 +23,11 @@ let infer_of src =
 
 let check_ty label src expected =
   Alcotest.(check ty_testable) label expected (infer_of src)
+
+(* Check a function-returning expression ignoring effect rows on arrows. *)
+let check_ty_shape label src expected =
+  Alcotest.(check ty_testable) label (strip_rows expected)
+    (strip_rows (infer_of src))
 
 let check_ty_error label src =
   match infer_of src with
@@ -63,23 +78,26 @@ let test_let_generalize_bool () =
 (* Function types                                                       *)
 (* ------------------------------------------------------------------ *)
 
-(* fn (x: Int) -> Int ! pure { x }  =>  Int -> Int *)
+(* fn (x: Int) -> Int ! pure { x }  =>  Int -> Int ! pure *)
 let test_fn_annotated () =
   check_ty "fn Int->Int"
     "fn (x: Int) -> Int ! pure { x }"
-    (TyFun (TyCon "Int", TyCon "Int"))
+    (TyFun (TyCon "Int", TyCon "Int", RPure))
 
-(* fn (x: Int) { x }  =>  Int -> Int  (inferred return type) *)
+(* fn (x: Int) { x }  =>  Int -> Int  (inferred return type; row ignored) *)
 let test_fn_inferred_return () =
-  check_ty "fn inferred return"
+  check_ty_shape "fn inferred return"
     "fn (x: Int) { x }"
-    (TyFun (TyCon "Int", TyCon "Int"))
+    (TyFun (TyCon "Int", TyCon "Int", RPure))
 
-(* fn (x: Int, y: Bool) -> Bool ! pure { y }  =>  Int -> Bool -> Bool *)
+(* fn (x: Int, y: Bool) -> Bool ! pure { y }
+   =>  Int -> Bool -> Bool  (outer arrow row ignored; innermost is pure) *)
 let test_fn_two_params () =
-  check_ty "fn two params"
+  check_ty_shape "fn two params"
     "fn (x: Int, y: Bool) -> Bool ! pure { y }"
-    (TyFun (TyCon "Int", TyFun (TyCon "Bool", TyCon "Bool")))
+    (TyFun (TyCon "Int",
+            TyFun (TyCon "Bool", TyCon "Bool", RPure),
+            RPure))
 
 (* ------------------------------------------------------------------ *)
 (* Match expressions                                                    *)
@@ -106,11 +124,11 @@ let test_letrec_simple () =
     "letrec { f(x: Int): Int = x } in f(42)"
     (TyCon "Int")
 
-(* letrec { f(x: Int): Bool = true } in f  =>  Int -> Bool *)
+(* letrec { f(x: Int): Bool = true } in f  =>  Int -> Bool  (row ignored) *)
 let test_letrec_fn_type () =
-  check_ty "letrec fn type"
+  check_ty_shape "letrec fn type"
     "letrec { f(x: Int): Bool = true } in f"
-    (TyFun (TyCon "Int", TyCon "Bool"))
+    (TyFun (TyCon "Int", TyCon "Bool", RPure))
 
 (* ------------------------------------------------------------------ *)
 (* Type errors                                                          *)
@@ -402,6 +420,142 @@ let test_program_mutual_recursion () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* Effect rows                                                          *)
+(* ------------------------------------------------------------------ *)
+
+(* Performing an effect declared in the function's effect row is fine. *)
+let test_row_perform_in_declared_row () =
+  check_program_ok "perform in declared row"
+    {|
+      effect Console {
+        print: (String) -> Unit,
+        read_line: () -> String
+      }
+
+      fn greet() -> Unit ! {Console} {
+        perform Console.print("hi")
+      }
+    |}
+
+(* Performing an effect NOT in the declared row is a type error. *)
+let test_row_perform_outside_row () =
+  check_program_error "perform outside declared row"
+    {|
+      effect Console {
+        print: (String) -> Unit,
+        read_line: () -> String
+      }
+
+      fn greet() -> Unit ! pure {
+        perform Console.print("hi")
+      }
+    |}
+
+(* Calling an effectful function from a function whose row doesn't admit
+   that effect is a type error. *)
+let test_row_call_effectful_from_pure () =
+  check_program_error "call effectful from pure"
+    {|
+      effect Console {
+        print: (String) -> Unit,
+        read_line: () -> String
+      }
+
+      fn shout(s: String) -> Unit ! {Console} {
+        perform Console.print(s)
+      }
+
+      fn greet() -> Unit ! pure {
+        shout("hi")
+      }
+    |}
+
+(* Calling a pure function from an effectful context is fine. *)
+let test_row_call_pure_from_effectful () =
+  check_program_ok "call pure from effectful"
+    {|
+      effect Console {
+        print: (String) -> Unit,
+        read_line: () -> String
+      }
+
+      fn id_int(x: Int) -> Int ! pure { x }
+
+      fn greet() -> Unit ! {Console} {
+        do {
+          let _x = id_int(42);
+          perform Console.print("hi")
+        }
+      }
+    |}
+
+(* handle discharges the effect: a function with a {State<Int>} body wrapped
+   in a State handler can be pure overall. *)
+let test_row_handler_discharges_effect () =
+  check_program_ok "handler discharges effect"
+    {|
+      effect State<s> {
+        get: () -> s,
+        put: (s) -> Unit
+      }
+
+      fn run(init: Int, body: (u: Unit) -> Int ! {State<Int>}) -> Int ! pure {
+        handle body(()) with {
+          State {
+            get() => resume(init)
+            put(s) => resume(())
+          }
+        }
+      }
+    |}
+
+(* Two performs of a State<s> operation in the same function must agree
+   on the state type. Here both get and put are tied to the function's
+   declared {State<Int>}, so their s type is unified to Int and calling
+   put(42) succeeds. *)
+let test_row_state_shared_param () =
+  check_program_ok "State param shared across performs"
+    {|
+      effect State<s> {
+        get: () -> s,
+        put: (s) -> Unit
+      }
+
+      fn bump() -> Unit ! {State<Int>} {
+        do {
+          let _current = perform State.get();
+          perform State.put(42)
+        }
+      }
+    |}
+
+(* Handler operation bodies run in the OUTER ambient. A Log handler that
+   translates Log to Console can perform Console.print from its op body. *)
+let test_row_handler_translates_effect () =
+  check_program_ok "handler translates Log to Console"
+    {|
+      effect Console {
+        print: (String) -> Unit,
+        read_line: () -> String
+      }
+
+      effect Log {
+        log: (String) -> Unit
+      }
+
+      fn log_to_console(body: (u: Unit) -> Unit ! {Log}) -> Unit ! {Console} {
+        handle body(()) with {
+          Log {
+            log(msg) => do {
+              perform Console.print(msg);
+              resume(())
+            }
+          }
+        }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -459,4 +613,13 @@ let () =
     ; ( "program",
         [ Alcotest.test_case "body vs return mismatch"   `Quick test_body_return_mismatch
         ; Alcotest.test_case "mutual recursion"          `Quick test_program_mutual_recursion
+        ] )
+    ; ( "effect rows",
+        [ Alcotest.test_case "perform in declared row"      `Quick test_row_perform_in_declared_row
+        ; Alcotest.test_case "perform outside declared row" `Quick test_row_perform_outside_row
+        ; Alcotest.test_case "call effectful from pure"     `Quick test_row_call_effectful_from_pure
+        ; Alcotest.test_case "call pure from effectful"     `Quick test_row_call_pure_from_effectful
+        ; Alcotest.test_case "handler discharges effect"    `Quick test_row_handler_discharges_effect
+        ; Alcotest.test_case "State param shared"           `Quick test_row_state_shared_param
+        ; Alcotest.test_case "handler translates effect"    `Quick test_row_handler_translates_effect
         ] ) ]

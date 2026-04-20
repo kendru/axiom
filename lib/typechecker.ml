@@ -1,4 +1,5 @@
-(** Axiom type checker — Hindley-Milner with let-generalization.
+(** Axiom type checker — Hindley-Milner with let-generalization and
+    row-typed effects.
 
     Algorithm W extended with:
     - Annotated function parameters (the annotation is trusted, not checked
@@ -9,28 +10,55 @@
     - Program-level checking via [check_program]: a two-pass walk collects
       top-level effect and function declarations, then checks each function
       body against its declared signature.
-    - Effect operations are looked up in the program's effect environment
-      and their types are instantiated at each [perform] site. Effect-row
-      tracking on function types is a future layer — this pass only checks
-      that every performed operation resolves to a declared one and that
-      argument/return types agree. *)
+    - Row-typed effects. Every [TyFun] carries an effect row. Every
+      expression is type-checked against an ambient row. [perform E.op]
+      requires [E] to be in the ambient; [handle e with \{ E { ... } \}]
+      adds [E] to the handled expression's ambient while leaving the
+      enclosing ambient unchanged. Row unification is Rémy-style: rows
+      may be reordered, and an open row (one with a row-meta tail) can
+      absorb additional effects from the other side.
+    - Implicit effect polymorphism via row re-opening at instantiation.
+      Each use of a function scheme freshly re-opens every [TyFun] row in
+      its body: a function declared with effect row [\{Log\}] is visible at
+      each call site as [\{Log | ρ\}] for some fresh [ρ], so it may be
+      called under any ambient row that contains [\{Log\}]. *)
 
 open Ast
 
 (* ------------------------------------------------------------------ *)
-(* Types                                                                *)
+(* Types and effect rows                                                *)
 (* ------------------------------------------------------------------ *)
 
 type ty =
   | TyCon    of string          (** Int, Bool, String, Unit, Float64 *)
   | TyVar    of string          (** type variable (before unification) *)
-  | TyFun    of ty * ty         (** A -> B  (curried) *)
+  | TyFun    of ty * ty * row   (** A -> B ! ε (curried) *)
   | TyForall of string * ty     (** forall a. T  (generalized) *)
   | TyMeta   of meta_var        (** unification variable *)
 
 and meta_var = {
   id       : int;
   mutable inst : ty option;   (** None = uninstantiated *)
+}
+
+(** An effect row — the set of effects a computation may perform.
+    [RPure] is the empty, closed row. [RCons (E, r)] prepends an effect
+    to a row. [RMeta m] is a row unification variable; it may be
+    instantiated either to [RPure] (absorbing no more effects) or to
+    [RCons (E, fresh)] when row unification needs to extend the row. *)
+and row =
+  | RPure
+  | RCons of effect_inst * row
+  | RMeta of row_meta
+
+and effect_inst = {
+  eff_name : string;
+  eff_args : ty list;   (** Instantiation of the effect's type parameters. *)
+}
+
+and row_meta = {
+  rid        : int;
+  mutable rinst : row option;
 }
 
 (* ------------------------------------------------------------------ *)
@@ -40,17 +68,52 @@ and meta_var = {
 let rec pp_ty fmt = function
   | TyCon s        -> Format.pp_print_string fmt s
   | TyVar s        -> Format.pp_print_string fmt s
-  | TyFun (a, b)   -> Format.fprintf fmt "(%a -> %a)" pp_ty a pp_ty b
+  | TyFun (a, b, r) ->
+    Format.fprintf fmt "(%a -> %a ! %a)" pp_ty a pp_ty b pp_row r
   | TyForall (v,t) -> Format.fprintf fmt "(forall %s. %a)" v pp_ty t
   | TyMeta mv      ->
-    match mv.inst with
-    | Some t -> pp_ty fmt t
-    | None   -> Format.fprintf fmt "?%d" mv.id
+    (match mv.inst with
+     | Some t -> pp_ty fmt t
+     | None   -> Format.fprintf fmt "?%d" mv.id)
+
+and pp_row fmt = function
+  | RPure -> Format.pp_print_string fmt "pure"
+  | RMeta rm ->
+    (match rm.rinst with
+     | Some r -> pp_row fmt r
+     | None   -> Format.fprintf fmt "?ρ%d" rm.rid)
+  | r ->
+    let rec collect acc = function
+      | RPure     -> (List.rev acc, None)
+      | RCons (e, rest) -> collect (e :: acc) rest
+      | RMeta rm ->
+        (match rm.rinst with
+         | Some r -> collect acc r
+         | None   -> (List.rev acc, Some rm))
+    in
+    let effs, tail = collect [] r in
+    Format.fprintf fmt "{";
+    Format.pp_print_list
+      ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
+      pp_effect_inst fmt effs;
+    (match tail with
+     | None -> Format.fprintf fmt "}"
+     | Some rm -> Format.fprintf fmt " | ?ρ%d}" rm.rid)
+
+and pp_effect_inst fmt { eff_name; eff_args } =
+  if eff_args = [] then Format.pp_print_string fmt eff_name
+  else
+    Format.fprintf fmt "%s<%a>" eff_name
+      (Format.pp_print_list
+         ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
+         pp_ty)
+      eff_args
 
 let rec equal_ty a b = match a, b with
   | TyCon x,      TyCon y      -> x = y
   | TyVar x,      TyVar y      -> x = y
-  | TyFun (a1,b1), TyFun (a2,b2) -> equal_ty a1 a2 && equal_ty b1 b2
+  | TyFun (a1,b1,r1), TyFun (a2,b2,r2) ->
+    equal_ty a1 a2 && equal_ty b1 b2 && equal_row r1 r2
   | TyForall (v1,t1), TyForall (v2,t2) ->
     v1 = v2 && equal_ty t1 t2
   | TyMeta m1,    TyMeta m2    -> m1.id = m2.id
@@ -58,6 +121,19 @@ let rec equal_ty a b = match a, b with
   | TyMeta { inst = Some t; _ }, other
   | other, TyMeta { inst = Some t; _ } -> equal_ty t other
   | _, _ -> false
+
+and equal_row a b = match a, b with
+  | RPure, RPure -> true
+  | RCons (e1, r1), RCons (e2, r2) -> equal_effect_inst e1 e2 && equal_row r1 r2
+  | RMeta m1, RMeta m2 -> m1.rid = m2.rid
+  | RMeta { rinst = Some r; _ }, other
+  | other, RMeta { rinst = Some r; _ } -> equal_row r other
+  | _, _ -> false
+
+and equal_effect_inst a b =
+  a.eff_name = b.eff_name
+  && List.length a.eff_args = List.length b.eff_args
+  && List.for_all2 equal_ty a.eff_args b.eff_args
 
 (* ------------------------------------------------------------------ *)
 (* Type environment                                                     *)
@@ -93,20 +169,68 @@ let fresh_meta () =
   incr next_id;
   TyMeta { id; inst = None }
 
-(** Dereference a chain of instantiated metas. *)
+let next_rid = ref 0
+let fresh_row_meta () =
+  let rid = !next_rid in
+  incr next_rid;
+  { rid; rinst = None }
+
+let fresh_row () = RMeta (fresh_row_meta ())
+
+(** Dereference a chain of instantiated type metas. *)
 let rec deref = function
   | TyMeta { inst = Some t; _ } -> deref t
   | t -> t
 
-(** Collect all free meta-variables in a type. *)
+(** Dereference a chain of instantiated row metas. *)
+let rec row_deref = function
+  | RMeta { rinst = Some r; _ } -> row_deref r
+  | r -> r
+
+(** Collect all free type metas in a type (including those reached
+    through effect rows). *)
 let rec free_metas acc = function
   | TyCon _    | TyVar _   -> acc
   | TyForall (_, t)        -> free_metas acc t
-  | TyFun (a, b)           -> free_metas (free_metas acc a) b
+  | TyFun (a, b, r)        ->
+    let acc = free_metas (free_metas acc a) b in
+    free_row_ty_metas acc r
   | TyMeta mv ->
     (match mv.inst with
      | None   -> mv :: acc
      | Some t -> free_metas acc t)
+
+and free_row_ty_metas acc = function
+  | RPure -> acc
+  | RCons (e, rest) ->
+    let acc = List.fold_left free_metas acc e.eff_args in
+    free_row_ty_metas acc rest
+  | RMeta rm ->
+    (match rm.rinst with
+     | None   -> acc
+     | Some r -> free_row_ty_metas acc r)
+
+(** Collect all free row metas reachable from a type. *)
+let rec free_row_metas acc = function
+  | TyCon _ | TyVar _ -> acc
+  | TyForall (_, t) -> free_row_metas acc t
+  | TyFun (a, b, r) ->
+    let acc = free_row_metas (free_row_metas acc a) b in
+    free_row_metas_row acc r
+  | TyMeta mv ->
+    (match mv.inst with
+     | None   -> acc
+     | Some t -> free_row_metas acc t)
+
+and free_row_metas_row acc = function
+  | RPure -> acc
+  | RCons (e, rest) ->
+    let acc = List.fold_left free_row_metas acc e.eff_args in
+    free_row_metas_row acc rest
+  | RMeta rm ->
+    (match rm.rinst with
+     | None   -> rm :: acc
+     | Some r -> free_row_metas_row acc r)
 
 (** Free metas in the entire environment. *)
 let env_free_metas env =
@@ -142,12 +266,15 @@ let empty_effect_env : effect_env = []
 let occurs_check mv ty =
   List.exists (fun m -> m.id = mv.id) (free_metas [] ty)
 
+let row_occurs_check rm row =
+  List.exists (fun m -> m.rid = rm.rid) (free_row_metas_row [] row)
+
 let rec unify a b =
   match deref a, deref b with
   | TyCon x, TyCon y when x = y -> ()
   | TyVar x, TyVar y when x = y -> ()
-  | TyFun (a1, b1), TyFun (a2, b2) ->
-    unify a1 a2; unify b1 b2
+  | TyFun (a1, b1, r1), TyFun (a2, b2, r2) ->
+    unify a1 a2; unify b1 b2; unify_row r1 r2
   (* Same uninstantiated meta on both sides: nothing to do. Without this
      case, the occurs check below would spuriously fail, since a meta
      trivially "occurs" in itself. *)
@@ -159,47 +286,99 @@ let rec unify a b =
   | a, b ->
     failwith (Format.asprintf "Typechecker: cannot unify %a with %a" pp_ty a pp_ty b)
 
+(** Row unification — Rémy's algorithm. Two rows unify when they contain
+    the same multiset of effects, with open tails absorbing any
+    remainder. The order of effects does not matter. *)
+and unify_row a b =
+  match row_deref a, row_deref b with
+  | RPure, RPure -> ()
+  | RMeta m1, RMeta m2 when m1.rid = m2.rid -> ()
+  | RMeta rm, r | r, RMeta rm ->
+    if row_occurs_check rm r
+    then failwith "Typechecker: row occurs check failed (cyclic row)"
+    else rm.rinst <- Some r
+  | RCons (e, rest1), r2 ->
+    let rest2 = rewrite_row r2 e in
+    unify_row rest1 rest2
+  | RPure, RCons (e, _) ->
+    failwith (Format.asprintf
+                "Typechecker: cannot unify pure row with row containing %a"
+                pp_effect_inst e)
+
+(** [rewrite_row r e] unifies the first head of [r] equal to [e] out of
+    [r] and returns the remainder. If [r] ends in an open row meta, that
+    meta is extended with [e] to create a fresh tail.
+    The arguments of matching effects are unified in place. *)
+and rewrite_row r e =
+  match row_deref r with
+  | RPure ->
+    failwith (Format.asprintf
+                "Typechecker: effect %a is not present in the expected row"
+                pp_effect_inst e)
+  | RCons (e', rest) ->
+    if e.eff_name = e'.eff_name
+       && List.length e.eff_args = List.length e'.eff_args
+    then begin
+      List.iter2 unify e.eff_args e'.eff_args;
+      rest
+    end else
+      RCons (e', rewrite_row rest e)
+  | RMeta rm ->
+    let fresh = fresh_row_meta () in
+    rm.rinst <- Some (RCons (e, RMeta fresh));
+    RMeta fresh
+
 (* ------------------------------------------------------------------ *)
 (* Instantiation and generalization                                     *)
 (* ------------------------------------------------------------------ *)
 
-(** Replace all bound type variables in a scheme with fresh metas.
-    The scheme body uses [TyVar] for quantified variables; we replace
-    each with a fresh [TyMeta] so unification can proceed. *)
-let instantiate { bound; body } =
-  if bound = [] then body
-  else begin
-    let subs = List.map (fun v -> (v, fresh_meta ())) bound in
-    let rec go = function
-      | TyVar v         -> (match List.assoc_opt v subs with Some t -> t | None -> TyVar v)
-      | TyCon _ as t    -> t
-      | TyFun (a, b)    -> TyFun (go a, go b)
-      | TyForall (v, t) ->
-        (* Stop substituting under a forall that shadows one of our vars *)
-        let subs' = List.filter (fun (x, _) -> x <> v) subs in
-        let rec go' = function
-          | TyVar x         -> (match List.assoc_opt x subs' with Some u -> u | None -> TyVar x)
-          | TyCon _ as c    -> c
-          | TyFun (a, b)    -> TyFun (go' a, go' b)
-          | TyForall (w, u) -> TyForall (w, go' u)
-          | TyMeta _ as m   -> m
-        in
-        TyForall (v, go' t)
-      | TyMeta _ as m -> m
-    in
-    go body
-  end
+(** Walk a row, possibly substituting TyVars inside effect args, and
+    always re-open a closed tail with a fresh row meta. The re-opening
+    is what gives every function use its own polymorphic effect tail:
+    a declared closed row [\{E1, E2\}] is visible at the call site as
+    [\{E1, E2 | ?ρ\}], so ?ρ can absorb the rest of the ambient row. *)
+let rec reopen_row subs = function
+  | RPure -> fresh_row ()
+  | RCons (e, rest) ->
+    let e' = { e with eff_args = List.map (subst_ty subs) e.eff_args } in
+    RCons (e', reopen_row subs rest)
+  | RMeta rm as r ->
+    (match rm.rinst with
+     | Some r' -> reopen_row subs r'
+     | None    -> r)
 
-(** Generalize a type over free metas not in the environment.
+(** Substitute TyVars listed in [subs], and re-open every TyFun row. *)
+and subst_ty subs = function
+  | TyVar v as t ->
+    (match List.assoc_opt v subs with Some u -> u | None -> t)
+  | TyCon _ as c -> c
+  | TyFun (a, b, r) -> TyFun (subst_ty subs a, subst_ty subs b, reopen_row subs r)
+  | TyForall (v, t) ->
+    let subs' = List.filter (fun (x, _) -> x <> v) subs in
+    TyForall (v, subst_ty subs' t)
+  | TyMeta _ as m -> m
+
+(** Replace all bound type variables in a scheme with fresh metas, and
+    re-open every TyFun row along the way with a fresh row meta tail.
+    Each use of a scheme gets fresh metas — including row metas — so
+    function values are effectively row-polymorphic. *)
+let instantiate { bound; body } =
+  let subs = List.map (fun v -> (v, fresh_meta ())) bound in
+  subst_ty subs body
+
+(** Generalize a type over free type metas not in the environment.
     Returns a scheme whose [body] is the type with metas replaced by [TyVar]s,
     and [bound] lists the variable names for instantiation.
     The body does NOT contain wrapping [TyForall] nodes — [bound] carries
-    that information separately. *)
+    that information separately.
+
+    Row metas are not generalized here; they are re-opened afresh on each
+    instantiation (see [instantiate]/[subst_ty]), which provides implicit
+    row polymorphism without an explicit quantifier. *)
 let generalize env ty =
   let env_metas = env_free_metas env in
   let env_ids   = List.map (fun m -> m.id) env_metas in
   let ty_metas  = free_metas [] ty in
-  (* Deduplicate while preserving order *)
   let seen = Hashtbl.create 8 in
   let unique = List.filter (fun m ->
       if Hashtbl.mem seen m.id then false
@@ -219,8 +398,16 @@ let generalize env ty =
          | None      -> TyMeta mv)
       | TyCon _ as c    -> c
       | TyVar _ as v    -> v
-      | TyFun (a, b)    -> TyFun (go a, go b)
+      | TyFun (a, b, r) -> TyFun (go a, go b, go_row r)
       | TyForall (v, u) -> TyForall (v, go u)
+    and go_row = function
+      | RPure -> RPure
+      | RCons (e, rest) ->
+        RCons ({ e with eff_args = List.map go e.eff_args }, go_row rest)
+      | RMeta rm as r ->
+        (match rm.rinst with
+         | Some r' -> go_row r'
+         | None    -> r)
     in
     let body  = go ty in
     let bound = List.map snd subs in
@@ -233,49 +420,89 @@ let generalize env ty =
 
 (** Convert an AST type_expr to a checker ty.
     Type variables (lowercase names not in scope as type constructors)
-    are treated as rigid type variables. *)
+    are treated as rigid type variables. The innermost TyFun's row is
+    taken from the [effect_set option] on that arrow; intermediate
+    curried arrows default to a fresh open row.
+
+    [None] effect slots — allowed by the parser for unannotated arrows
+    within type_expr — yield a fresh open row so type checking does not
+    prematurely constrain the function to pure. *)
 let rec ty_of_type_expr = function
   | TyName s when String.length s > 0 && s.[0] >= 'a' && s.[0] <= 'z' ->
     TyVar s
   | TyName s  -> TyCon s
   | TyApp (s, _args) -> TyCon s
   | TyTuple _ -> fresh_meta ()    (* tuple types deferred *)
-  | TyFun (param_tys, ret, _eff) ->
+  | TyFun (param_tys, ret, eff) ->
     let ret_ty = ty_of_type_expr ret in
-    List.fold_right (fun pt acc -> TyFun (ty_of_type_expr pt, acc)) param_tys ret_ty
+    let row = row_of_effect_set_opt eff in
+    (* Curried: the declared effect row lives on the innermost arrow (the
+       last one to be applied), so we build from the right and attach [row]
+       there. Intermediate arrows get fresh open rows. *)
+    (match List.rev param_tys with
+     | [] -> ret_ty   (* nullary function types have no arrow at all *)
+     | last :: rest_rev ->
+       let innermost = TyFun (ty_of_type_expr last, ret_ty, row) in
+       List.fold_left
+         (fun acc pt -> TyFun (ty_of_type_expr pt, acc, fresh_row ()))
+         innermost rest_rev)
+
+(** Convert an AST [effect_set] to a checker row. [Effects [e1; ...; en]]
+    becomes [RCons (e1, ... RCons (en, RPure))] (closed); [Pure] is
+    [RPure]. *)
+and row_of_effect_set = function
+  | Pure -> RPure
+  | Effects ts ->
+    List.fold_right
+      (fun t acc -> RCons (effect_inst_of_type_expr t, acc))
+      ts RPure
+
+and row_of_effect_set_opt = function
+  | Some e -> row_of_effect_set e
+  | None   -> fresh_row ()   (* unannotated: inference will discover it *)
+
+and effect_inst_of_type_expr = function
+  | TyName s -> { eff_name = s; eff_args = [] }
+  | TyApp (s, args) ->
+    { eff_name = s; eff_args = List.map ty_of_type_expr args }
+  | t ->
+    failwith (Format.asprintf
+                "Typechecker: not a legal effect: %a"
+                Ast.pp_type_expr t)
 
 (* ------------------------------------------------------------------ *)
 (* Inference                                                            *)
 (* ------------------------------------------------------------------ *)
 
-(** Substitute the TyVars listed in [subs] with the paired types.
-    Used to instantiate an effect operation's quantified type parameters
-    with fresh metas. *)
-let subst_tyvars subs =
+(** Substitute TyVars listed in [subs]. Used to instantiate an effect
+    operation's quantified type parameters with fresh metas. Rows inside
+    [TyFun] slots are preserved as-is (rather than re-opened), since we
+    are not instantiating a scheme here — merely substituting variables. *)
+let rec subst_tyvars subs t =
   let rec go = function
     | TyVar v as t ->
       (match List.assoc_opt v subs with Some u -> u | None -> t)
     | TyCon _ as c -> c
-    | TyFun (a, b) -> TyFun (go a, go b)
+    | TyFun (a, b, r) -> TyFun (go a, go b, go_row r)
     | TyForall (v, t) ->
       let subs' = List.filter (fun (x, _) -> x <> v) subs in
-      let rec go' = function
-        | TyVar x as t ->
-          (match List.assoc_opt x subs' with Some u -> u | None -> t)
-        | TyCon _ as c -> c
-        | TyFun (a, b) -> TyFun (go' a, go' b)
-        | TyForall (w, u) -> TyForall (w, go' u)
-        | TyMeta _ as m -> m
-      in
-      TyForall (v, go' t)
+      TyForall (v, subst_tyvars subs' t)
     | TyMeta _ as m -> m
+  and go_row = function
+    | RPure -> RPure
+    | RCons (e, rest) ->
+      RCons ({ e with eff_args = List.map go e.eff_args }, go_row rest)
+    | RMeta _ as r -> r
   in
-  go
+  go t
 
-(** [infer_expr_in eenv env e] infers the type of [e] under the value
-    environment [env] and effect environment [eenv]. Raises [Failure] on
-    type errors. *)
-let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
+(** [infer_expr_in eenv env ambient e] infers the type of [e] under the
+    value environment [env] and effect environment [eenv]. The [ambient]
+    row is the effect row of the enclosing computation — any effect
+    performed by [e] (directly via [perform], or indirectly via calling a
+    function whose row isn't pure) must unify with [ambient]. Raises
+    [Failure] on type errors. *)
+let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr) : ty =
   match e.desc with
 
   | IntLit _    -> TyCon "Int"
@@ -289,42 +516,52 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
     instantiate scheme
 
   | Let { pat; value; body } ->
-    let ty_val = infer_expr_in eenv env value in
+    let ty_val = infer_expr_in eenv env ambient value in
     let scheme = generalize env ty_val in
     let env'   = match pat.pat_desc with
       | PVar name -> env_extend name scheme env
       | _         -> env_from_pattern env pat ty_val
     in
-    infer_expr_in eenv env' body
+    infer_expr_in eenv env' ambient body
 
   | Letrec (bindings, body) ->
-    (* Compute annotated types for each binding: param types + return type -> fun_ty *)
+    (* Compute annotated types for each binding: param types + return type -> fun_ty.
+       The innermost arrow carries a fresh open row that will be unified with the
+       body's own ambient during checking. *)
     let binding_info = List.map (fun b ->
         let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) b.letrec_params in
         let ret_ty    = ty_of_type_expr b.letrec_return_type in
-        let fun_ty    = List.fold_right (fun pt acc -> TyFun (pt, acc)) param_tys ret_ty in
-        (b, param_tys, ret_ty, fun_ty)
+        let body_row  = fresh_row () in
+        let fun_ty    = match List.rev param_tys with
+          | [] -> ret_ty
+          | last :: rest_rev ->
+            let innermost = TyFun (last, ret_ty, body_row) in
+            List.fold_left
+              (fun acc pt -> TyFun (pt, acc, fresh_row ()))
+              innermost rest_rev
+        in
+        (b, param_tys, ret_ty, body_row, fun_ty)
       ) bindings in
     (* Extend env with all bindings at their monomorphic function types for recursion *)
-    let env_rec = List.fold_left (fun acc (b, _, _, fun_ty) ->
+    let env_rec = List.fold_left (fun acc (b, _, _, _, fun_ty) ->
         env_extend b.letrec_name (mono fun_ty) acc
       ) env binding_info in
     (* Infer each body in env extended with its own params, unify with return type *)
-    List.iter (fun (b, param_tys, ret_ty, _) ->
+    List.iter (fun (b, param_tys, ret_ty, body_row, _) ->
         let env_params = List.fold_left2
             (fun acc p pt -> env_extend p.param_name (mono pt) acc)
             env_rec b.letrec_params param_tys
         in
-        let body_ty = infer_expr_in eenv env_params b.letrec_body in
+        let body_ty = infer_expr_in eenv env_params body_row b.letrec_body in
         unify body_ty ret_ty
       ) binding_info;
     (* Generalize and build the env for the continuation *)
-    let env' = List.fold_left (fun acc (b, _, _, fun_ty) ->
+    let env' = List.fold_left (fun acc (b, _, _, _, fun_ty) ->
         env_extend b.letrec_name (generalize env fun_ty) acc
       ) env binding_info in
-    infer_expr_in eenv env' body
+    infer_expr_in eenv env' ambient body
 
-  | Fn { params; return_type; fn_body; _ } ->
+  | Fn { params; return_type; effects; fn_body } ->
     (* Replace type variable names with fresh metas so that let-generalization
        can quantify over them.  A single shared table ensures that the same name
        (e.g. 'a') maps to the same meta across all param annotations. *)
@@ -344,35 +581,55 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
       go ty_expr
     in
     let param_tys = List.map (fun p -> freshen_type_expr p.param_type) params in
+    (* Body's ambient row: declared effect annotation (if any) or fresh open row. *)
+    let body_row = row_of_effect_set_opt effects in
     (* Extend env with monomorphic param bindings *)
     let env' = List.fold_left2
         (fun acc p ty -> env_extend p.param_name (mono ty) acc)
         env params param_tys
     in
-    let body_ty = infer_expr_in eenv env' fn_body in
+    let body_ty = infer_expr_in eenv env' body_row fn_body in
     (* Unify body type with return annotation if present *)
     (match return_type with
      | Some ann_ty -> unify body_ty (freshen_type_expr ann_ty)
      | None -> ());
-    (* Build curried function type: p1 -> p2 -> ... -> body_ty *)
-    List.fold_right (fun pt acc -> TyFun (pt, acc)) param_tys body_ty
+    (* Build curried function type: p1 -> p2 -> ... -> body_ty.
+       The declared/inferred body row lives on the innermost arrow;
+       intermediate arrows get fresh open rows (partial applications are pure). *)
+    (match List.rev param_tys with
+     | [] -> body_ty
+     | last :: rest_rev ->
+       let innermost = TyFun (last, body_ty, body_row) in
+       List.fold_left
+         (fun acc pt -> TyFun (pt, acc, fresh_row ()))
+         innermost rest_rev)
 
   | App (f, args) ->
-    let f_ty   = infer_expr_in eenv env f in
+    let f_ty   = infer_expr_in eenv env ambient f in
     let ret_ty = fresh_meta () in
-    (* Build the expected function type from the arguments *)
-    let arg_tys = List.map (infer_expr_in eenv env) args in
-    let expected = List.fold_right (fun at acc -> TyFun (at, acc)) arg_tys ret_ty in
+    (* Build the expected function type from the arguments. A full application
+       performs the callee's innermost effect row, which must unify with the
+       ambient. Intermediate curried arrows get fresh open rows since partial
+       application itself performs no effects. *)
+    let arg_tys = List.map (infer_expr_in eenv env ambient) args in
+    let expected = match List.rev arg_tys with
+      | [] -> ret_ty
+      | last :: rest_rev ->
+        let innermost = TyFun (last, ret_ty, ambient) in
+        List.fold_left
+          (fun acc at -> TyFun (at, acc, fresh_row ()))
+          innermost rest_rev
+    in
     unify f_ty expected;
     deref ret_ty
 
   | Match { scrutinee; arms } ->
-    let _scrut_ty = infer_expr_in eenv env scrutinee in
+    let _scrut_ty = infer_expr_in eenv env ambient scrutinee in
     let result_ty = fresh_meta () in
     List.iter (fun arm ->
         (* Extend env with pattern bindings — conservative: only PVar binds *)
         let env' = env_from_pattern env arm.pattern _scrut_ty in
-        let arm_ty = infer_expr_in eenv env' arm.arm_body in
+        let arm_ty = infer_expr_in eenv env' ambient arm.arm_body in
         unify result_ty arm_ty
       ) arms;
     deref result_ty
@@ -380,16 +637,16 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
   | Record fields ->
     (* Record types are nominal/structural — deferred until kind system.
        Infer field types for side-effects (catches unbound vars), return a fresh meta. *)
-    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env e)) fields;
+    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env ambient e)) fields;
     fresh_meta ()
 
   | RecordUpdate (base, fields) ->
-    let _base_ty = infer_expr_in eenv env base in
-    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env e)) fields;
+    let _base_ty = infer_expr_in eenv env ambient base in
+    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env ambient e)) fields;
     fresh_meta ()
 
   | Project (e, _field) ->
-    ignore (infer_expr_in eenv env e);
+    ignore (infer_expr_in eenv env ambient e);
     fresh_meta ()
 
   | Perform { effect_name; op_name; args } ->
@@ -408,8 +665,12 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
                     "Typechecker: effect '%s' has no operation '%s'"
                     effect_name op_name)
     in
-    (* Each perform instantiates the effect's type parameters afresh. *)
+    (* Each perform instantiates the effect's type parameters afresh. The
+       instantiated arg types become the effect's row entry, so that two
+       performs on the same effect within a single ambient row agree
+       (e.g. two State.get calls share the same state type). *)
     let subs = List.map (fun v -> (v, fresh_meta ())) scheme.eff_type_params in
+    let eff_args = List.map (fun v -> List.assoc v subs) scheme.eff_type_params in
     let param_tys = List.map (subst_tyvars subs) op.op_params in
     let ret_ty    = subst_tyvars subs op.op_return in
     let n_params = List.length param_tys in
@@ -419,34 +680,35 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
                   "Typechecker: effect operation '%s.%s' expects %d arg(s), got %d"
                   effect_name op_name n_params n_args);
     List.iter2 (fun a pt ->
-        let at = infer_expr_in eenv env a in
+        let at = infer_expr_in eenv env ambient a in
         unify at pt)
       args param_tys;
+    (* This perform requires [effect_name] to be in the ambient row. *)
+    let this_eff = { eff_name = effect_name; eff_args } in
+    unify_row ambient (RCons (this_eff, RMeta (fresh_row_meta ())));
     deref ret_ty
 
   | Handle { handled; handlers } ->
     (* Type-check a linear (single-shot) handler.
 
-       Model: each handler clause consumes one effect from the handled
-       computation and produces a value of the overall `handle` result
-       type [result_ty].
+       Effect-row model: the [handled] expression is checked under an
+       ambient row that extends the outer ambient with the effects the
+       handlers consume. Handler clauses run in the outer ambient (the
+       handler's side effects are whatever the surrounding computation
+       allows). A return clause (if present) likewise runs in the outer
+       ambient and transforms [handled_ty] into [result_ty].
 
-       - The handled expression has some value type [handled_ty]. Without a
-         return clause this is also the final result; a return clause
-         transforms [handled_ty] into [result_ty].
        - Each op handler receives the operation's arguments at their declared
          types (after fresh instantiation of the effect's type parameters)
          and must produce a value of [result_ty].
        - [resume] is bound in the op handler body with type
          [op_return_ty -> result_ty]. Calling it continues the handled
-         computation; linear handlers resume at most once.
-
-       Effect-row tracking on function types — and the constraint that the
-       handled expression actually performs the effect being handled — is a
-       follow-on in the next layer. *)
-    let handled_ty = infer_expr_in eenv env handled in
-    let result_ty  = fresh_meta () in
-    List.iter (fun (h : effect_handler) ->
+         computation; linear handlers resume at most once. *)
+    (* Build the extended ambient for the handled expression: prepend each
+       handled effect (with its instantiated type arguments) onto the outer
+       ambient. Keep the per-effect substitution so op handlers can reuse
+       the same type args. *)
+    let handler_subs = List.map (fun (h : effect_handler) ->
         let scheme =
           match List.assoc_opt h.effect_handler eenv with
           | Some s -> s
@@ -455,11 +717,17 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
                         "Typechecker: unknown effect '%s' in handler"
                         h.effect_handler)
         in
-        (* Each handler clause instantiates the effect's type parameters
-           with fresh metas. These are shared across the op clauses of
-           this handler so that, e.g. for State<s>, both get: () -> s and
-           put: (s) -> Unit refer to the same s. *)
         let subs = List.map (fun v -> (v, fresh_meta ())) scheme.eff_type_params in
+        let eff_args = List.map (fun v -> List.assoc v subs) scheme.eff_type_params in
+        (h, scheme, subs, { eff_name = h.effect_handler; eff_args })
+      ) handlers in
+    let handled_row =
+      List.fold_right (fun (_, _, _, einst) acc -> RCons (einst, acc))
+        handler_subs ambient
+    in
+    let handled_ty = infer_expr_in eenv env handled_row handled in
+    let result_ty  = fresh_meta () in
+    List.iter (fun ((h : effect_handler), scheme, subs, _einst) ->
         List.iter (fun (oh : op_handler) ->
             let op =
               try List.find (fun o -> o.op_name = oh.op_handler_name) scheme.eff_ops
@@ -485,10 +753,11 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
             in
             (* Bind `resume` : op_return_ty -> result_ty. Linear handlers
                resume at most once, so we type it as a function from the
-               op's return value to the overall handle result. *)
-            let resume_ty  = TyFun (op_ret_ty, result_ty) in
+               op's return value to the overall handle result. Resume runs
+               in the outer ambient. *)
+            let resume_ty  = TyFun (op_ret_ty, result_ty, ambient) in
             let env_resume = env_extend "resume" (mono resume_ty) env_params in
-            let body_ty    = infer_expr_in eenv env_resume oh.op_handler_body in
+            let body_ty    = infer_expr_in eenv env_resume ambient oh.op_handler_body in
             unify body_ty result_ty)
           h.op_handlers;
         (* Return clause (if present) transforms the handled value into the
@@ -498,9 +767,9 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
            unify handled_ty result_ty
          | Some { return_var; return_body } ->
            let env_ret = env_extend return_var (mono handled_ty) env in
-           let body_ty = infer_expr_in eenv env_ret return_body in
+           let body_ty = infer_expr_in eenv env_ret ambient return_body in
            unify body_ty result_ty))
-      handlers;
+      handler_subs;
     deref result_ty
 
   | Do stmts ->
@@ -508,10 +777,10 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
        The final stmt must be a StmtExpr whose type is the block's type. *)
     let rec go env = function
       | []                         -> TyCon "Unit"
-      | [StmtExpr e]               -> infer_expr_in eenv env e
-      | StmtExpr e :: rest         -> ignore (infer_expr_in eenv env e); go env rest
+      | [StmtExpr e]               -> infer_expr_in eenv env ambient e
+      | StmtExpr e :: rest         -> ignore (infer_expr_in eenv env ambient e); go env rest
       | StmtLet { pat; value } :: rest ->
-        let ty   = infer_expr_in eenv env value in
+        let ty   = infer_expr_in eenv env ambient value in
         let env' = match pat.pat_desc with
           | PVar name -> env_extend name (generalize env ty) env
           | _         -> env_from_pattern env pat ty
@@ -521,9 +790,9 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (e : expr) : ty =
     go env stmts
 
   | If { cond; then_; else_ } ->
-    unify (infer_expr_in eenv env cond) (TyCon "Bool");
-    let t = infer_expr_in eenv env then_ in
-    let e = infer_expr_in eenv env else_ in
+    unify (infer_expr_in eenv env ambient cond) (TyCon "Bool");
+    let t = infer_expr_in eenv env ambient then_ in
+    let e = infer_expr_in eenv env ambient else_ in
     unify t e;
     deref t
 
@@ -543,11 +812,13 @@ and env_from_pattern env (p : pattern) scrut_ty =
     (* Both branches bind the same variables; use p1 *)
     env_from_pattern env p1 scrut_ty
 
-(** [infer_expr env e] infers the type of [e] with no effects declared.
-    Program-level inference — with declared effects in scope — uses
-    [check_program] or [infer_expr_in] directly. *)
+(** [infer_expr env e] infers the type of [e] with no effects declared,
+    using a fresh open row for the ambient effect row so that [e] is free
+    to perform any effects its subterms introduce. Program-level inference —
+    with declared effects in scope — uses [check_program] or
+    [infer_expr_in] directly. *)
 let infer_expr (env : env) (e : expr) : ty =
-  infer_expr_in empty_effect_env env e
+  infer_expr_in empty_effect_env env (fresh_row ()) e
 
 (* ------------------------------------------------------------------ *)
 (* Program-level checking                                              *)
@@ -571,13 +842,22 @@ let fn_scheme_of_decl
     (type_params : string list)
     (params      : param list)
     (return_type : type_expr option)
+    (effects     : effect_set option)
   : scheme =
   let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
   let ret_ty = match return_type with
     | Some t -> ty_of_type_expr t
     | None   -> fresh_meta ()
   in
-  let fun_ty = List.fold_right (fun pt acc -> TyFun (pt, acc)) param_tys ret_ty in
+  let body_row = row_of_effect_set_opt effects in
+  let fun_ty = match List.rev param_tys with
+    | [] -> ret_ty
+    | last :: rest_rev ->
+      let innermost = TyFun (last, ret_ty, body_row) in
+      List.fold_left
+        (fun acc pt -> TyFun (pt, acc, fresh_row ()))
+        innermost rest_rev
+  in
   { bound = type_params; body = fun_ty }
 
 (** [check_program prog] type-checks a whole program in two passes:
@@ -605,8 +885,8 @@ let check_program (prog : program) : env * effect_env =
     | DeclEffect { effect_name; type_params; ops; _ } ->
       let scheme = effect_scheme_of_decl type_params ops in
       (env, (effect_name, scheme) :: eenv)
-    | DeclFn { fn_name; type_params; params; return_type; _ } ->
-      let scheme = fn_scheme_of_decl type_params params return_type in
+    | DeclFn { fn_name; type_params; params; return_type; effects; _ } ->
+      let scheme = fn_scheme_of_decl type_params params return_type effects in
       ((fn_name, scheme) :: env, eenv)
     | DeclType _ | DeclModule _ | DeclRequire _ ->
       (env, eenv)
@@ -616,13 +896,17 @@ let check_program (prog : program) : env * effect_env =
   in
   List.iter (fun d ->
       match d.decl_desc with
-      | DeclFn { params; return_type; decl_body; _ } ->
+      | DeclFn { params; return_type; effects; decl_body; _ } ->
         let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
         let body_env =
           List.fold_left2 (fun acc p t -> env_extend p.param_name (mono t) acc)
             env0 params param_tys
         in
-        let body_ty = infer_expr_in eenv0 body_env decl_body in
+        (* The body runs in the ambient row declared on the signature. If
+           the signature omits the effect annotation, use a fresh open row
+           so inference can discover the effects performed. *)
+        let ambient = row_of_effect_set_opt effects in
+        let body_ty = infer_expr_in eenv0 body_env ambient decl_body in
         (match return_type with
          | Some t -> unify body_ty (ty_of_type_expr t)
          | None   -> ())

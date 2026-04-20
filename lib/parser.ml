@@ -503,7 +503,8 @@ and parse_atom (st : state) : expr =
     | Some (StringLit s) -> advance st; Ast.expr (StringLit s)
     | Some True          -> advance st; Ast.expr (BoolLit true)
     | Some False         -> advance st; Ast.expr (BoolLit false)
-    | Some (Ident s)     -> advance st; Ast.expr (Var s)
+    | Some (Ident s)
+    | Some (CtorIdent s) -> advance st; Ast.expr (Var s)
     | Some Resume        -> advance st; Ast.expr (Var "resume")
     | Some LBrace ->
       (* { } empty record; { ident : ... } record literal; { expr with ... } update *)

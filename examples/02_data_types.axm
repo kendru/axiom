@@ -27,12 +27,6 @@ type Ordering = | LT | EQ | GT
 -- ----------------------------------------------------------------
 
 -- Unwrap an Option with a default value.
--- Note: constructor "application" uses lowercase wrapper functions
--- (e.g. some(x), none()) because the parser currently treats
--- uppercase identifiers as types, not as expression-level constructors.
--- This guides a stdlib decision: provide such wrappers, or extend the
--- parser to allow constructors as expressions.
-
 fn unwrap_or<a>(opt: Option<a>, default: a) -> a ! pure {
   match opt with {
     | Some(x) => x
@@ -42,15 +36,15 @@ fn unwrap_or<a>(opt: Option<a>, default: a) -> a ! pure {
 
 fn map_option<a, b>(f: (x: a) -> b ! pure, opt: Option<a>) -> Option<b> ! pure {
   match opt with {
-    | Some(x) => some(f(x))
-    | None => none()
+    | Some(x) => Some(f(x))
+    | None => None
   }
 }
 
 fn flat_map_option<a, b>(f: (x: a) -> Option<b> ! pure, opt: Option<a>) -> Option<b> ! pure {
   match opt with {
     | Some(x) => f(x)
-    | None => none()
+    | None => None
   }
 }
 

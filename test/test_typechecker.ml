@@ -556,6 +556,60 @@ let test_row_handler_translates_effect () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* Constructor expressions                                              *)
+(* ------------------------------------------------------------------ *)
+
+(* A nullary constructor used as an expression has the declared type. *)
+let test_ctor_expr_nullary () =
+  check_program_ok "nullary ctor in expression"
+    {|
+      type Color = | Red | Green | Blue
+
+      fn make_red() -> Color ! pure { Red }
+    |}
+
+(* A unary constructor applied to an argument. *)
+let test_ctor_expr_applied () =
+  check_program_ok "ctor applied to arg"
+    {|
+      type Wrapper = | Wrap(Int)
+
+      fn wrap_it(n: Int) -> Wrapper ! pure { Wrap(n) }
+    |}
+
+(* Passing the wrong type to a constructor is a type error. *)
+let test_ctor_expr_wrong_arg_type () =
+  check_program_error "ctor applied to wrong type"
+    {|
+      type Wrapper = | Wrap(Int)
+
+      fn bad() -> Wrapper ! pure { Wrap("hello") }
+    |}
+
+(* Construct-then-match round-trip: result type flows through correctly. *)
+let test_ctor_expr_round_trip () =
+  check_program_ok "ctor construct-then-match"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn identity_option(x: Int) -> Int ! pure {
+        match Some(x) with {
+          | Some(n) => n
+          | None    => 0
+        }
+      }
+    |}
+
+(* Return type mismatch: ctor produces the wrong type for the function. *)
+let test_ctor_expr_return_mismatch () =
+  check_program_error "ctor return type mismatch"
+    {|
+      type Color = | Red | Green | Blue
+
+      fn bad() -> Int ! pure { Red }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* DeclType — constructor registration                                  *)
 (* ------------------------------------------------------------------ *)
 
@@ -723,6 +777,13 @@ let () =
     ; ( "modules",
         [ Alcotest.test_case "body collected"            `Quick test_module_body_collected
         ; Alcotest.test_case "body type error"           `Quick test_module_body_type_error
+        ] )
+    ; ( "ctor-expressions",
+        [ Alcotest.test_case "nullary ctor"              `Quick test_ctor_expr_nullary
+        ; Alcotest.test_case "applied ctor"              `Quick test_ctor_expr_applied
+        ; Alcotest.test_case "wrong arg type"            `Quick test_ctor_expr_wrong_arg_type
+        ; Alcotest.test_case "construct-then-match"      `Quick test_ctor_expr_round_trip
+        ; Alcotest.test_case "return mismatch"           `Quick test_ctor_expr_return_mismatch
         ] )
     ; ( "effect rows",
         [ Alcotest.test_case "perform in declared row"      `Quick test_row_perform_in_declared_row

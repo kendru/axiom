@@ -12,7 +12,7 @@ type token =
   (* Keywords *)
   | Let | In | Fn | Pub | Type | Module | Require | Effect
   | Perform | Handle | With | Match | Do | Resume | Letrec
-  | If | Else | Return
+  | If | Else | Return | Import | As
   (* Built-in value keywords *)
   | Pure | True | False
   (* Identifiers *)
@@ -67,6 +67,8 @@ let pp_token fmt = function
   | If       -> Format.pp_print_string fmt "If"
   | Else     -> Format.pp_print_string fmt "Else"
   | Return   -> Format.pp_print_string fmt "Return"
+  | Import   -> Format.pp_print_string fmt "Import"
+  | As       -> Format.pp_print_string fmt "As"
   | Pure     -> Format.pp_print_string fmt "Pure"
   | True     -> Format.pp_print_string fmt "True"
   | False    -> Format.pp_print_string fmt "False"
@@ -126,6 +128,8 @@ let keyword_of_string = function
   | "if"      -> Some If
   | "else"    -> Some Else
   | "return"  -> Some Return
+  | "import"  -> Some Import
+  | "as"      -> Some As
   | "pure"    -> Some Pure
   | "true"    -> Some True
   | "false"   -> Some False

@@ -39,6 +39,7 @@ let tag_decl_type     = 0x51
 let tag_decl_effect   = 0x52
 let tag_decl_module   = 0x53
 let tag_decl_require  = 0x54
+let tag_decl_import   = 0x56
 let tag_program       = 0x55
 
 (* ================================================================== *)

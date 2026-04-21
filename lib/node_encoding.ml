@@ -412,6 +412,13 @@ let rec encode_decl store (d : decl) : bytes =
         put_type_expr buf ty;
         put_comment buf d.decl_comment)
 
+  | DeclImport { module_path; alias } ->
+    build_node store ~tag:tag_decl_import ~children:[]
+      ~write_inline:(fun buf ->
+        put_str buf module_path;
+        put_opt buf put_str alias;
+        put_comment buf d.decl_comment)
+
 (* ================================================================== *)
 (* Program encoder                                                     *)
 (* ================================================================== *)

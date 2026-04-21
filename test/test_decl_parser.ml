@@ -172,6 +172,22 @@ let test_require_decl () =
     (decl (DeclRequire (TyName "Log")))
 
 (* ------------------------------------------------------------------ *)
+(* import declarations                                                  *)
+(* ------------------------------------------------------------------ *)
+
+(* import json_parser *)
+let test_import_decl_bare () =
+  check_decl "import bare"
+    "import json_parser"
+    (decl (DeclImport { module_path = "json_parser"; alias = None }))
+
+(* import http_client as http *)
+let test_import_decl_alias () =
+  check_decl "import with alias"
+    "import http_client as http"
+    (decl (DeclImport { module_path = "http_client"; alias = Some "http" }))
+
+(* ------------------------------------------------------------------ *)
 (* Multi-declaration programs                                           *)
 (* ------------------------------------------------------------------ *)
 
@@ -234,6 +250,10 @@ let () =
         ] )
     ; ( "require",
         [ Alcotest.test_case "Log"             `Quick test_require_decl
+        ] )
+    ; ( "import",
+        [ Alcotest.test_case "bare"            `Quick test_import_decl_bare
+        ; Alcotest.test_case "with alias"      `Quick test_import_decl_alias
         ] )
     ; ( "program",
         [ Alcotest.test_case "two fns"         `Quick test_program_two_fns

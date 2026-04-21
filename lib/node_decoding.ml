@@ -446,6 +446,12 @@ let rec decode_decl lookup hash : decl =
       let decl_comment = get_comment cur in
       (DeclRequire ty, decl_comment)
 
+    | t when t = tag_decl_import ->
+      let module_path = get_str cur in
+      let alias = get_opt cur get_str in
+      let decl_comment = get_comment cur in
+      (DeclImport { module_path; alias }, decl_comment)
+
     | _ -> failwith (Printf.sprintf "Node_decoding: unknown declaration tag 0x%02x" tag)
   in
   { decl_desc; decl_comment }

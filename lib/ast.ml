@@ -498,6 +498,10 @@ and decl_desc =
       body        : decl list;
     }
   | DeclRequire of type_expr
+  | DeclImport of {
+      module_path : string;
+      alias       : string option;
+    }
 
 (** Build a declaration node with no comment. *)
 let decl k = { decl_desc = k; decl_comment = None }
@@ -564,6 +568,10 @@ and pp_decl_desc fmt = function
          pp_decl) body
   | DeclRequire t ->
     Format.fprintf fmt "Require(%a)" pp_type_expr t
+  | DeclImport { module_path; alias } ->
+    (match alias with
+     | None   -> Format.fprintf fmt "Import(%s)" module_path
+     | Some a -> Format.fprintf fmt "Import(%s as %s)" module_path a)
 
 (* ------------------------------------------------------------------ *)
 (* Equality for declarations                                            *)
@@ -608,6 +616,8 @@ and equal_decl_desc a b = match a, b with
     && List.length a.body = List.length b.body
     && List.for_all2 equal_decl a.body b.body
   | DeclRequire a, DeclRequire b -> equal_type_expr a b
+  | DeclImport a, DeclImport b ->
+    a.module_path = b.module_path && a.alias = b.alias
   | _, _ -> false
 
 let equal_program a b =

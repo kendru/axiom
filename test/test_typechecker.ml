@@ -839,6 +839,90 @@ let test_program_record_pattern_unknown_field () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* Module imports                                                       *)
+(* ------------------------------------------------------------------ *)
+
+(* Functions declared in a module are callable via module.fn syntax. *)
+let test_import_qualified_access () =
+  check_program_ok "module qualified access"
+    {|
+      module math {
+        fn add(a: Int, b: Int) -> Int ! pure { a }
+      }
+
+      fn use_it() -> Int ! pure {
+        math.add(1, 2)
+      }
+    |}
+
+(* import M makes M.fn available under M.fn. *)
+let test_import_bare () =
+  check_program_ok "import bare"
+    {|
+      module math {
+        fn add(a: Int, b: Int) -> Int ! pure { a }
+      }
+
+      import math
+
+      fn use_it() -> Int ! pure {
+        math.add(1, 2)
+      }
+    |}
+
+(* import M as alias makes M's functions available as alias.fn. *)
+let test_import_alias () =
+  check_program_ok "import with alias"
+    {|
+      module math {
+        fn add(a: Int, b: Int) -> Int ! pure { a }
+      }
+
+      import math as m
+
+      fn use_it() -> Int ! pure {
+        m.add(1, 2)
+      }
+    |}
+
+(* Importing an unknown module is a type error. *)
+let test_import_unknown_module () =
+  check_program_error "import unknown module"
+    {|
+      import no_such_module
+
+      fn use_it() -> Int ! pure { 42 }
+    |}
+
+(* A module's function called via qualified name with wrong arg type fails. *)
+let test_import_qualified_wrong_type () =
+  check_program_error "qualified call wrong arg type"
+    {|
+      module math {
+        fn add(a: Int, b: Int) -> Int ! pure { a }
+      }
+
+      fn bad() -> Int ! pure {
+        math.add(true, 2)
+      }
+    |}
+
+(* import before module definition (order-independent via pre-pass). *)
+let test_import_before_definition () =
+  check_program_ok "import before definition"
+    {|
+      import math
+
+      fn use_it() -> Int ! pure {
+        math.add(1, 2)
+      }
+
+      module math {
+        fn add(a: Int, b: Int) -> Int ! pure { a }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Parametric type application                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -1022,6 +1106,14 @@ let () =
         ; Alcotest.test_case "program record pattern"    `Quick test_program_record_pattern
         ; Alcotest.test_case "program record pattern types" `Quick test_program_record_pattern_types
         ; Alcotest.test_case "program pattern unknown field" `Quick test_program_record_pattern_unknown_field
+        ] )
+    ; ( "imports",
+        [ Alcotest.test_case "qualified access"          `Quick test_import_qualified_access
+        ; Alcotest.test_case "import bare"               `Quick test_import_bare
+        ; Alcotest.test_case "import alias"              `Quick test_import_alias
+        ; Alcotest.test_case "unknown module"            `Quick test_import_unknown_module
+        ; Alcotest.test_case "qualified wrong type"      `Quick test_import_qualified_wrong_type
+        ; Alcotest.test_case "import before definition"  `Quick test_import_before_definition
         ] )
     ; ( "parametric types",
         [ Alcotest.test_case "distinct params"           `Quick test_tyapp_distinct_params

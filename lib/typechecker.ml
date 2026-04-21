@@ -719,22 +719,36 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr)
                    "Typechecker: record update on non-record type %a" pp_ty t))
 
   | Project (e, field) ->
-    let e_ty = infer_expr_in eenv env ambient e in
-    (match deref e_ty with
-     | TyRecord fields ->
-       (match List.assoc_opt field fields with
-        | Some field_ty -> deref field_ty
-        | None ->
-          failwith (Printf.sprintf
-                      "Typechecker: record has no field '%s'" field))
-     | TyMeta _ ->
-       (* Base type not yet determined; constrain it to contain this field *)
-       let field_ty = fresh_meta () in
-       unify e_ty (TyRecord [(field, field_ty)]);
-       deref field_ty
-     | t ->
-       failwith (Format.asprintf
-                   "Typechecker: field projection applied to non-record type %a" pp_ty t))
+    (* Check for module-qualified access: if e is a bare Var whose name
+       matches a known module, look up "module.field" directly in the env
+       rather than trying to type-check the Var as a standalone value. *)
+    let module_qualified_ty =
+      match e.desc with
+      | Var possible_module ->
+        let qualified = possible_module ^ "." ^ field in
+        (match List.assoc_opt qualified env with
+         | Some scheme -> Some (instantiate scheme)
+         | None        -> None)
+      | _ -> None
+    in
+    (match module_qualified_ty with
+     | Some ty -> ty
+     | None ->
+       let e_ty = infer_expr_in eenv env ambient e in
+       (match deref e_ty with
+        | TyRecord fields ->
+          (match List.assoc_opt field fields with
+           | Some field_ty -> deref field_ty
+           | None ->
+             failwith (Printf.sprintf
+                         "Typechecker: record has no field '%s'" field))
+        | TyMeta _ ->
+          let field_ty = fresh_meta () in
+          unify e_ty (TyRecord [(field, field_ty)]);
+          deref field_ty
+        | t ->
+          failwith (Format.asprintf
+                      "Typechecker: field projection applied to non-record type %a" pp_ty t)))
 
   | Perform { effect_name; op_name; args } ->
     let scheme =
@@ -1015,6 +1029,39 @@ let ctor_scheme_of_type
   in
   { bound = type_params; body }
 
+(** A module registry maps module names to the bare (env, effect_env) of
+    their direct declarations, keyed by unqualified name. Used by
+    [check_program] to resolve [DeclImport] and to register qualified names
+    for [DeclModule]. *)
+type module_registry = (string * (env * effect_env)) list
+
+(** Build the module registry by scanning [prog] for [DeclModule] nodes.
+    Only top-level modules are registered; nested modules are not. *)
+let build_module_registry (prog : program) : module_registry =
+  List.filter_map (fun d ->
+    match d.decl_desc with
+    | DeclModule { module_name; body; _ } ->
+      let collect_body (env, eenv) b =
+        match b.decl_desc with
+        | DeclEffect { effect_name; type_params; ops; _ } ->
+          let scheme = effect_scheme_of_decl type_params ops in
+          (env, (effect_name, scheme) :: eenv)
+        | DeclFn { fn_name; type_params; params; return_type; effects; _ } ->
+          let scheme = fn_scheme_of_decl type_params params return_type effects in
+          ((fn_name, scheme) :: env, eenv)
+        | DeclType { type_name; type_params; ctors; _ } ->
+          let env' = List.fold_left (fun acc ctor ->
+              env_extend ctor.Ast.ctor_name
+                (ctor_scheme_of_type type_name type_params ctor) acc
+            ) env ctors in
+          (env', eenv)
+        | _ -> (env, eenv)
+      in
+      let mod_env, mod_eenv = List.fold_left collect_body ([], []) body in
+      Some (module_name, (mod_env, mod_eenv))
+    | _ -> None
+  ) prog
+
 (** [check_program prog] type-checks a whole program in two passes:
 
     Pass 1 walks every declaration and builds:
@@ -1040,6 +1087,19 @@ let ctor_scheme_of_type
     Returns the populated [(env, effect_env)] for reuse in tests and
     downstream tooling. Raises [Failure] on type errors. *)
 let check_program (prog : program) : env * effect_env =
+  let module_registry = build_module_registry prog in
+  (* [add_qualified prefix mod_env mod_eenv env eenv] folds [mod_env] and
+     [mod_eenv] into [env] and [eenv], prepending [prefix ^ "."] to each key. *)
+  let add_qualified prefix mod_env mod_eenv env eenv =
+    let qualify name = prefix ^ "." ^ name in
+    let env' = List.fold_left
+        (fun acc (name, scheme) -> env_extend (qualify name) scheme acc)
+        env mod_env in
+    let eenv' = List.fold_left
+        (fun acc (name, scheme) -> (qualify name, scheme) :: acc)
+        eenv mod_eenv in
+    (env', eenv')
+  in
   let rec collect (env, eenv) d =
     match d.decl_desc with
     | DeclEffect { effect_name; type_params; ops; _ } ->
@@ -1055,8 +1115,23 @@ let check_program (prog : program) : env * effect_env =
             acc
         ) env ctors in
       (env', eenv)
-    | DeclModule { body; _ } ->
-      List.fold_left collect (env, eenv) body
+    | DeclModule { module_name; body; _ } ->
+      (* Fold body into the flat env with bare names (existing behaviour). *)
+      let env', eenv' = List.fold_left collect (env, eenv) body in
+      (* Also register each declaration under module_name.name so callers
+         can access them via qualified syntax (module_name.fn). *)
+      (match List.assoc_opt module_name module_registry with
+       | None -> (env', eenv')
+       | Some (mod_env, mod_eenv) ->
+         add_qualified module_name mod_env mod_eenv env' eenv')
+    | DeclImport { module_path; alias } ->
+      let prefix = match alias with Some a -> a | None -> module_path in
+      (match List.assoc_opt module_path module_registry with
+       | None ->
+         failwith (Printf.sprintf
+                     "Typechecker: unknown module '%s' in import" module_path)
+       | Some (mod_env, mod_eenv) ->
+         add_qualified prefix mod_env mod_eenv env eenv)
     | DeclRequire _ ->
       (env, eenv)
   in
@@ -1081,7 +1156,7 @@ let check_program (prog : program) : env * effect_env =
        | None   -> ())
     | DeclModule { body; _ } ->
       List.iter check_decl body
-    | _ -> ()
+    | DeclImport _ | DeclRequire _ | DeclEffect _ | DeclType _ -> ()
   in
   List.iter check_decl prog;
   (env0, eenv0)

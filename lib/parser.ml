@@ -719,6 +719,26 @@ let rec parse_decl (st : state) : Ast.decl =
       let t = parse_type_expr st in
       Ast.decl (DeclRequire t)
 
+    | Some Import ->
+      advance st;
+      let module_path = match peek st with
+        | Some (Ident s) -> advance st; s
+        | Some t ->
+          failwith (Format.asprintf "Parser: expected module name after 'import', got %a" pp_token t)
+        | None -> failwith "Parser: expected module name after 'import'"
+      in
+      let alias = match peek st with
+        | Some As ->
+          advance st;
+          (match peek st with
+           | Some (Ident s) -> advance st; Some s
+           | Some t ->
+             failwith (Format.asprintf "Parser: expected alias after 'as', got %a" pp_token t)
+           | None -> failwith "Parser: expected alias after 'as'")
+        | _ -> None
+      in
+      Ast.decl (DeclImport { module_path; alias })
+
     | Some t ->
       failwith (Format.asprintf "Parser: expected declaration, got %a" pp_token t)
     | None ->

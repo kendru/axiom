@@ -15,6 +15,7 @@ let rec strip_rows = function
   | TyForall (v, t) -> TyForall (v, strip_rows t)
   | TyMeta { inst = Some t; _ } -> strip_rows t
   | TyMeta _ as m -> m
+  | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, strip_rows t)) fields)
 
 let infer_of src =
   let tokens = Axiom_lib.Lexer.tokenize src in
@@ -709,6 +710,134 @@ let test_module_body_type_error () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* Record type inference                                                *)
+(* ------------------------------------------------------------------ *)
+
+(* { x: 42, y: true } infers as {x: Int, y: Bool} *)
+let test_record_literal_type () =
+  check_ty "record literal type"
+    "{ x: 42, y: true }"
+    (TyRecord [("x", TyCon "Int"); ("y", TyCon "Bool")])
+
+(* Single-field record *)
+let test_record_single_field () =
+  check_ty "single-field record"
+    "{ msg: \"hello\" }"
+    (TyRecord [("msg", TyCon "String")])
+
+(* let r = { x: 42 } in r.x  =>  Int *)
+let test_project_field_type () =
+  check_ty "project field type"
+    "let r = { x: 42 } in r.x"
+    (TyCon "Int")
+
+(* let r = { x: 42, y: true } in r.y  =>  Bool *)
+let test_project_second_field () =
+  check_ty "project second field"
+    "let r = { x: 42, y: true } in r.y"
+    (TyCon "Bool")
+
+(* Projecting a nonexistent field is a type error *)
+let test_project_unknown_field () =
+  check_ty_error "project unknown field"
+    "let r = { x: 42 } in r.z"
+
+(* Record update preserves type: { r with x: 99 } still has the same record type *)
+let test_record_update_type () =
+  check_ty "record update type"
+    "let r = { x: 42 } in { r with x: 99 }"
+    (TyRecord [("x", TyCon "Int")])
+
+(* Record update with wrong field type is a type error *)
+let test_record_update_type_mismatch () =
+  check_ty_error "record update type mismatch"
+    {|let r = { x: 42 } in { r with x: "oops" }|}
+
+(* Record update targeting a nonexistent field is a type error *)
+let test_record_update_unknown_field () =
+  check_ty_error "record update unknown field"
+    "let r = { x: 42 } in { r with z: 99 }"
+
+(* Projecting a non-record type is a type error *)
+let test_project_non_record () =
+  check_ty_error "project on non-record"
+    "let n = 42 in n.x"
+
+(* Record unification: two records with different fields don't unify *)
+let test_record_field_set_mismatch () =
+  check_ty_error "record field set mismatch"
+    {|if true { { x: 1 } } else { { y: 1 } }|}
+
+(* Records with same fields but different value types don't unify *)
+let test_record_field_type_mismatch () =
+  check_ty_error "record field type mismatch"
+    {|if true { { x: 42 } } else { { x: "hi" } }|}
+
+(* Records with same fields and same types do unify *)
+let test_record_unify_same () =
+  check_ty "record same-type unify"
+    {|if true { { x: 1, y: 2 } } else { { x: 3, y: 4 } }|}
+    (TyRecord [("x", TyCon "Int"); ("y", TyCon "Int")])
+
+(* Program-level: function that builds and returns a record *)
+let test_program_record_return () =
+  check_program_ok "function returns record"
+    {|
+      fn make_pair() -> Unit ! pure {
+        let r = { x: 1, y: 2 } in
+        let _x = r.x in
+        ()
+      }
+    |}
+
+(* Program-level: record update in a function body *)
+let test_program_record_update () =
+  check_program_ok "record update in function"
+    {|
+      fn bump() -> Unit ! pure {
+        let r = { count: 0 } in
+        let _r2 = { r with count: 1 } in
+        ()
+      }
+    |}
+
+(* Program-level: record pattern in match *)
+let test_program_record_pattern () =
+  check_program_ok "record pattern match"
+    {|
+      fn get_x() -> Int ! pure {
+        let r = { x: 42, y: true } in
+        match r with {
+          | { x = n, y = _ } => n
+        }
+      }
+    |}
+
+(* Record pattern binds variables with the correct field types *)
+let test_program_record_pattern_types () =
+  check_program_ok "record pattern field types"
+    {|
+      fn check() -> Int ! pure {
+        let r = { x: 42, y: true } in
+        match r with {
+          | { x = n, y = _ } => n
+        }
+      }
+    |}
+
+(* Record pattern mentioning an unknown field is a type error *)
+let test_program_record_pattern_unknown_field () =
+  check_program_error "record pattern unknown field"
+    {|
+      fn bad() -> Int ! pure {
+        let r = { x: 42 } in
+        match r with {
+          | { z = n } => n
+        }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -793,4 +922,23 @@ let () =
         ; Alcotest.test_case "handler discharges effect"    `Quick test_row_handler_discharges_effect
         ; Alcotest.test_case "State param shared"           `Quick test_row_state_shared_param
         ; Alcotest.test_case "handler translates effect"    `Quick test_row_handler_translates_effect
+        ] )
+    ; ( "records",
+        [ Alcotest.test_case "literal type"              `Quick test_record_literal_type
+        ; Alcotest.test_case "single field"              `Quick test_record_single_field
+        ; Alcotest.test_case "project field"             `Quick test_project_field_type
+        ; Alcotest.test_case "project second field"      `Quick test_project_second_field
+        ; Alcotest.test_case "project unknown field"     `Quick test_project_unknown_field
+        ; Alcotest.test_case "update type"               `Quick test_record_update_type
+        ; Alcotest.test_case "update type mismatch"      `Quick test_record_update_type_mismatch
+        ; Alcotest.test_case "update unknown field"      `Quick test_record_update_unknown_field
+        ; Alcotest.test_case "project non-record"        `Quick test_project_non_record
+        ; Alcotest.test_case "field set mismatch"        `Quick test_record_field_set_mismatch
+        ; Alcotest.test_case "field type mismatch"       `Quick test_record_field_type_mismatch
+        ; Alcotest.test_case "unify same fields"         `Quick test_record_unify_same
+        ; Alcotest.test_case "program record return"     `Quick test_program_record_return
+        ; Alcotest.test_case "program record update"     `Quick test_program_record_update
+        ; Alcotest.test_case "program record pattern"    `Quick test_program_record_pattern
+        ; Alcotest.test_case "program record pattern types" `Quick test_program_record_pattern_types
+        ; Alcotest.test_case "program pattern unknown field" `Quick test_program_record_pattern_unknown_field
         ] ) ]

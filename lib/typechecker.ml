@@ -35,6 +35,7 @@ type ty =
   | TyFun    of ty * ty * row   (** A -> B ! ε (curried) *)
   | TyForall of string * ty     (** forall a. T  (generalized) *)
   | TyMeta   of meta_var        (** unification variable *)
+  | TyRecord of (string * ty) list (** structural record type: {f1: T1, f2: T2, ...} *)
 
 and meta_var = {
   id       : int;
@@ -75,6 +76,12 @@ let rec pp_ty fmt = function
     (match mv.inst with
      | Some t -> pp_ty fmt t
      | None   -> Format.fprintf fmt "?%d" mv.id)
+  | TyRecord fields ->
+    let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) fields in
+    Format.fprintf fmt "{%a}"
+      (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
+         (fun fmt (name, ty) -> Format.fprintf fmt "%s: %a" name pp_ty ty))
+      sorted
 
 and pp_row fmt = function
   | RPure -> Format.pp_print_string fmt "pure"
@@ -120,6 +127,11 @@ let rec equal_ty a b = match a, b with
   (* Dereference metas *)
   | TyMeta { inst = Some t; _ }, other
   | other, TyMeta { inst = Some t; _ } -> equal_ty t other
+  | TyRecord fa,  TyRecord fb  ->
+    let sort f = List.sort (fun (a, _) (b, _) -> String.compare a b) f in
+    let fa' = sort fa and fb' = sort fb in
+    List.length fa' = List.length fb'
+    && List.for_all2 (fun (na, ta) (nb, tb) -> na = nb && equal_ty ta tb) fa' fb'
   | _, _ -> false
 
 and equal_row a b = match a, b with
@@ -199,6 +211,8 @@ let rec free_metas acc = function
     (match mv.inst with
      | None   -> mv :: acc
      | Some t -> free_metas acc t)
+  | TyRecord fields ->
+    List.fold_left (fun acc (_, t) -> free_metas acc t) acc fields
 
 and free_row_ty_metas acc = function
   | RPure -> acc
@@ -221,6 +235,8 @@ let rec free_row_metas acc = function
     (match mv.inst with
      | None   -> acc
      | Some t -> free_row_metas acc t)
+  | TyRecord fields ->
+    List.fold_left (fun acc (_, t) -> free_row_metas acc t) acc fields
 
 and free_row_metas_row acc = function
   | RPure -> acc
@@ -283,6 +299,20 @@ let rec unify a b =
     if occurs_check mv t
     then failwith "Typechecker: occurs check failed (infinite type)"
     else mv.inst <- Some t
+  | TyRecord fa, TyRecord fb ->
+    let sort f = List.sort (fun (a, _) (b, _) -> String.compare a b) f in
+    let fa' = sort fa and fb' = sort fb in
+    if List.length fa' <> List.length fb' then
+      failwith (Format.asprintf
+                  "Typechecker: cannot unify record types with different fields: %a vs %a"
+                  pp_ty (TyRecord fa) pp_ty (TyRecord fb))
+    else
+      List.iter2 (fun (na, ta) (nb, tb) ->
+          if na <> nb then
+            failwith (Printf.sprintf
+                        "Typechecker: record field name mismatch: '%s' vs '%s'" na nb)
+          else unify ta tb)
+        fa' fb'
   | a, b ->
     failwith (Format.asprintf "Typechecker: cannot unify %a with %a" pp_ty a pp_ty b)
 
@@ -357,6 +387,7 @@ and subst_ty subs = function
     let subs' = List.filter (fun (x, _) -> x <> v) subs in
     TyForall (v, subst_ty subs' t)
   | TyMeta _ as m -> m
+  | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, subst_ty subs t)) fields)
 
 (** Replace all bound type variables in a scheme with fresh metas, and
     re-open every TyFun row along the way with a fresh row meta tail.
@@ -400,6 +431,7 @@ let generalize env ty =
       | TyVar _ as v    -> v
       | TyFun (a, b, r) -> TyFun (go a, go b, go_row r)
       | TyForall (v, u) -> TyForall (v, go u)
+      | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, go t)) fields)
     and go_row = function
       | RPure -> RPure
       | RCons (e, rest) ->
@@ -488,6 +520,7 @@ let rec subst_tyvars subs t =
       let subs' = List.filter (fun (x, _) -> x <> v) subs in
       TyForall (v, subst_tyvars subs' t)
     | TyMeta _ as m -> m
+    | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, go t)) fields)
   and go_row = function
     | RPure -> RPure
     | RCons (e, rest) ->
@@ -635,19 +668,49 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr)
     deref result_ty
 
   | Record fields ->
-    (* Record types are nominal/structural — deferred until kind system.
-       Infer field types for side-effects (catches unbound vars), return a fresh meta. *)
-    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env ambient e)) fields;
-    fresh_meta ()
+    let field_tys = List.map (fun (name, e) ->
+        (name, infer_expr_in eenv env ambient e)) fields in
+    TyRecord field_tys
 
-  | RecordUpdate (base, fields) ->
-    let _base_ty = infer_expr_in eenv env ambient base in
-    List.iter (fun (_, e) -> ignore (infer_expr_in eenv env ambient e)) fields;
-    fresh_meta ()
+  | RecordUpdate (base, updates) ->
+    let base_ty = infer_expr_in eenv env ambient base in
+    (match deref base_ty with
+     | TyRecord base_fields ->
+       List.iter (fun (name, _) ->
+           if not (List.mem_assoc name base_fields) then
+             failwith (Printf.sprintf
+                         "Typechecker: record update targets unknown field '%s'" name)
+         ) updates;
+       List.iter (fun (name, e) ->
+           let update_ty = infer_expr_in eenv env ambient e in
+           unify update_ty (List.assoc name base_fields)
+         ) updates;
+       base_ty
+     | TyMeta _ ->
+       (* Base type not yet determined; infer updates for side-effects *)
+       List.iter (fun (_, e) -> ignore (infer_expr_in eenv env ambient e)) updates;
+       base_ty
+     | t ->
+       failwith (Format.asprintf
+                   "Typechecker: record update on non-record type %a" pp_ty t))
 
-  | Project (e, _field) ->
-    ignore (infer_expr_in eenv env ambient e);
-    fresh_meta ()
+  | Project (e, field) ->
+    let e_ty = infer_expr_in eenv env ambient e in
+    (match deref e_ty with
+     | TyRecord fields ->
+       (match List.assoc_opt field fields with
+        | Some field_ty -> deref field_ty
+        | None ->
+          failwith (Printf.sprintf
+                      "Typechecker: record has no field '%s'" field))
+     | TyMeta _ ->
+       (* Base type not yet determined; constrain it to contain this field *)
+       let field_ty = fresh_meta () in
+       unify e_ty (TyRecord [(field, field_ty)]);
+       deref field_ty
+     | t ->
+       failwith (Format.asprintf
+                   "Typechecker: field projection applied to non-record type %a" pp_ty t))
 
   | Perform { effect_name; op_name; args } ->
     let scheme =
@@ -827,8 +890,31 @@ and env_from_pattern env (p : pattern) scrut_ty =
                      name n_args n_pats);
        List.fold_left2 (fun e p t -> env_from_pattern e p t)
          env sub_pats arg_tys)
-  | PRecord (fields, _) ->
-    List.fold_left (fun e (_, p) -> env_from_pattern e p (fresh_meta ())) env fields
+  | PRecord (fields, is_open) ->
+    let field_tys =
+      match deref scrut_ty with
+      | TyRecord record_fields ->
+        List.map (fun (name, _) ->
+            match List.assoc_opt name record_fields with
+            | Some ty -> (name, ty)
+            | None ->
+              failwith (Printf.sprintf
+                          "Typechecker: record pattern mentions unknown field '%s'" name)
+          ) fields
+      | TyMeta _ ->
+        (* Scrutinee type not yet known; create fresh field metas *)
+        let fresh_fields = List.map (fun (name, _) -> (name, fresh_meta ())) fields in
+        (* A closed pattern fully determines the record's shape *)
+        if not is_open then
+          unify scrut_ty (TyRecord fresh_fields);
+        fresh_fields
+      | t ->
+        failwith (Format.asprintf
+                    "Typechecker: record pattern applied to non-record type %a" pp_ty t)
+    in
+    List.fold_left2 (fun e (_, sub_pat) (_, field_ty) ->
+        env_from_pattern e sub_pat field_ty)
+      env fields field_tys
   | POr (p1, _p2) ->
     (* Both branches bind the same variables; use p1 *)
     env_from_pattern env p1 scrut_ty

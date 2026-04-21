@@ -16,6 +16,7 @@ let rec strip_rows = function
   | TyMeta { inst = Some t; _ } -> strip_rows t
   | TyMeta _ as m -> m
   | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, strip_rows t)) fields)
+  | TyApp (name, args) -> TyApp (name, List.map strip_rows args)
 
 let infer_of src =
   let tokens = Axiom_lib.Lexer.tokenize src in
@@ -661,7 +662,7 @@ let test_decl_type_parametric_ctor () =
     {|
       type Option<a> = | Some(a) | None
 
-      fn get_or_zero(opt: Option) -> Int ! pure {
+      fn get_or_zero(opt: Option<Int>) -> Int ! pure {
         match opt with {
           | Some(x) => x
           | None    => 0
@@ -675,7 +676,7 @@ let test_decl_type_ctor_pattern_arity () =
     {|
       type Option<a> = | Some(a) | None
 
-      fn bad(opt: Option) -> Int ! pure {
+      fn bad(opt: Option<Int>) -> Int ! pure {
         match opt with {
           | Some(x, y) => 0
           | None       => 1
@@ -838,6 +839,86 @@ let test_program_record_pattern_unknown_field () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* Parametric type application                                          *)
+(* ------------------------------------------------------------------ *)
+
+(* Option<Int> and Option<Bool> are distinct types. *)
+let test_tyapp_distinct_params () =
+  check_program_error "Option<Int> ≠ Option<Bool>"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn bad(x: Option<Int>) -> Option<Bool> ! pure { x }
+    |}
+
+(* Constructing Some(42) where Option<Bool> is expected is a type error. *)
+let test_tyapp_ctor_wrong_param () =
+  check_program_error "Some(42) where Option<Bool> expected"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn bad() -> Option<Bool> ! pure { Some(42) }
+    |}
+
+(* Round-trip through a parameterized return type. *)
+let test_tyapp_return_type () =
+  check_program_ok "Option<Int> return type"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn wrap(n: Int) -> Option<Int> ! pure { Some(n) }
+    |}
+
+(* Nested type application: Option<Option<Int>>. *)
+let test_tyapp_nested () =
+  check_program_ok "Option<Option<Int>>"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn double_wrap(n: Int) -> Option<Option<Int>> ! pure {
+        Some(Some(n))
+      }
+    |}
+
+(* Two-parameter type: Result<a, e>. *)
+let test_tyapp_two_params () =
+  check_program_ok "Result<Int, String>"
+    {|
+      type Result<a, e> = | Ok(a) | Err(e)
+
+      fn make_ok(n: Int) -> Result<Int, String> ! pure { Ok(n) }
+      fn make_err(s: String) -> Result<Int, String> ! pure { Err(s) }
+    |}
+
+(* Mixing Ok and Err branches in a match must agree on the result type. *)
+let test_tyapp_result_match () =
+  check_program_ok "match Result arms"
+    {|
+      type Result<a, e> = | Ok(a) | Err(e)
+
+      fn unwrap_or(r: Result<Int, String>, default: Int) -> Int ! pure {
+        match r with {
+          | Ok(x)  => x
+          | Err(_) => default
+        }
+      }
+    |}
+
+(* Using the wrong type in an Ok arm is a type error. *)
+let test_tyapp_result_arm_mismatch () =
+  check_program_error "Result arm type mismatch"
+    {|
+      type Result<a, e> = | Ok(a) | Err(e)
+
+      fn bad(r: Result<Int, String>) -> Int ! pure {
+        match r with {
+          | Ok(x)  => x
+          | Err(s) => s
+        }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -941,4 +1022,13 @@ let () =
         ; Alcotest.test_case "program record pattern"    `Quick test_program_record_pattern
         ; Alcotest.test_case "program record pattern types" `Quick test_program_record_pattern_types
         ; Alcotest.test_case "program pattern unknown field" `Quick test_program_record_pattern_unknown_field
+        ] )
+    ; ( "parametric types",
+        [ Alcotest.test_case "distinct params"           `Quick test_tyapp_distinct_params
+        ; Alcotest.test_case "ctor wrong param"          `Quick test_tyapp_ctor_wrong_param
+        ; Alcotest.test_case "Option<Int> return"        `Quick test_tyapp_return_type
+        ; Alcotest.test_case "nested TyApp"              `Quick test_tyapp_nested
+        ; Alcotest.test_case "two-param Result"          `Quick test_tyapp_two_params
+        ; Alcotest.test_case "Result match arms"         `Quick test_tyapp_result_match
+        ; Alcotest.test_case "Result arm mismatch"       `Quick test_tyapp_result_arm_mismatch
         ] ) ]

@@ -36,6 +36,7 @@ type ty =
   | TyForall of string * ty     (** forall a. T  (generalized) *)
   | TyMeta   of meta_var        (** unification variable *)
   | TyRecord of (string * ty) list (** structural record type: {f1: T1, f2: T2, ...} *)
+  | TyApp    of string * ty list (** parameterized type: Option<Int>, List<a>, Map<K,V> *)
 
 and meta_var = {
   id       : int;
@@ -82,6 +83,11 @@ let rec pp_ty fmt = function
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
          (fun fmt (name, ty) -> Format.fprintf fmt "%s: %a" name pp_ty ty))
       sorted
+  | TyApp (name, args) ->
+    Format.fprintf fmt "%s<%a>" name
+      (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
+         pp_ty)
+      args
 
 and pp_row fmt = function
   | RPure -> Format.pp_print_string fmt "pure"
@@ -132,6 +138,9 @@ let rec equal_ty a b = match a, b with
     let fa' = sort fa and fb' = sort fb in
     List.length fa' = List.length fb'
     && List.for_all2 (fun (na, ta) (nb, tb) -> na = nb && equal_ty ta tb) fa' fb'
+  | TyApp (n1, a1), TyApp (n2, a2) ->
+    n1 = n2 && List.length a1 = List.length a2
+    && List.for_all2 equal_ty a1 a2
   | _, _ -> false
 
 and equal_row a b = match a, b with
@@ -213,6 +222,8 @@ let rec free_metas acc = function
      | Some t -> free_metas acc t)
   | TyRecord fields ->
     List.fold_left (fun acc (_, t) -> free_metas acc t) acc fields
+  | TyApp (_, args) ->
+    List.fold_left free_metas acc args
 
 and free_row_ty_metas acc = function
   | RPure -> acc
@@ -237,6 +248,8 @@ let rec free_row_metas acc = function
      | Some t -> free_row_metas acc t)
   | TyRecord fields ->
     List.fold_left (fun acc (_, t) -> free_row_metas acc t) acc fields
+  | TyApp (_, args) ->
+    List.fold_left free_row_metas acc args
 
 and free_row_metas_row acc = function
   | RPure -> acc
@@ -313,6 +326,14 @@ let rec unify a b =
                         "Typechecker: record field name mismatch: '%s' vs '%s'" na nb)
           else unify ta tb)
         fa' fb'
+  | TyApp (n1, a1), TyApp (n2, a2) ->
+    if n1 <> n2 then
+      failwith (Format.asprintf
+                  "Typechecker: cannot unify %a with %a" pp_ty (TyApp (n1, a1)) pp_ty (TyApp (n2, a2)));
+    if List.length a1 <> List.length a2 then
+      failwith (Format.asprintf
+                  "Typechecker: type constructor %s applied to wrong number of arguments" n1);
+    List.iter2 unify a1 a2
   | a, b ->
     failwith (Format.asprintf "Typechecker: cannot unify %a with %a" pp_ty a pp_ty b)
 
@@ -388,6 +409,7 @@ and subst_ty subs = function
     TyForall (v, subst_ty subs' t)
   | TyMeta _ as m -> m
   | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, subst_ty subs t)) fields)
+  | TyApp (name, args) -> TyApp (name, List.map (subst_ty subs) args)
 
 (** Replace all bound type variables in a scheme with fresh metas, and
     re-open every TyFun row along the way with a fresh row meta tail.
@@ -432,6 +454,7 @@ let generalize env ty =
       | TyFun (a, b, r) -> TyFun (go a, go b, go_row r)
       | TyForall (v, u) -> TyForall (v, go u)
       | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, go t)) fields)
+      | TyApp (name, args) -> TyApp (name, List.map go args)
     and go_row = function
       | RPure -> RPure
       | RCons (e, rest) ->
@@ -463,7 +486,7 @@ let rec ty_of_type_expr = function
   | TyName s when String.length s > 0 && s.[0] >= 'a' && s.[0] <= 'z' ->
     TyVar s
   | TyName s  -> TyCon s
-  | TyApp (s, _args) -> TyCon s
+  | TyApp (s, args) -> TyApp (s, List.map ty_of_type_expr args)
   | TyTuple _ -> fresh_meta ()    (* tuple types deferred *)
   | TyFun (param_tys, ret, eff) ->
     let ret_ty = ty_of_type_expr ret in
@@ -521,6 +544,7 @@ let rec subst_tyvars subs t =
       TyForall (v, subst_tyvars subs' t)
     | TyMeta _ as m -> m
     | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, go t)) fields)
+    | TyApp (name, args) -> TyApp (name, List.map go args)
   and go_row = function
     | RPure -> RPure
     | RCons (e, rest) ->
@@ -600,7 +624,7 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr)
        (e.g. 'a') maps to the same meta across all param annotations. *)
     let tv_table : (string * ty) list ref = ref [] in
     let freshen_type_expr ty_expr =
-      let go = function
+      let rec go = function
         | TyName s when String.length s > 0 && s.[0] >= 'a' && s.[0] <= 'z' ->
           (match List.assoc_opt s !tv_table with
            | Some m -> m
@@ -608,7 +632,7 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr)
              let m = fresh_meta () in
              tv_table := (s, m) :: !tv_table; m)
         | TyName s            -> TyCon s
-        | TyApp (s, _)        -> TyCon s
+        | TyApp (s, args)     -> TyApp (s, List.map go args)
         | TyTuple _ | TyFun _ -> fresh_meta ()
       in
       go ty_expr
@@ -976,7 +1000,10 @@ let ctor_scheme_of_type
     (type_params : string list)
     (ctor        : Ast.ctor_decl)
   : scheme =
-  let ret_ty    = TyCon type_name in
+  let ret_ty =
+    if type_params = [] then TyCon type_name
+    else TyApp (type_name, List.map (fun v -> TyVar v) type_params)
+  in
   let param_tys = List.map ty_of_type_expr ctor.ctor_params in
   let body = match List.rev param_tys with
     | [] -> ret_ty

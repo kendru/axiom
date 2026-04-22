@@ -1,6 +1,6 @@
 (library
  (name axiom_lib)
- (modules lexer ast parser typechecker node_hash node_tag node_encoding node_decoding node_store)
+ (modules lexer ast parser printer typechecker node_hash node_tag node_encoding node_decoding node_store)
  (libraries unix)
  (foreign_stubs
   (language c)

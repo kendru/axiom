@@ -32,3 +32,8 @@
  (name test_node_store)
  (modules test_node_store)
  (libraries axiom_lib alcotest unix))
+
+(test
+ (name test_printer)
+ (modules test_printer)
+ (libraries axiom_lib alcotest))

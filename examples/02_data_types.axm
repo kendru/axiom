@@ -137,8 +137,8 @@ fn tree_depth<a>(t: Tree<a>) -> Int ! pure {
 
 fn tree_map<a, b>(f: (x: a) -> b ! pure, t: Tree<a>) -> Tree<b> ! pure {
   match t with {
-    | Leaf => leaf()
-    | Node(l, v, r) => node(tree_map(f, l), f(v), tree_map(f, r))
+    | Leaf => Leaf
+    | Node(l, v, r) => Node(tree_map(f, l), f(v), tree_map(f, r))
   }
 }
 
@@ -176,6 +176,6 @@ fn non_empty_to_list<a>(ne: NonEmpty<a>) -> List<a> ! pure {
 fn from_list<a>(xs: List<a>) -> Option<NonEmpty<a>> ! pure {
   match xs with {
     | Nil => none()
-    | Cons(h, t) => some(non_empty(h, t))
+    | Cons(h, t) => some(NonEmpty(h, t))
   }
 }

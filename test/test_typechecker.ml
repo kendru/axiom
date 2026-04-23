@@ -1189,6 +1189,159 @@ let test_exhaustive_record_open_pattern () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* Standard library — built-in functions and types                      *)
+(* ------------------------------------------------------------------ *)
+
+(* Arithmetic builtins are in scope without any declaration. *)
+let test_stdlib_add () =
+  check_program_ok "add is a builtin"
+    {| fn f(x: Int, y: Int) -> Int ! pure { add(x, y) } |}
+
+let test_stdlib_mul () =
+  check_program_ok "mul is a builtin"
+    {| fn f(x: Int, y: Int) -> Int ! pure { mul(x, y) } |}
+
+let test_stdlib_sub () =
+  check_program_ok "sub is a builtin"
+    {| fn f(x: Int, y: Int) -> Int ! pure { sub(x, y) } |}
+
+let test_stdlib_neg () =
+  check_program_ok "neg is a builtin"
+    {| fn f(x: Int) -> Int ! pure { neg(x) } |}
+
+(* Comparison builtins are polymorphic: they work on any type. *)
+let test_stdlib_lt_int () =
+  check_program_ok "lt on Int"
+    {| fn f(x: Int, y: Int) -> Bool ! pure { lt(x, y) } |}
+
+let test_stdlib_eq_string () =
+  check_program_ok "eq on String"
+    {| fn f(s: String, t: String) -> Bool ! pure { eq(s, t) } |}
+
+(* concat works on strings. *)
+let test_stdlib_concat () =
+  check_program_ok "concat is a builtin"
+    {| fn f(s: String, t: String) -> String ! pure { concat(s, t) } |}
+
+(* div carries DivByZero in its effect row. *)
+let test_stdlib_div_effect () =
+  check_program_ok "div in DivByZero ambient"
+    {| fn f(x: Int, y: Int) -> Int ! {DivByZero} { div(x, y) } |}
+
+(* Calling div in a pure context is a type error. *)
+let test_stdlib_div_pure_error () =
+  check_program_error "div in pure context fails"
+    {| fn f(x: Int, y: Int) -> Int ! pure { div(x, y) } |}
+
+(* nil() produces a List without a local type declaration. *)
+let test_stdlib_nil () =
+  check_program_ok "nil produces List"
+    {| fn f<a>() -> List<a> ! pure { nil() } |}
+
+(* cons builds a list. *)
+let test_stdlib_cons () =
+  check_program_ok "cons builds List"
+    {| fn f(x: Int, xs: List<Int>) -> List<Int> ! pure { cons(x, xs) } |}
+
+(* none() and some() work without declaring Option. *)
+let test_stdlib_none () =
+  check_program_ok "none produces Option"
+    {| fn f<a>() -> Option<a> ! pure { none() } |}
+
+let test_stdlib_some () =
+  check_program_ok "some wraps a value"
+    {| fn f(x: Int) -> Option<Int> ! pure { some(x) } |}
+
+(* ok and err produce Result values. *)
+let test_stdlib_ok () =
+  check_program_ok "ok produces Result"
+    {| fn f<e>(x: Int) -> Result<Int, e> ! pure { ok(x) } |}
+
+let test_stdlib_err () =
+  check_program_ok "err produces Result"
+    {| fn f<a>(s: String) -> Result<a, String> ! pure { err(s) } |}
+
+(* max is polymorphic. *)
+let test_stdlib_max () =
+  check_program_ok "max on Int"
+    {| fn f(x: Int, y: Int) -> Int ! pure { max(x, y) } |}
+
+(* Nil/Cons constructors are in scope for pattern matching without declaration. *)
+let test_stdlib_list_pattern () =
+  check_program_ok "List pattern without declaration"
+    {|
+      fn first<a>(xs: List<a>) -> Option<a> ! pure {
+        match xs with {
+          | Nil      => none()
+          | Cons(h, _) => some(h)
+        }
+      }
+    |}
+
+(* examples/01_basics.axm type-checks with the stdlib in place. *)
+let test_stdlib_example_01 () =
+  let src = {|
+    type Point = | Point(Int, Int)
+
+    fn square(x: Int) -> Int ! pure { mul(x, x) }
+
+    fn abs(x: Int) -> Int ! pure {
+      if lt(x, 0) { neg(x) } else { x }
+    }
+
+    fn greet(name: String) -> String ! pure {
+      do {
+        let greeting = concat("Hello, ", name);
+        let message = concat(greeting, "!");
+        message
+      }
+    }
+
+    fn first_match<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Option<a> ! pure {
+      match xs with {
+        | Nil => none()
+        | Cons(h, t) => if pred(h) { some(h) } else { first_match(pred, t) }
+      }
+    }
+  |} in
+  check_program_ok "01_basics core functions" src
+
+(* examples/02_data_types.axm core List functions type-check with the stdlib. *)
+let test_stdlib_example_02_list () =
+  check_program_ok "02_data_types List functions"
+    {|
+      type List<a> = | Nil | Cons(a, List<a>)
+
+      fn length<a>(xs: List<a>) -> Int ! pure {
+        match xs with {
+          | Nil => 0
+          | Cons(_, t) => add(1, length(t))
+        }
+      }
+
+      fn map<a, b>(f: (x: a) -> b ! pure, xs: List<a>) -> List<b> ! pure {
+        match xs with {
+          | Nil => nil()
+          | Cons(h, t) => cons(f(h), map(f, t))
+        }
+      }
+    |}
+
+(* examples/02_data_types.axm Result helpers type-check with the stdlib. *)
+let test_stdlib_example_02_result () =
+  check_program_ok "02_data_types Result functions"
+    {|
+      type Result<a, e> = | Ok(a) | Err(e)
+
+      fn map_result<a, b, e>(f: (x: a) -> b ! pure, r: Result<a, e>) -> Result<b, e> ! pure {
+        match r with {
+          | Ok(x) => ok(f(x))
+          | Err(e) => err(e)
+        }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -1326,4 +1479,26 @@ let () =
         ; Alcotest.test_case "record literal field"      `Quick test_exhaustive_record_literal_field
         ; Alcotest.test_case "record multi-pattern"      `Quick test_exhaustive_record_multi_pattern
         ; Alcotest.test_case "record open pattern"       `Quick test_exhaustive_record_open_pattern
+        ] )
+    ; ( "stdlib",
+        [ Alcotest.test_case "add"                       `Quick test_stdlib_add
+        ; Alcotest.test_case "mul"                       `Quick test_stdlib_mul
+        ; Alcotest.test_case "sub"                       `Quick test_stdlib_sub
+        ; Alcotest.test_case "neg"                       `Quick test_stdlib_neg
+        ; Alcotest.test_case "lt on Int"                 `Quick test_stdlib_lt_int
+        ; Alcotest.test_case "eq on String"              `Quick test_stdlib_eq_string
+        ; Alcotest.test_case "concat"                    `Quick test_stdlib_concat
+        ; Alcotest.test_case "div carries DivByZero"     `Quick test_stdlib_div_effect
+        ; Alcotest.test_case "div pure error"            `Quick test_stdlib_div_pure_error
+        ; Alcotest.test_case "nil"                       `Quick test_stdlib_nil
+        ; Alcotest.test_case "cons"                      `Quick test_stdlib_cons
+        ; Alcotest.test_case "none"                      `Quick test_stdlib_none
+        ; Alcotest.test_case "some"                      `Quick test_stdlib_some
+        ; Alcotest.test_case "ok"                        `Quick test_stdlib_ok
+        ; Alcotest.test_case "err"                       `Quick test_stdlib_err
+        ; Alcotest.test_case "max"                       `Quick test_stdlib_max
+        ; Alcotest.test_case "List pattern"              `Quick test_stdlib_list_pattern
+        ; Alcotest.test_case "example 01 core"           `Quick test_stdlib_example_01
+        ; Alcotest.test_case "example 02 List"           `Quick test_stdlib_example_02_list
+        ; Alcotest.test_case "example 02 Result"         `Quick test_stdlib_example_02_result
         ] ) ]

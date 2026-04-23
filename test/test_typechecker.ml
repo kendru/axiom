@@ -1003,6 +1003,192 @@ let test_tyapp_result_arm_mismatch () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* Exhaustiveness checking                                              *)
+(* ------------------------------------------------------------------ *)
+
+(* ADT: missing None arm is a type error. *)
+let test_exhaustive_adt_missing_ctor () =
+  check_program_error "non-exhaustive ADT match"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn bad(opt: Option<Int>) -> Int ! pure {
+        match opt with {
+          | Some(x) => x
+        }
+      }
+    |}
+
+(* ADT: all constructors covered, no error. *)
+let test_exhaustive_adt_full () =
+  check_program_ok "exhaustive ADT match"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn unwrap(opt: Option<Int>) -> Int ! pure {
+        match opt with {
+          | Some(x) => x
+          | None    => 0
+        }
+      }
+    |}
+
+(* Bool: missing false arm is a type error. *)
+let test_exhaustive_bool_missing_false () =
+  check_program_error "non-exhaustive Bool match (missing false)"
+    {|
+      fn bad(b: Bool) -> Int ! pure {
+        match b with {
+          | true => 1
+        }
+      }
+    |}
+
+(* Bool: missing true arm is a type error. *)
+let test_exhaustive_bool_missing_true () =
+  check_program_error "non-exhaustive Bool match (missing true)"
+    {|
+      fn bad(b: Bool) -> Int ! pure {
+        match b with {
+          | false => 0
+        }
+      }
+    |}
+
+(* Bool: both arms present, ok. *)
+let test_exhaustive_bool_full () =
+  check_program_ok "exhaustive Bool match"
+    {|
+      fn to_int(b: Bool) -> Int ! pure {
+        match b with {
+          | true  => 1
+          | false => 0
+        }
+      }
+    |}
+
+(* Int: literal-only match without wildcard is a type error. *)
+let test_exhaustive_int_no_wildcard () =
+  check_program_error "non-exhaustive Int match (no wildcard)"
+    {|
+      fn bad(n: Int) -> Int ! pure {
+        match n with {
+          | 0 => 0
+          | 1 => 1
+        }
+      }
+    |}
+
+(* String: literal-only match without wildcard is a type error. *)
+let test_exhaustive_string_no_wildcard () =
+  check_program_error "non-exhaustive String match (no wildcard)"
+    {|
+      fn bad(s: String) -> Int ! pure {
+        match s with {
+          | "a" => 0
+        }
+      }
+    |}
+
+(* Wildcard makes any match exhaustive. *)
+let test_exhaustive_wildcard_covers_all () =
+  check_program_ok "wildcard covers Int"
+    {|
+      fn describe(n: Int) -> Int ! pure {
+        match n with {
+          | 0 => 0
+          | _ => 1
+        }
+      }
+    |}
+
+(* Variable pattern makes any match exhaustive. *)
+let test_exhaustive_var_covers_all () =
+  check_program_ok "variable pattern covers ADT"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn to_zero(opt: Option<Int>) -> Int ! pure {
+        match opt with {
+          | x => 0
+        }
+      }
+    |}
+
+(* Or-pattern covering all Bool constructors is exhaustive. *)
+let test_exhaustive_or_pattern_bool () =
+  check_program_ok "or-pattern covers Bool"
+    {|
+      fn to_int(b: Bool) -> Int ! pure {
+        match b with {
+          | true | false => 0
+        }
+      }
+    |}
+
+(* Or-pattern covering all ADT constructors is exhaustive. *)
+let test_exhaustive_or_pattern_adt () =
+  check_program_ok "or-pattern covers Option"
+    {|
+      type Option<a> = | Some(a) | None
+
+      fn is_some(opt: Option<Int>) -> Int ! pure {
+        match opt with {
+          | Some(_) | None => 0
+        }
+      }
+    |}
+
+(* Record: wildcard/var sub-patterns make the match exhaustive. *)
+let test_exhaustive_record_wildcard_fields () =
+  check_program_ok "record with wildcard fields is exhaustive"
+    {|
+      fn get_x() -> Int ! pure {
+        let r = { x: 42, y: true } in
+        match r with {
+          | { x = n, y = _ } => n
+        }
+      }
+    |}
+
+(* Record: a literal sub-pattern does not cover the whole field domain. *)
+let test_exhaustive_record_literal_field () =
+  check_program_error "record with literal field is non-exhaustive"
+    {|
+      fn bad() -> Int ! pure {
+        let r = { x: 42 } in
+        match r with {
+          | { x = 0 } => 0
+        }
+      }
+    |}
+
+(* Record: two patterns together can cover the field domain. *)
+let test_exhaustive_record_multi_pattern () =
+  check_program_ok "two record patterns covering all field values"
+    {|
+      fn classify() -> Int ! pure {
+        let r = { x: 42 } in
+        match r with {
+          | { x = 0 } => 0
+          | { x = _ } => 1
+        }
+      }
+    |}
+
+(* Record: open pattern omitting a field implicitly wildcards that field. *)
+let test_exhaustive_record_open_pattern () =
+  check_program_ok "open record pattern covers omitted fields"
+    {|
+      fn get_x() -> Int ! pure {
+        let r = { x: 42, y: true } in
+        match r with {
+          | { x = n, .. } => n
+        }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -1123,4 +1309,21 @@ let () =
         ; Alcotest.test_case "two-param Result"          `Quick test_tyapp_two_params
         ; Alcotest.test_case "Result match arms"         `Quick test_tyapp_result_match
         ; Alcotest.test_case "Result arm mismatch"       `Quick test_tyapp_result_arm_mismatch
+        ] )
+    ; ( "exhaustiveness",
+        [ Alcotest.test_case "ADT missing ctor"          `Quick test_exhaustive_adt_missing_ctor
+        ; Alcotest.test_case "ADT full coverage"         `Quick test_exhaustive_adt_full
+        ; Alcotest.test_case "Bool missing false"        `Quick test_exhaustive_bool_missing_false
+        ; Alcotest.test_case "Bool missing true"         `Quick test_exhaustive_bool_missing_true
+        ; Alcotest.test_case "Bool full coverage"        `Quick test_exhaustive_bool_full
+        ; Alcotest.test_case "Int no wildcard"           `Quick test_exhaustive_int_no_wildcard
+        ; Alcotest.test_case "String no wildcard"        `Quick test_exhaustive_string_no_wildcard
+        ; Alcotest.test_case "wildcard covers all"       `Quick test_exhaustive_wildcard_covers_all
+        ; Alcotest.test_case "var covers all"            `Quick test_exhaustive_var_covers_all
+        ; Alcotest.test_case "or-pattern Bool"           `Quick test_exhaustive_or_pattern_bool
+        ; Alcotest.test_case "or-pattern ADT"            `Quick test_exhaustive_or_pattern_adt
+        ; Alcotest.test_case "record wildcard fields"    `Quick test_exhaustive_record_wildcard_fields
+        ; Alcotest.test_case "record literal field"      `Quick test_exhaustive_record_literal_field
+        ; Alcotest.test_case "record multi-pattern"      `Quick test_exhaustive_record_multi_pattern
+        ; Alcotest.test_case "record open pattern"       `Quick test_exhaustive_record_open_pattern
         ] ) ]

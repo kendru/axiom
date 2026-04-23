@@ -541,8 +541,10 @@ let rec flatten_or_pat p =
 
 (** [missing_cases scrut_ty pats] returns [None] if [pats] cover all
     possible values of [scrut_ty], or [Some descriptions] listing the
-    missing cases. Uses [type_ctor_env] to look up ADT constructors. *)
-let missing_cases (scrut_ty : ty) (pats : pattern list) : string list option =
+    missing cases. Uses [type_ctor_env] to look up ADT constructors.
+    For record types, recursively checks that each field's sub-patterns
+    are themselves exhaustive for the field's type. *)
+let rec missing_cases (scrut_ty : ty) (pats : pattern list) : string list option =
   let flat = List.concat_map flatten_or_pat pats in
   if List.exists (fun p ->
       match p.pat_desc with PWild | PVar _ -> true | _ -> false) flat
@@ -573,10 +575,32 @@ let missing_cases (scrut_ty : ty) (pats : pattern list) : string list option =
                  | _ -> false) flat)
            ) ctor_names in
          if missing = [] then None else Some missing)
-    | TyRecord _ ->
-      if List.exists (fun p ->
-          match p.pat_desc with PRecord _ -> true | _ -> false) flat
-      then None else Some ["{...}"]
+    | TyRecord record_fields ->
+      let record_pats = List.filter_map (fun p ->
+          match p.pat_desc with
+          | PRecord (fps, is_open) -> Some (fps, is_open)
+          | _ -> None
+        ) flat in
+      if record_pats = [] then Some ["{...}"]
+      else
+        (* For each field, collect the sub-patterns from all record arms and
+           check that they recursively cover the field's type.  An open
+           pattern that omits a field implicitly covers it with a wildcard. *)
+        let missing_fields = List.filter_map (fun (field_name, field_ty) ->
+            let field_sub_pats = List.filter_map (fun (fps, is_open) ->
+                match List.assoc_opt field_name fps with
+                | Some sub_pat -> Some sub_pat
+                | None ->
+                  if is_open
+                  then Some { pat_desc = PWild; pat_comment = None }
+                  else None
+              ) record_pats in
+            match missing_cases field_ty field_sub_pats with
+            | None -> None
+            | Some _ -> Some field_name
+          ) record_fields in
+        if missing_fields = [] then None
+        else Some (List.map (fun f -> "field '" ^ f ^ "'") missing_fields)
     | _ -> None
 
 let check_match_exhaustive (scrut_ty : ty) (arms : match_arm list) =

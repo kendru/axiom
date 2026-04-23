@@ -1139,6 +1139,55 @@ let test_exhaustive_or_pattern_adt () =
       }
     |}
 
+(* Record: wildcard/var sub-patterns make the match exhaustive. *)
+let test_exhaustive_record_wildcard_fields () =
+  check_program_ok "record with wildcard fields is exhaustive"
+    {|
+      fn get_x() -> Int ! pure {
+        let r = { x: 42, y: true } in
+        match r with {
+          | { x = n, y = _ } => n
+        }
+      }
+    |}
+
+(* Record: a literal sub-pattern does not cover the whole field domain. *)
+let test_exhaustive_record_literal_field () =
+  check_program_error "record with literal field is non-exhaustive"
+    {|
+      fn bad() -> Int ! pure {
+        let r = { x: 42 } in
+        match r with {
+          | { x = 0 } => 0
+        }
+      }
+    |}
+
+(* Record: two patterns together can cover the field domain. *)
+let test_exhaustive_record_multi_pattern () =
+  check_program_ok "two record patterns covering all field values"
+    {|
+      fn classify() -> Int ! pure {
+        let r = { x: 42 } in
+        match r with {
+          | { x = 0 } => 0
+          | { x = _ } => 1
+        }
+      }
+    |}
+
+(* Record: open pattern omitting a field implicitly wildcards that field. *)
+let test_exhaustive_record_open_pattern () =
+  check_program_ok "open record pattern covers omitted fields"
+    {|
+      fn get_x() -> Int ! pure {
+        let r = { x: 42, y: true } in
+        match r with {
+          | { x = n, .. } => n
+        }
+      }
+    |}
+
 (* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
@@ -1273,4 +1322,8 @@ let () =
         ; Alcotest.test_case "var covers all"            `Quick test_exhaustive_var_covers_all
         ; Alcotest.test_case "or-pattern Bool"           `Quick test_exhaustive_or_pattern_bool
         ; Alcotest.test_case "or-pattern ADT"            `Quick test_exhaustive_or_pattern_adt
+        ; Alcotest.test_case "record wildcard fields"    `Quick test_exhaustive_record_wildcard_fields
+        ; Alcotest.test_case "record literal field"      `Quick test_exhaustive_record_literal_field
+        ; Alcotest.test_case "record multi-pattern"      `Quick test_exhaustive_record_multi_pattern
+        ; Alcotest.test_case "record open pattern"       `Quick test_exhaustive_record_open_pattern
         ] ) ]

@@ -288,6 +288,11 @@ type effect_env = (string * effect_scheme) list
 
 let empty_effect_env : effect_env = []
 
+(** Maps each declared type name to its constructor names.
+    Populated by [check_program] before inference begins; used by
+    [check_match_exhaustive] to verify pattern coverage for ADTs. *)
+let type_ctor_env : (string * string list) list ref = ref []
+
 (* ------------------------------------------------------------------ *)
 (* Unification                                                          *)
 (* ------------------------------------------------------------------ *)
@@ -526,6 +531,69 @@ and effect_inst_of_type_expr = function
                 Ast.pp_type_expr t)
 
 (* ------------------------------------------------------------------ *)
+(* Exhaustiveness checking                                              *)
+(* ------------------------------------------------------------------ *)
+
+let rec flatten_or_pat p =
+  match p.pat_desc with
+  | POr (p1, p2) -> flatten_or_pat p1 @ flatten_or_pat p2
+  | _ -> [p]
+
+(** [missing_cases scrut_ty pats] returns [None] if [pats] cover all
+    possible values of [scrut_ty], or [Some descriptions] listing the
+    missing cases. Uses [type_ctor_env] to look up ADT constructors. *)
+let missing_cases (scrut_ty : ty) (pats : pattern list) : string list option =
+  let flat = List.concat_map flatten_or_pat pats in
+  if List.exists (fun p ->
+      match p.pat_desc with PWild | PVar _ -> true | _ -> false) flat
+  then None
+  else
+    match deref scrut_ty with
+    | TyCon "Bool" ->
+      let has_true  = List.exists (fun p -> p.pat_desc = PLitTrue)  flat in
+      let has_false = List.exists (fun p -> p.pat_desc = PLitFalse) flat in
+      let missing =
+        (if has_true  then [] else ["true"]) @
+        (if has_false then [] else ["false"])
+      in
+      if missing = [] then None else Some missing
+    | TyCon "Unit" ->
+      if List.exists (fun p -> p.pat_desc = PLitUnit) flat
+      then None else Some ["()"]
+    | TyCon "Int" | TyCon "String" | TyCon "Float64" ->
+      Some ["_ (wildcard required for infinite-domain types)"]
+    | TyCon type_name | TyApp (type_name, _) ->
+      (match List.assoc_opt type_name !type_ctor_env with
+       | None | Some [] -> None
+       | Some ctor_names ->
+         let missing = List.filter (fun ctor_name ->
+             not (List.exists (fun p ->
+                 match p.pat_desc with
+                 | PCtor (n, _) -> n = ctor_name
+                 | _ -> false) flat)
+           ) ctor_names in
+         if missing = [] then None else Some missing)
+    | TyRecord _ ->
+      if List.exists (fun p ->
+          match p.pat_desc with PRecord _ -> true | _ -> false) flat
+      then None else Some ["{...}"]
+    | _ -> None
+
+let check_match_exhaustive (scrut_ty : ty) (arms : match_arm list) =
+  let pats = List.map (fun arm -> arm.pattern) arms in
+  match missing_cases scrut_ty pats with
+  | None -> ()
+  | Some missing ->
+    let ty_str = match deref scrut_ty with
+      | TyCon n | TyApp (n, _) -> n
+      | t -> Format.asprintf "%a" pp_ty t
+    in
+    failwith (Printf.sprintf
+                "Typechecker: non-exhaustive match on type '%s'; \
+                 missing cases: %s"
+                ty_str (String.concat ", " missing))
+
+(* ------------------------------------------------------------------ *)
 (* Inference                                                            *)
 (* ------------------------------------------------------------------ *)
 
@@ -681,14 +749,14 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr)
     deref ret_ty
 
   | Match { scrutinee; arms } ->
-    let _scrut_ty = infer_expr_in eenv env ambient scrutinee in
+    let scrut_ty = infer_expr_in eenv env ambient scrutinee in
     let result_ty = fresh_meta () in
     List.iter (fun arm ->
-        (* Extend env with pattern bindings — conservative: only PVar binds *)
-        let env' = env_from_pattern env arm.pattern _scrut_ty in
+        let env' = env_from_pattern env arm.pattern scrut_ty in
         let arm_ty = infer_expr_in eenv env' ambient arm.arm_body in
         unify result_ty arm_ty
       ) arms;
+    check_match_exhaustive scrut_ty arms;
     deref result_ty
 
   | Record fields ->
@@ -1062,6 +1130,19 @@ let build_module_registry (prog : program) : module_registry =
     | _ -> None
   ) prog
 
+(** Build a map from each declared type name to the names of its constructors.
+    Used to populate [type_ctor_env] before exhaustiveness checking begins. *)
+let build_type_ctor_env (prog : program) : (string * string list) list =
+  let rec collect_decl acc d =
+    match d.decl_desc with
+    | DeclType { type_name; ctors; _ } ->
+      (type_name, List.map (fun c -> c.Ast.ctor_name) ctors) :: acc
+    | DeclModule { body; _ } ->
+      List.fold_left collect_decl acc body
+    | _ -> acc
+  in
+  List.fold_left collect_decl [] prog
+
 (** [check_program prog] type-checks a whole program in two passes:
 
     Pass 1 walks every declaration and builds:
@@ -1087,6 +1168,7 @@ let build_module_registry (prog : program) : module_registry =
     Returns the populated [(env, effect_env)] for reuse in tests and
     downstream tooling. Raises [Failure] on type errors. *)
 let check_program (prog : program) : env * effect_env =
+  type_ctor_env := build_type_ctor_env prog;
   let module_registry = build_module_registry prog in
   (* [add_qualified prefix mod_env mod_eenv env eenv] folds [mod_env] and
      [mod_eenv] into [env] and [eenv], prepending [prefix ^ "."] to each key. *)

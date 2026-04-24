@@ -478,57 +478,78 @@ let generalize env ty =
 (* Type-expression AST -> ty                                            *)
 (* ------------------------------------------------------------------ *)
 
-(** Convert an AST type_expr to a checker ty.
-    Type variables (lowercase names not in scope as type constructors)
-    are treated as rigid type variables. The innermost TyFun's row is
-    taken from the [effect_set option] on that arrow; intermediate
-    curried arrows default to a fresh open row.
+(** Maps named row-tail variables (e.g. the [e] in [{ Log | e }]) to a
+    shared [row_meta] within a single function signature so that two
+    occurrences of the same name produce the same unification variable. *)
+type row_var_env = (string, row_meta) Hashtbl.t
 
-    [None] effect slots — allowed by the parser for unannotated arrows
-    within type_expr — yield a fresh open row so type checking does not
-    prematurely constrain the function to pure. *)
-let rec ty_of_type_expr = function
+let new_row_var_env () : row_var_env = Hashtbl.create 4
+
+let find_or_create_row_meta (env : row_var_env) (name : string) : row_meta =
+  match Hashtbl.find_opt env name with
+  | Some rm -> rm
+  | None ->
+    let rm = fresh_row_meta () in
+    Hashtbl.add env name rm;
+    rm
+
+(** Convert an AST type_expr to a checker ty, sharing row-variable
+    metas within [env] so that the same variable name at two positions
+    maps to the same [RMeta]. *)
+let rec ty_of_type_expr_env (env : row_var_env) = function
   | TyName s when String.length s > 0 && s.[0] >= 'a' && s.[0] <= 'z' ->
     TyVar s
   | TyName s  -> TyCon s
-  | TyApp (s, args) -> TyApp (s, List.map ty_of_type_expr args)
+  | TyApp (s, args) -> TyApp (s, List.map (ty_of_type_expr_env env) args)
   | TyTuple _ -> fresh_meta ()    (* tuple types deferred *)
   | TyFun (param_tys, ret, eff) ->
-    let ret_ty = ty_of_type_expr ret in
-    let row = row_of_effect_set_opt eff in
+    let ret_ty = ty_of_type_expr_env env ret in
+    let row = row_of_effect_set_opt_env env eff in
     (* Curried: the declared effect row lives on the innermost arrow (the
        last one to be applied), so we build from the right and attach [row]
        there. Intermediate arrows get fresh open rows. *)
     (match List.rev param_tys with
      | [] -> ret_ty   (* nullary function types have no arrow at all *)
      | last :: rest_rev ->
-       let innermost = TyFun (ty_of_type_expr last, ret_ty, row) in
+       let innermost = TyFun (ty_of_type_expr_env env last, ret_ty, row) in
        List.fold_left
-         (fun acc pt -> TyFun (ty_of_type_expr pt, acc, fresh_row ()))
+         (fun acc pt -> TyFun (ty_of_type_expr_env env pt, acc, fresh_row ()))
          innermost rest_rev)
 
-(** Convert an AST [effect_set] to a checker row. [Effects [e1; ...; en]]
-    becomes [RCons (e1, ... RCons (en, RPure))] (closed); [Pure] is
-    [RPure]. *)
-and row_of_effect_set = function
+(** Convert an AST [effect_set] to a checker row using [env] to share
+    row-variable metas. [Pure] → [RPure]; closed [Effects] → [RCons]
+    chain ending in [RPure]; open [Effects] with tail variable → chain
+    ending in the [RMeta] for that variable. *)
+and row_of_effect_set_env (env : row_var_env) = function
   | Pure -> RPure
-  | Effects ts ->
+  | Effects (ts, None) ->
     List.fold_right
-      (fun t acc -> RCons (effect_inst_of_type_expr t, acc))
+      (fun t acc -> RCons (effect_inst_of_type_expr_env env t, acc))
       ts RPure
+  | Effects (ts, Some v) ->
+    let rm = find_or_create_row_meta env v in
+    List.fold_right
+      (fun t acc -> RCons (effect_inst_of_type_expr_env env t, acc))
+      ts (RMeta rm)
 
-and row_of_effect_set_opt = function
-  | Some e -> row_of_effect_set e
+and row_of_effect_set_opt_env (env : row_var_env) = function
+  | Some e -> row_of_effect_set_env env e
   | None   -> fresh_row ()   (* unannotated: inference will discover it *)
 
-and effect_inst_of_type_expr = function
+and effect_inst_of_type_expr_env (env : row_var_env) = function
   | TyName s -> { eff_name = s; eff_args = [] }
   | TyApp (s, args) ->
-    { eff_name = s; eff_args = List.map ty_of_type_expr args }
+    { eff_name = s; eff_args = List.map (ty_of_type_expr_env env) args }
   | t ->
     failwith (Format.asprintf
                 "Typechecker: not a legal effect: %a"
                 Ast.pp_type_expr t)
+
+(** Shims with the original names — use a fresh empty env so existing
+    call sites that don't need row-variable sharing continue to work. *)
+let ty_of_type_expr t       = ty_of_type_expr_env (new_row_var_env ()) t
+let row_of_effect_set e     = row_of_effect_set_env (new_row_var_env ()) e
+let row_of_effect_set_opt e = row_of_effect_set_opt_env (new_row_var_env ()) e
 
 (* ------------------------------------------------------------------ *)
 (* Exhaustiveness checking                                              *)
@@ -1153,19 +1174,22 @@ let effect_scheme_of_decl (type_params : string list) (ops : Ast.effect_op list)
 
 (** Build a top-level function scheme from its declared parameter types
     and return type. Type parameters named on the declaration become the
-    scheme's bound variables so callers instantiate them with fresh metas. *)
+    scheme's bound variables so callers instantiate them with fresh metas.
+    A shared [row_var_env] ensures that the same row-variable name at
+    different positions in the signature maps to the same [RMeta]. *)
 let fn_scheme_of_decl
     (type_params : string list)
     (params      : param list)
     (return_type : type_expr option)
     (effects     : effect_set option)
   : scheme =
-  let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
+  let renv = new_row_var_env () in
+  let param_tys = List.map (fun p -> ty_of_type_expr_env renv p.param_type) params in
   let ret_ty = match return_type with
-    | Some t -> ty_of_type_expr t
+    | Some t -> ty_of_type_expr_env renv t
     | None   -> fresh_meta ()
   in
-  let body_row = row_of_effect_set_opt effects in
+  let body_row = row_of_effect_set_opt_env renv effects in
   let fun_ty = match List.rev param_tys with
     | [] -> ret_ty
     | last :: rest_rev ->
@@ -1326,7 +1350,11 @@ let check_program (prog : program) : env * effect_env =
   let rec check_decl d =
     match d.decl_desc with
     | DeclFn { params; return_type; effects; decl_body; _ } ->
-      let param_tys = List.map (fun p -> ty_of_type_expr p.param_type) params in
+      (* Use a shared row-var env so that the same row-variable name in the
+         param types, effect annotation, and return type produces the same
+         RMeta, giving the body check consistent ambient rows. *)
+      let renv = new_row_var_env () in
+      let param_tys = List.map (fun p -> ty_of_type_expr_env renv p.param_type) params in
       let body_env =
         List.fold_left2 (fun acc p t -> env_extend p.param_name (mono t) acc)
           env0 params param_tys
@@ -1334,10 +1362,10 @@ let check_program (prog : program) : env * effect_env =
       (* The body runs in the ambient row declared on the signature. If
          the signature omits the effect annotation, use a fresh open row
          so inference can discover the effects performed. *)
-      let ambient = row_of_effect_set_opt effects in
+      let ambient = row_of_effect_set_opt_env renv effects in
       let body_ty = infer_expr_in eenv0 body_env ambient decl_body in
       (match return_type with
-       | Some t -> unify body_ty (ty_of_type_expr t)
+       | Some t -> unify body_ty (ty_of_type_expr_env renv t)
        | None   -> ())
     | DeclModule { body; _ } ->
       List.iter check_decl body

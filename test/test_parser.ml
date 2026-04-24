@@ -152,7 +152,7 @@ let test_fn_effect_set () =
     "fn (x: Int) -> Int ! {Log} { x }"
     (expr (Fn { params      = [{ param_name = "x"; param_type = TyName "Int" }]
            ; return_type = Some (TyName "Int")
-           ; effects     = Some (Effects [TyName "Log"])
+           ; effects     = Some (Effects ([TyName "Log"], None))
            ; fn_body     = expr (Var "x") }))
 
 (* ------------------------------------------------------------------ *)

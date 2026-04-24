@@ -92,9 +92,10 @@ let rec put_type_expr buf = function
 and put_effect_set buf = function
   | Pure ->
     put_u8 buf etag_pure
-  | Effects tys ->
+  | Effects (tys, tail) ->
     put_u8 buf etag_effects;
-    put_list buf put_type_expr tys
+    put_list buf put_type_expr tys;
+    put_opt buf put_str tail
 
 let put_param buf (p : param) =
   put_str buf p.param_name;

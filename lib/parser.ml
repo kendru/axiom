@@ -114,12 +114,36 @@ and parse_effect_set (st : state) : effect_set =
   | Some LBrace ->
     advance st;
     (match peek st with
-     | Some RBrace -> advance st; Ast.Effects []
+     | Some RBrace -> advance st; Ast.Effects ([], None)
+     | Some Pipe ->
+       (* { | rho } — open row with no concrete effects, just a tail variable *)
+       advance st;
+       let v = match peek st with
+         | Some (Ident s) -> advance st; s
+         | Some t ->
+           failwith (Format.asprintf "Parser: expected row variable after '|', got %a" pp_token t)
+         | None -> failwith "Parser: expected row variable after '|'"
+       in
+       consume st RBrace;
+       Ast.Effects ([], Some v)
      | _ ->
        let first = parse_type_expr st in
        let rest  = parse_type_args_rest st in
+       let tail = match peek st with
+         | Some Pipe ->
+           advance st;
+           (match peek st with
+            | Some (Ident s) -> advance st; Some s
+            | Some t ->
+              failwith (Format.asprintf "Parser: expected row variable after '|', got %a" pp_token t)
+            | None -> failwith "Parser: expected row variable after '|'")
+         | _ -> None
+       in
        consume st RBrace;
-       Ast.Effects (first :: rest))
+       Ast.Effects (first :: rest, tail))
+  | Some (Ident s) ->
+    (* bare lowercase identifier as a row variable: ! e *)
+    advance st; Ast.Effects ([], Some s)
   | Some t ->
     failwith (Format.asprintf "Parser: expected effect set, got %a" pp_token t)
   | None -> failwith "Parser: expected effect set, got end of input"

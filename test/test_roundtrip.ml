@@ -186,7 +186,7 @@ let test_fn_effect_set () =
   check_expr "Fn effect set"
     (expr (Fn { params = [{ param_name = "x"; param_type = TyName "Int" }]
               ; return_type = Some (TyName "Unit")
-              ; effects = Some (Effects [TyName "Log"; TyApp ("Throw", [TyName "E"])])
+              ; effects = Some (Effects ([TyName "Log"; TyApp ("Throw", [TyName "E"])], None))
               ; fn_body = expr UnitLit }))
 
 let test_fn_complex_types () =

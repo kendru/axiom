@@ -1327,6 +1327,70 @@ let test_stdlib_example_02_list () =
       }
     |}
 
+(* ------------------------------------------------------------------ *)
+(* Open effect rows — row variable polymorphism                        *)
+(* ------------------------------------------------------------------ *)
+
+(* A function declared with a row variable in its effect set type-checks. *)
+let test_row_var_open_row_parses () =
+  check_program_ok "open effect row parses and type-checks"
+    {|
+      effect Log {
+        log: (String) -> Unit
+      }
+
+      fn wrap(body: (u: Unit) -> Unit ! {Log | e}) -> Unit ! {Log | e} {
+        body(())
+      }
+    |}
+
+(* Two occurrences of the same row variable in a function signature share
+   the same RMeta, allowing the two positions to be used consistently.
+   Here both parameters and the return effect use the same variable [e]. *)
+let test_row_var_same_var_unifies () =
+  check_program_ok "same row variable in two positions unifies"
+    {|
+      fn either_eff(f: (u: Unit) -> Unit ! e, g: (u: Unit) -> Unit ! e) -> Unit ! e {
+        f(())
+      }
+    |}
+
+(* A function with a bare row variable effect can be called from a pure context. *)
+let test_row_var_callable_pure () =
+  check_program_ok "row-variable function callable from pure context"
+    {|
+      fn call_it(f: (u: Unit) -> Unit ! e) -> Unit ! e {
+        f(())
+      }
+
+      fn pure_body(u: Unit) -> Unit ! pure { () }
+
+      fn use_pure() -> Unit ! pure {
+        call_it(pure_body)
+      }
+    |}
+
+(* A function with a bare row variable effect can be called from an effectful context. *)
+let test_row_var_callable_effectful () =
+  check_program_ok "row-variable function callable from effectful context"
+    {|
+      effect Log {
+        log: (String) -> Unit
+      }
+
+      fn call_it(f: (u: Unit) -> Unit ! e) -> Unit ! e {
+        f(())
+      }
+
+      fn log_body(u: Unit) -> Unit ! {Log} {
+        perform Log.log("hi")
+      }
+
+      fn use_effectful() -> Unit ! {Log} {
+        call_it(log_body)
+      }
+    |}
+
 (* examples/02_data_types.axm Result helpers type-check with the stdlib. *)
 let test_stdlib_example_02_result () =
   check_program_ok "02_data_types Result functions"
@@ -1479,6 +1543,12 @@ let () =
         ; Alcotest.test_case "record literal field"      `Quick test_exhaustive_record_literal_field
         ; Alcotest.test_case "record multi-pattern"      `Quick test_exhaustive_record_multi_pattern
         ; Alcotest.test_case "record open pattern"       `Quick test_exhaustive_record_open_pattern
+        ] )
+    ; ( "open-effect-rows",
+        [ Alcotest.test_case "open row parses"           `Quick test_row_var_open_row_parses
+        ; Alcotest.test_case "same var unifies"          `Quick test_row_var_same_var_unifies
+        ; Alcotest.test_case "callable from pure"        `Quick test_row_var_callable_pure
+        ; Alcotest.test_case "callable from effectful"   `Quick test_row_var_callable_effectful
         ] )
     ; ( "stdlib",
         [ Alcotest.test_case "add"                       `Quick test_stdlib_add

@@ -127,7 +127,8 @@ and get_effect_set cur =
   | t when t = etag_pure -> Pure
   | t when t = etag_effects ->
     let tys = get_list cur get_type_expr in
-    Effects tys
+    let tail = get_opt cur get_str in
+    Effects (tys, tail)
   | _ -> failwith (Printf.sprintf "Node_decoding: unknown effect_set tag 0x%02x" tag)
 
 let get_param cur =

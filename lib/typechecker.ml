@@ -1058,6 +1058,85 @@ let infer_expr (env : env) (e : expr) : ty =
   infer_expr_in empty_effect_env env (fresh_row ()) e
 
 (* ------------------------------------------------------------------ *)
+(* Standard library — built-in environments                             *)
+(* ------------------------------------------------------------------ *)
+
+(** Helper: curried function scheme with all-[RPure] arrows.
+    [RPure] rows are re-opened to fresh metas on every [instantiate] call
+    via [reopen_row], giving each use site its own effect tail. *)
+let stdlib_fun_scheme bound params ret =
+  let body = match List.rev params with
+    | [] -> ret
+    | last :: rest_rev ->
+      let innermost = TyFun (last, ret, RPure) in
+      List.fold_left (fun acc pt -> TyFun (pt, acc, RPure)) innermost rest_rev
+  in
+  { bound; body }
+
+(** Type-constructor sets for the three built-in ADTs.
+    Merged with program-specific entries in [check_program] so that
+    exhaustiveness checking works without a user-level type declaration. *)
+let stdlib_type_ctor_env : (string * string list) list =
+  [ ("List",   ["Nil"; "Cons"])
+  ; ("Option", ["None"; "Some"])
+  ; ("Result", ["Ok"; "Err"])
+  ]
+
+(** Pre-declared value environment.  Every entry here is available in any
+    program without an explicit declaration or import. *)
+let stdlib_env : env =
+  let int  = TyCon "Int" in
+  let bool = TyCon "Bool" in
+  let str  = TyCon "String" in
+  let list_a    = TyApp ("List",   [TyVar "a"]) in
+  let option_a  = TyApp ("Option", [TyVar "a"]) in
+  let result_ae = TyApp ("Result", [TyVar "a"; TyVar "e"]) in
+  let arith2    = stdlib_fun_scheme []       [int; int] int in
+  let arith1    = stdlib_fun_scheme []       [int]      int in
+  let div_body  =
+    TyFun (int, TyFun (int, int,
+      RCons ({ eff_name = "DivByZero"; eff_args = [] }, RPure)), RPure) in
+  let cmp       = stdlib_fun_scheme ["a"]    [TyVar "a"; TyVar "a"] bool in
+  let nil_s     = { bound = ["a"]; body = list_a } in
+  let cons_s    = stdlib_fun_scheme ["a"]    [TyVar "a"; list_a] list_a in
+  let none_s    = { bound = ["a"]; body = option_a } in
+  let some_s    = stdlib_fun_scheme ["a"]    [TyVar "a"] option_a in
+  let ok_s      = stdlib_fun_scheme ["a";"e"] [TyVar "a"] result_ae in
+  let err_s     = stdlib_fun_scheme ["a";"e"] [TyVar "e"] result_ae in
+  let max_s     = stdlib_fun_scheme ["a"]    [TyVar "a"; TyVar "a"] (TyVar "a") in
+  [ (* Arithmetic *)
+    ("add", arith2); ("sub", arith2); ("mul", arith2)
+  ; ("div", { bound = []; body = div_body }); ("neg", arith1)
+  (* Comparison *)
+  ; ("eq", cmp); ("lt", cmp); ("gt", cmp); ("le", cmp); ("ge", cmp)
+  (* String *)
+  ; ("concat", stdlib_fun_scheme [] [str; str] str)
+  (* List — uppercase constructors and lowercase helper aliases *)
+  ; ("Nil",  nil_s);  ("nil",  nil_s)
+  ; ("Cons", cons_s); ("cons", cons_s)
+  (* Option — uppercase constructors and lowercase helper aliases *)
+  ; ("None", none_s); ("none", none_s)
+  ; ("Some", some_s); ("some", some_s)
+  (* Result — uppercase constructors and lowercase helper aliases *)
+  ; ("Ok",  ok_s);  ("ok",  ok_s)
+  ; ("Err", err_s); ("err", err_s)
+  (* Ordered max *)
+  ; ("max", max_s)
+  ]
+
+(** Pre-declared effect environment.  [DivByZero] is carried by [div]. *)
+let stdlib_effect_env : effect_env =
+  [ ("DivByZero",
+     { eff_type_params = []
+     ; eff_ops =
+         [ { op_name   = "throw"
+           ; op_params = []
+           ; op_return = TyCon "Nothing"
+           } ]
+     })
+  ]
+
+(* ------------------------------------------------------------------ *)
 (* Program-level checking                                              *)
 (* ------------------------------------------------------------------ *)
 
@@ -1192,7 +1271,7 @@ let build_type_ctor_env (prog : program) : (string * string list) list =
     Returns the populated [(env, effect_env)] for reuse in tests and
     downstream tooling. Raises [Failure] on type errors. *)
 let check_program (prog : program) : env * effect_env =
-  type_ctor_env := build_type_ctor_env prog;
+  type_ctor_env := stdlib_type_ctor_env @ build_type_ctor_env prog;
   let module_registry = build_module_registry prog in
   (* [add_qualified prefix mod_env mod_eenv env eenv] folds [mod_env] and
      [mod_eenv] into [env] and [eenv], prepending [prefix ^ "."] to each key. *)
@@ -1242,7 +1321,7 @@ let check_program (prog : program) : env * effect_env =
       (env, eenv)
   in
   let env0, eenv0 =
-    List.fold_left collect (empty_env, empty_effect_env) prog
+    List.fold_left collect (stdlib_env, stdlib_effect_env) prog
   in
   let rec check_decl d =
     match d.decl_desc with

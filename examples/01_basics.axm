@@ -2,6 +2,9 @@
 -- Fundamental Axiom expressions: let-bindings, functions, pattern matching,
 -- if/else, records, and do-blocks.
 
+-- A point type using an ADT constructor.
+type Point = | Point(Int, Int)
+
 -- A simple pure function with full type annotation.
 fn square(x: Int) -> Int ! pure {
   let result = mul(x, x) in
@@ -31,18 +34,22 @@ fn abs(x: Int) -> Int ! pure {
   if lt(x, 0) { neg(x) } else { x }
 }
 
--- Record construction and projection.
+-- Point construction and projection via pattern matching.
 fn make_point(x: Int, y: Int) -> Point ! pure {
-  { x: x, y: y }
+  Point(x, y)
 }
 
 fn get_x(p: Point) -> Int ! pure {
-  p.x
+  match p with {
+    | Point(x, _) => x
+  }
 }
 
--- Record update.
+-- Move a point right by dx.
 fn move_right(p: Point, dx: Int) -> Point ! pure {
-  { p with x: add(p.x, dx) }
+  match p with {
+    | Point(x, y) => Point(add(x, dx), y)
+  }
 }
 
 -- Do-block for sequential steps.

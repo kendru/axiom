@@ -35,7 +35,8 @@ type ty =
   | TyFun    of ty * ty * row   (** A -> B ! ε (curried) *)
   | TyForall of string * ty     (** forall a. T  (generalized) *)
   | TyMeta   of meta_var        (** unification variable *)
-  | TyRecord of (string * ty) list (** structural record type: {f1: T1, f2: T2, ...} *)
+  | TyRecord of (string * ty) list * rec_meta option
+                               (** structural record: {f1:T1,...} or open {f1:T1,...|ρ} *)
   | TyApp    of string * ty list (** parameterized type: Option<Int>, List<a>, Map<K,V> *)
 
 and meta_var = {
@@ -63,6 +64,30 @@ and row_meta = {
   mutable rinst : row option;
 }
 
+(** A record row variable.  [rrec_inst = None] = open/unknown tail.
+    When instantiated, always points to a [TyRecord] carrying the extra fields
+    that were absorbed during unification. *)
+and rec_meta = {
+  rrec_id   : int;
+  mutable rrec_inst : ty option;
+}
+
+(* ------------------------------------------------------------------ *)
+(* Record-tail helper (used throughout; defined early for pp_ty/equal_ty) *)
+(* ------------------------------------------------------------------ *)
+
+(** Flatten a record by chasing instantiated [rec_meta] tails.
+    Returns [(all_fields, tail)] where [tail = None] means the record is now
+    fully closed and [tail = Some rm] means [rm] is still open (uninstantiated). *)
+let rec flatten_record fields tail =
+  match tail with
+  | None -> (fields, None)
+  | Some rm ->
+    match rm.rrec_inst with
+    | None -> (fields, Some rm)
+    | Some (TyRecord (extra, t)) -> flatten_record (fields @ extra) t
+    | Some _ -> (fields, None)   (* defensive; shouldn't occur *)
+
 (* ------------------------------------------------------------------ *)
 (* Pretty-printer and equality (for tests)                             *)
 (* ------------------------------------------------------------------ *)
@@ -77,12 +102,16 @@ let rec pp_ty fmt = function
     (match mv.inst with
      | Some t -> pp_ty fmt t
      | None   -> Format.fprintf fmt "?%d" mv.id)
-  | TyRecord fields ->
-    let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) fields in
-    Format.fprintf fmt "{%a}"
+  | TyRecord (fields, tail) ->
+    let all_fields, final_tail = flatten_record fields tail in
+    let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) all_fields in
+    Format.fprintf fmt "{%a%s}"
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
          (fun fmt (name, ty) -> Format.fprintf fmt "%s: %a" name pp_ty ty))
       sorted
+      (match final_tail with
+       | None    -> ""
+       | Some rm -> Format.sprintf " | ?r%d" rm.rrec_id)
   | TyApp (name, args) ->
     Format.fprintf fmt "%s<%a>" name
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
@@ -133,11 +162,16 @@ let rec equal_ty a b = match a, b with
   (* Dereference metas *)
   | TyMeta { inst = Some t; _ }, other
   | other, TyMeta { inst = Some t; _ } -> equal_ty t other
-  | TyRecord fa,  TyRecord fb  ->
+  | TyRecord (fa, ta), TyRecord (fb, tb) ->
+    let fa, ta = flatten_record fa ta and fb, tb = flatten_record fb tb in
     let sort f = List.sort (fun (a, _) (b, _) -> String.compare a b) f in
     let fa' = sort fa and fb' = sort fb in
     List.length fa' = List.length fb'
     && List.for_all2 (fun (na, ta) (nb, tb) -> na = nb && equal_ty ta tb) fa' fb'
+    && (match ta, tb with
+        | None,    None    -> true
+        | Some ra, Some rb -> ra.rrec_id = rb.rrec_id
+        | _,       _       -> false)
   | TyApp (n1, a1), TyApp (n2, a2) ->
     n1 = n2 && List.length a1 = List.length a2
     && List.for_all2 equal_ty a1 a2
@@ -198,6 +232,12 @@ let fresh_row_meta () =
 
 let fresh_row () = RMeta (fresh_row_meta ())
 
+let next_rrec_id = ref 0
+let fresh_rec_meta () =
+  let id = !next_rrec_id in
+  incr next_rrec_id;
+  { rrec_id = id; rrec_inst = None }
+
 (** Dereference a chain of instantiated type metas. *)
 let rec deref = function
   | TyMeta { inst = Some t; _ } -> deref t
@@ -220,8 +260,9 @@ let rec free_metas acc = function
     (match mv.inst with
      | None   -> mv :: acc
      | Some t -> free_metas acc t)
-  | TyRecord fields ->
-    List.fold_left (fun acc (_, t) -> free_metas acc t) acc fields
+  | TyRecord (fields, tail) ->
+    let all_fields, _ = flatten_record fields tail in
+    List.fold_left (fun acc (_, t) -> free_metas acc t) acc all_fields
   | TyApp (_, args) ->
     List.fold_left free_metas acc args
 
@@ -246,8 +287,9 @@ let rec free_row_metas acc = function
     (match mv.inst with
      | None   -> acc
      | Some t -> free_row_metas acc t)
-  | TyRecord fields ->
-    List.fold_left (fun acc (_, t) -> free_row_metas acc t) acc fields
+  | TyRecord (fields, tail) ->
+    let all_fields, _ = flatten_record fields tail in
+    List.fold_left (fun acc (_, t) -> free_row_metas acc t) acc all_fields
   | TyApp (_, args) ->
     List.fold_left free_row_metas acc args
 
@@ -317,20 +359,10 @@ let rec unify a b =
     if occurs_check mv t
     then failwith "Typechecker: occurs check failed (infinite type)"
     else mv.inst <- Some t
-  | TyRecord fa, TyRecord fb ->
-    let sort f = List.sort (fun (a, _) (b, _) -> String.compare a b) f in
-    let fa' = sort fa and fb' = sort fb in
-    if List.length fa' <> List.length fb' then
-      failwith (Format.asprintf
-                  "Typechecker: cannot unify record types with different fields: %a vs %a"
-                  pp_ty (TyRecord fa) pp_ty (TyRecord fb))
-    else
-      List.iter2 (fun (na, ta) (nb, tb) ->
-          if na <> nb then
-            failwith (Printf.sprintf
-                        "Typechecker: record field name mismatch: '%s' vs '%s'" na nb)
-          else unify ta tb)
-        fa' fb'
+  | TyRecord (fa, tail_a), TyRecord (fb, tail_b) ->
+    let fa, tail_a = flatten_record fa tail_a in
+    let fb, tail_b = flatten_record fb tail_b in
+    unify_records fa tail_a fb tail_b
   | TyApp (n1, a1), TyApp (n2, a2) ->
     if n1 <> n2 then
       failwith (Format.asprintf
@@ -384,6 +416,69 @@ and rewrite_row r e =
     rm.rinst <- Some (RCons (e, RMeta fresh));
     RMeta fresh
 
+(** Unify two already-flattened record types.
+    - Both closed ([None]): field sets must be identical.
+    - One open, one closed: the open tail absorbs the extra fields from the
+      closed side; all fields declared by the open side must exist in the
+      closed side.
+    - Both open: unify common fields; each tail absorbs the unique fields of
+      the other side, sharing a fresh tail for any further unknowns. *)
+and unify_records fa tail_a fb tail_b =
+  match tail_a, tail_b with
+  | None, None ->
+    let sort f = List.sort (fun (a, _) (b, _) -> String.compare a b) f in
+    let fa' = sort fa and fb' = sort fb in
+    if List.length fa' <> List.length fb' then
+      failwith (Format.asprintf
+                  "Typechecker: cannot unify record types with different fields: %a vs %a"
+                  pp_ty (TyRecord (fa, None)) pp_ty (TyRecord (fb, None)))
+    else
+      List.iter2 (fun (na, ta) (nb, tb) ->
+          if na <> nb then
+            failwith (Printf.sprintf
+                        "Typechecker: record field name mismatch: '%s' vs '%s'" na nb)
+          else unify ta tb)
+        fa' fb'
+  | Some rm_a, None ->
+    List.iter (fun (na, ta) ->
+        match List.assoc_opt na fb with
+        | None ->
+          failwith (Printf.sprintf
+                      "Typechecker: open record requires field '%s' \
+                       not present in closed record" na)
+        | Some tb -> unify ta tb
+      ) fa;
+    let extra = List.filter (fun (n, _) -> not (List.mem_assoc n fa)) fb in
+    rm_a.rrec_inst <- Some (TyRecord (extra, None))
+  | None, Some rm_b ->
+    List.iter (fun (nb, tb) ->
+        match List.assoc_opt nb fa with
+        | None ->
+          failwith (Printf.sprintf
+                      "Typechecker: open record requires field '%s' \
+                       not present in closed record" nb)
+        | Some ta -> unify ta tb
+      ) fb;
+    let extra = List.filter (fun (n, _) -> not (List.mem_assoc n fb)) fa in
+    rm_b.rrec_inst <- Some (TyRecord (extra, None))
+  | Some rm_a, Some rm_b when rm_a.rrec_id = rm_b.rrec_id ->
+    List.iter (fun (na, ta) ->
+        match List.assoc_opt na fb with
+        | Some tb -> unify ta tb
+        | None    -> ()
+      ) fa
+  | Some rm_a, Some rm_b ->
+    let only_a = List.filter (fun (n, _) -> not (List.mem_assoc n fb)) fa in
+    let only_b = List.filter (fun (n, _) -> not (List.mem_assoc n fa)) fb in
+    List.iter (fun (na, ta) ->
+        match List.assoc_opt na fb with
+        | Some tb -> unify ta tb
+        | None    -> ()
+      ) fa;
+    let shared = fresh_rec_meta () in
+    rm_a.rrec_inst <- Some (TyRecord (only_b, Some shared));
+    rm_b.rrec_inst <- Some (TyRecord (only_a, Some shared))
+
 (* ------------------------------------------------------------------ *)
 (* Instantiation and generalization                                     *)
 (* ------------------------------------------------------------------ *)
@@ -413,7 +508,8 @@ and subst_ty subs = function
     let subs' = List.filter (fun (x, _) -> x <> v) subs in
     TyForall (v, subst_ty subs' t)
   | TyMeta _ as m -> m
-  | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, subst_ty subs t)) fields)
+  | TyRecord (fields, tail) ->
+    TyRecord (List.map (fun (n, t) -> (n, subst_ty subs t)) fields, tail)
   | TyApp (name, args) -> TyApp (name, List.map (subst_ty subs) args)
 
 (** Replace all bound type variables in a scheme with fresh metas, and
@@ -458,7 +554,8 @@ let generalize env ty =
       | TyVar _ as v    -> v
       | TyFun (a, b, r) -> TyFun (go a, go b, go_row r)
       | TyForall (v, u) -> TyForall (v, go u)
-      | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, go t)) fields)
+      | TyRecord (fields, tail) ->
+        TyRecord (List.map (fun (n, t) -> (n, go t)) fields, tail)
       | TyApp (name, args) -> TyApp (name, List.map go args)
     and go_row = function
       | RPure -> RPure
@@ -596,7 +693,8 @@ let rec missing_cases (scrut_ty : ty) (pats : pattern list) : string list option
                  | _ -> false) flat)
            ) ctor_names in
          if missing = [] then None else Some missing)
-    | TyRecord record_fields ->
+    | TyRecord (record_fields, tail) ->
+      let all_fields, _ = flatten_record record_fields tail in
       let record_pats = List.filter_map (fun p ->
           match p.pat_desc with
           | PRecord (fps, is_open) -> Some (fps, is_open)
@@ -619,7 +717,7 @@ let rec missing_cases (scrut_ty : ty) (pats : pattern list) : string list option
             match missing_cases field_ty field_sub_pats with
             | None -> None
             | Some _ -> Some field_name
-          ) record_fields in
+          ) all_fields in
         if missing_fields = [] then None
         else Some (List.map (fun f -> "field '" ^ f ^ "'") missing_fields)
     | _ -> None
@@ -656,7 +754,8 @@ let rec subst_tyvars subs t =
       let subs' = List.filter (fun (x, _) -> x <> v) subs in
       TyForall (v, subst_tyvars subs' t)
     | TyMeta _ as m -> m
-    | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, go t)) fields)
+    | TyRecord (fields, tail) ->
+      TyRecord (List.map (fun (n, t) -> (n, go t)) fields, tail)
     | TyApp (name, args) -> TyApp (name, List.map go args)
   and go_row = function
     | RPure -> RPure
@@ -807,20 +906,21 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr)
   | Record fields ->
     let field_tys = List.map (fun (name, e) ->
         (name, infer_expr_in eenv env ambient e)) fields in
-    TyRecord field_tys
+    TyRecord (field_tys, None)
 
   | RecordUpdate (base, updates) ->
     let base_ty = infer_expr_in eenv env ambient base in
     (match deref base_ty with
-     | TyRecord base_fields ->
+     | TyRecord (base_fields, tail) ->
+       let all_fields, _ = flatten_record base_fields tail in
        List.iter (fun (name, _) ->
-           if not (List.mem_assoc name base_fields) then
+           if not (List.mem_assoc name all_fields) then
              failwith (Printf.sprintf
                          "Typechecker: record update targets unknown field '%s'" name)
          ) updates;
        List.iter (fun (name, e) ->
            let update_ty = infer_expr_in eenv env ambient e in
-           unify update_ty (List.assoc name base_fields)
+           unify update_ty (List.assoc name all_fields)
          ) updates;
        base_ty
      | TyMeta _ ->
@@ -849,15 +949,24 @@ let rec infer_expr_in (eenv : effect_env) (env : env) (ambient : row) (e : expr)
      | None ->
        let e_ty = infer_expr_in eenv env ambient e in
        (match deref e_ty with
-        | TyRecord fields ->
-          (match List.assoc_opt field fields with
+        | TyRecord (fields, tail) ->
+          let all_fields, final_tail = flatten_record fields tail in
+          (match List.assoc_opt field all_fields with
            | Some field_ty -> deref field_ty
            | None ->
-             failwith (Printf.sprintf
-                         "Typechecker: record has no field '%s'" field))
+             (match final_tail with
+              | None ->
+                failwith (Printf.sprintf
+                            "Typechecker: record has no field '%s'" field)
+              | Some rm ->
+                let field_ty = fresh_meta () in
+                let new_tail = fresh_rec_meta () in
+                rm.rrec_inst <- Some (TyRecord ([(field, field_ty)], Some new_tail));
+                field_ty))
         | TyMeta _ ->
           let field_ty = fresh_meta () in
-          unify e_ty (TyRecord [(field, field_ty)]);
+          let tail_meta = fresh_rec_meta () in
+          unify e_ty (TyRecord ([(field, field_ty)], Some tail_meta));
           deref field_ty
         | t ->
           failwith (Format.asprintf
@@ -1044,20 +1153,19 @@ and env_from_pattern env (p : pattern) scrut_ty =
   | PRecord (fields, is_open) ->
     let field_tys =
       match deref scrut_ty with
-      | TyRecord record_fields ->
+      | TyRecord (record_fields, tail) ->
+        let all_fields, _ = flatten_record record_fields tail in
         List.map (fun (name, _) ->
-            match List.assoc_opt name record_fields with
+            match List.assoc_opt name all_fields with
             | Some ty -> (name, ty)
             | None ->
               failwith (Printf.sprintf
                           "Typechecker: record pattern mentions unknown field '%s'" name)
           ) fields
       | TyMeta _ ->
-        (* Scrutinee type not yet known; create fresh field metas *)
         let fresh_fields = List.map (fun (name, _) -> (name, fresh_meta ())) fields in
-        (* A closed pattern fully determines the record's shape *)
-        if not is_open then
-          unify scrut_ty (TyRecord fresh_fields);
+        let tail = if is_open then Some (fresh_rec_meta ()) else None in
+        unify scrut_ty (TyRecord (fresh_fields, tail));
         fresh_fields
       | t ->
         failwith (Format.asprintf

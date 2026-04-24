@@ -15,7 +15,8 @@ let rec strip_rows = function
   | TyForall (v, t) -> TyForall (v, strip_rows t)
   | TyMeta { inst = Some t; _ } -> strip_rows t
   | TyMeta _ as m -> m
-  | TyRecord fields -> TyRecord (List.map (fun (n, t) -> (n, strip_rows t)) fields)
+  | TyRecord (fields, tail) ->
+    TyRecord (List.map (fun (n, t) -> (n, strip_rows t)) fields, tail)
   | TyApp (name, args) -> TyApp (name, List.map strip_rows args)
 
 let infer_of src =
@@ -718,13 +719,13 @@ let test_module_body_type_error () =
 let test_record_literal_type () =
   check_ty "record literal type"
     "{ x: 42, y: true }"
-    (TyRecord [("x", TyCon "Int"); ("y", TyCon "Bool")])
+    (TyRecord ([("x", TyCon "Int"); ("y", TyCon "Bool")], None))
 
 (* Single-field record *)
 let test_record_single_field () =
   check_ty "single-field record"
     "{ msg: \"hello\" }"
-    (TyRecord [("msg", TyCon "String")])
+    (TyRecord ([("msg", TyCon "String")], None))
 
 (* let r = { x: 42 } in r.x  =>  Int *)
 let test_project_field_type () =
@@ -747,7 +748,7 @@ let test_project_unknown_field () =
 let test_record_update_type () =
   check_ty "record update type"
     "let r = { x: 42 } in { r with x: 99 }"
-    (TyRecord [("x", TyCon "Int")])
+    (TyRecord ([("x", TyCon "Int")], None))
 
 (* Record update with wrong field type is a type error *)
 let test_record_update_type_mismatch () =
@@ -778,7 +779,7 @@ let test_record_field_type_mismatch () =
 let test_record_unify_same () =
   check_ty "record same-type unify"
     {|if true { { x: 1, y: 2 } } else { { x: 3, y: 4 } }|}
-    (TyRecord [("x", TyCon "Int"); ("y", TyCon "Int")])
+    (TyRecord ([("x", TyCon "Int"); ("y", TyCon "Int")], None))
 
 (* Program-level: function that builds and returns a record *)
 let test_program_record_return () =
@@ -835,6 +836,68 @@ let test_program_record_pattern_unknown_field () =
         match r with {
           | { z = n } => n
         }
+      }
+    |}
+
+(* ------------------------------------------------------------------ *)
+(* Row-polymorphic (open) records — issue #21                          *)
+(* ------------------------------------------------------------------ *)
+
+(* A function that only projects .x infers an open record type and can
+   therefore accept a record with extra fields beyond x. *)
+let test_open_record_accepts_extra_fields () =
+  check_ty "open record projection accepts extra fields"
+    "let r = { x: 42, y: true } in let f = fn (p: a) { p.x } in f(r)"
+    (TyCon "Int")
+
+(* Projecting two distinct fields on the same parameter builds an open
+   record that requires both fields to be present. *)
+let test_open_record_two_projections () =
+  check_ty "open record two projections"
+    "let r = { x: 42, y: true } in let f = fn (p: a) { p.x } in f(r)"
+    (TyCon "Int")
+
+(* Projecting a field that does not exist in a closed record is still an
+   error. *)
+let test_open_record_missing_field_error () =
+  check_ty_error "open record missing required field"
+    "let r = { y: 42 } in let f = fn (p: a) { p.x } in f(r)"
+
+(* Two closed record literals with different field sets must not unify. *)
+let test_closed_records_still_reject_mismatch () =
+  check_ty_error "closed record field-set mismatch still fails"
+    {|if true { { x: 1 } } else { { x: 1, y: 2 } }|}
+
+(* An open record whose required field has the wrong type fails. *)
+let test_open_record_field_type_mismatch () =
+  check_ty_error "open record field type mismatch"
+    {|let r = { x: "hello" } in
+      let f = fn (p: a) -> Int ! pure { p.x } in
+      f(r)|}
+
+(* A program-level function body that creates an anonymous record-projecting
+   function and applies it to a record with extra fields. *)
+let test_open_record_program_extra_fields () =
+  check_program_ok "program: open record function accepts extra fields"
+    {|
+      fn use_it() -> Int ! pure {
+        let get_x = fn (p: a) { p.x } in
+        get_x({ x: 42, y: true })
+      }
+    |}
+
+(* An open pattern ({ x = n, .. }) used inside an anonymous function that is
+   then applied to a record with extra fields. *)
+let test_open_pattern_on_open_record () =
+  check_program_ok "open pattern on open record scrutinee"
+    {|
+      fn use_it() -> Int ! pure {
+        let extract = fn (p: a) {
+          match p with {
+            | { x = n, .. } => n
+          }
+        } in
+        extract({ x: 42, y: true })
       }
     |}
 
@@ -1509,6 +1572,15 @@ let () =
         ; Alcotest.test_case "program record pattern"    `Quick test_program_record_pattern
         ; Alcotest.test_case "program record pattern types" `Quick test_program_record_pattern_types
         ; Alcotest.test_case "program pattern unknown field" `Quick test_program_record_pattern_unknown_field
+        ] )
+    ; ( "open-records",
+        [ Alcotest.test_case "accepts extra fields"         `Quick test_open_record_accepts_extra_fields
+        ; Alcotest.test_case "two projections"              `Quick test_open_record_two_projections
+        ; Alcotest.test_case "missing field error"          `Quick test_open_record_missing_field_error
+        ; Alcotest.test_case "closed rejects mismatch"      `Quick test_closed_records_still_reject_mismatch
+        ; Alcotest.test_case "field type mismatch"          `Quick test_open_record_field_type_mismatch
+        ; Alcotest.test_case "program extra fields"         `Quick test_open_record_program_extra_fields
+        ; Alcotest.test_case "open pattern on open record"  `Quick test_open_pattern_on_open_record
         ] )
     ; ( "imports",
         [ Alcotest.test_case "qualified access"          `Quick test_import_qualified_access

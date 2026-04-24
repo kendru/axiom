@@ -203,6 +203,58 @@ let test_program_two_fns () =
                 ; return_type = None; effects = None; decl_body = expr (Var "y") }) ]
 
 (* ------------------------------------------------------------------ *)
+(* Open effect rows — { E | rho } syntax                               *)
+(* ------------------------------------------------------------------ *)
+
+(* fn f(x: Int) -> Int ! {Log | e} { x }  — effect with tail variable *)
+let test_open_effect_row () =
+  check_decl "open effect row"
+    "fn f(x: Int) -> Int ! {Log | e} { x }"
+    (decl (DeclFn { pub         = false
+               ; fn_name     = "f"
+               ; type_params = []
+               ; params      = [{ param_name = "x"; param_type = TyName "Int" }]
+               ; return_type = Some (TyName "Int")
+               ; effects     = Some (Effects ([TyName "Log"], Some "e"))
+               ; decl_body   = expr (Var "x") }))
+
+(* fn f() -> Unit ! { | e} { () }  — just a tail variable, no concrete effects *)
+let test_open_effect_row_tail_only () =
+  check_decl "open effect row tail only"
+    "fn f() -> Unit ! {| e} { () }"
+    (decl (DeclFn { pub         = false
+               ; fn_name     = "f"
+               ; type_params = []
+               ; params      = []
+               ; return_type = Some (TyName "Unit")
+               ; effects     = Some (Effects ([], Some "e"))
+               ; decl_body   = expr UnitLit }))
+
+(* fn f() -> Unit ! e { () }  — bare row variable *)
+let test_bare_row_variable () =
+  check_decl "bare row variable"
+    "fn f() -> Unit ! e { () }"
+    (decl (DeclFn { pub         = false
+               ; fn_name     = "f"
+               ; type_params = []
+               ; params      = []
+               ; return_type = Some (TyName "Unit")
+               ; effects     = Some (Effects ([], Some "e"))
+               ; decl_body   = expr UnitLit }))
+
+(* fn f() -> Unit ! {Log, Console | e} { () }  — multiple effects with tail *)
+let test_open_effect_row_multi () =
+  check_decl "open effect row multiple effects"
+    "fn f() -> Unit ! {Log, Console | e} { () }"
+    (decl (DeclFn { pub         = false
+               ; fn_name     = "f"
+               ; type_params = []
+               ; params      = []
+               ; return_type = Some (TyName "Unit")
+               ; effects     = Some (Effects ([TyName "Log"; TyName "Console"], Some "e"))
+               ; decl_body   = expr UnitLit }))
+
+(* ------------------------------------------------------------------ *)
 (* Comment attachment on declarations                                   *)
 (* ------------------------------------------------------------------ *)
 
@@ -261,4 +313,10 @@ let () =
     ; ( "comments",
         [ Alcotest.test_case "fn comment"      `Quick test_fn_decl_comment
         ; Alcotest.test_case "type comment"    `Quick test_type_decl_comment
+        ] )
+    ; ( "open-effect-rows",
+        [ Alcotest.test_case "effect with tail var"      `Quick test_open_effect_row
+        ; Alcotest.test_case "tail variable only"        `Quick test_open_effect_row_tail_only
+        ; Alcotest.test_case "bare row variable"         `Quick test_bare_row_variable
+        ; Alcotest.test_case "multiple effects with tail" `Quick test_open_effect_row_multi
         ] ) ]

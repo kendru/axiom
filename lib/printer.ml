@@ -55,9 +55,13 @@ let rec print_type_expr = function
     "(" ^ String.concat ", " params_s ^ ") -> " ^ print_type_expr ret ^ eff_s
 
 and print_effect_set = function
-  | Pure       -> "pure"
-  | Effects [] -> "{}"
-  | Effects ts -> "{" ^ String.concat ", " (List.map print_type_expr ts) ^ "}"
+  | Pure -> "pure"
+  | Effects (ts, tail) ->
+    let tail_str = match tail with
+      | None   -> ""
+      | Some v -> if ts = [] then "| " ^ v else " | " ^ v
+    in
+    "{" ^ String.concat ", " (List.map print_type_expr ts) ^ tail_str ^ "}"
 
 let print_param { param_name; param_type } =
   param_name ^ ": " ^ print_type_expr param_type

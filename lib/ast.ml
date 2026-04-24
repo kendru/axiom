@@ -12,8 +12,8 @@ type type_expr =
                                             (** (T1, T2) -> T ! E *)
 
 and effect_set =
-  | Pure                        (** no effects *)
-  | Effects of type_expr list   (** { Log, Throw<E>, ... } *)
+  | Pure                                       (** no effects *)
+  | Effects of type_expr list * string option  (** { Log, Throw<E>, ... } or { Log | rho } *)
 
 (* ------------------------------------------------------------------ *)
 (* Function parameters                                                  *)
@@ -205,10 +205,15 @@ let rec pp_type_expr fmt = function
 
 and pp_effect_set fmt = function
   | Pure -> Format.pp_print_string fmt "pure"
-  | Effects ts ->
-    Format.fprintf fmt "{%a}"
+  | Effects (ts, tail) ->
+    let tail_str = match tail with
+      | None   -> ""
+      | Some v -> if ts = [] then "| " ^ v else " | " ^ v
+    in
+    Format.fprintf fmt "{%a%s}"
       (Format.pp_print_list ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
          pp_type_expr) ts
+      tail_str
 
 let pp_param fmt { param_name; param_type } =
   Format.fprintf fmt "%s: %a" param_name pp_type_expr param_type
@@ -358,11 +363,12 @@ let rec equal_type_expr a b = match a, b with
   | _,               _             -> false
 
 and equal_effect_set a b = match a, b with
-  | Pure,       Pure       -> true
-  | Effects xs, Effects ys ->
-    List.length xs = List.length ys
+  | Pure,                Pure                -> true
+  | Effects (xs, tx), Effects (ys, ty) ->
+    tx = ty
+    && List.length xs = List.length ys
     && List.for_all2 equal_type_expr xs ys
-  | _,          _          -> false
+  | _,                   _                   -> false
 
 let equal_param a b =
   a.param_name = b.param_name && equal_type_expr a.param_type b.param_type

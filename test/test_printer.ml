@@ -115,7 +115,7 @@ let test_fn_effect_set () =
   rt_expr "fn effect set"
     (expr (Fn { params      = [{ param_name = "x"; param_type = TyName "Int" }]
                ; return_type = Some (TyName "Int")
-               ; effects     = Some (Effects [TyName "Log"])
+               ; effects     = Some (Effects ([TyName "Log"], None))
                ; fn_body     = expr (Var "x") }))
 
 let test_fn_generic_param () =
@@ -413,7 +413,7 @@ let test_ty_fun_effects () =
   rt_expr "type fun with effects"
     (fn_with_ty
        (TyFun ([TyName "Int"], TyName "Int",
-               Some (Effects [TyName "Log"; TyName "State"]))))
+               Some (Effects ([TyName "Log"; TyName "State"], None)))))
 
 (* ------------------------------------------------------------------ *)
 (* Comments                                                             *)

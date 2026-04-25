@@ -1,0 +1,3 @@
+(library
+ (name wasm_encode)
+ (modules wasm_encode))

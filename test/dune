@@ -37,3 +37,8 @@
  (name test_printer)
  (modules test_printer)
  (libraries axiom_lib alcotest))
+
+(test
+ (name test_wasm_encode)
+ (modules test_wasm_encode)
+ (libraries wasm_encode alcotest))

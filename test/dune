@@ -42,3 +42,9 @@
  (name test_wasm_encode)
  (modules test_wasm_encode)
  (libraries wasm_encode alcotest))
+
+(test
+ (name test_build_pipeline)
+ (modules test_build_pipeline)
+ (libraries axiom_lib alcotest)
+ (action (setenv AXIOM_EXE %{exe:../bin/main.exe} (run %{test}))))

@@ -50,7 +50,7 @@ let () =
    with Failure msg ->
      Printf.eprintf "axiom build: type error: %s\n" msg;
      exit 1);
-  let wasm_bytes = Axiom_lib.Codegen.emit_stub prog in
+  let wasm_bytes = Axiom_lib.Codegen.emit prog in
   (try
      let oc = open_out_bin !output_file in
      output_bytes oc wasm_bytes;

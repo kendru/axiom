@@ -55,3 +55,18 @@ The CLI (`bin/main.ml`) wires these stages together with the `axiom build` subco
 ## Examples
 
 `examples/` contains 10 `.axm` programs (01_basics through 10_json) that demonstrate the working-form syntax and serve as integration tests for the pipeline. `examples/README.md` documents the code conventions used in those files.
+
+## Implementation Documentation
+
+Detailed documentation for each major subsystem lives in `docs/implementation/`:
+
+| Document | Covers |
+|----------|--------|
+| [front-end.md](docs/implementation/front-end.md) | Lexer, AST, Parser, Printer — the working-form ↔ AST pipeline |
+| [typechecker.md](docs/implementation/typechecker.md) | Hindley–Milner inference, effect row unification, two-pass declaration checking |
+| [ir.md](docs/implementation/ir.md) | Binary IR encoding/decoding, BLAKE3 hashing, structural sharing |
+| [node-encoding.md](docs/implementation/node-encoding.md) | Byte-level wire format reference for every IR node type |
+| [persistence.md](docs/implementation/persistence.md) | Node store: segmented flat-file layout, read/write paths, bloom filters, sealing |
+| [node-store.md](docs/implementation/node-store.md) | On-disk format reference for segments, indexes, and the manifest |
+| [codegen.md](docs/implementation/codegen.md) | Code generator and WASM encoder (current Milestone 1 scope) |
+| [status.md](docs/implementation/status.md) | Feature implementation status vs. the design specification |

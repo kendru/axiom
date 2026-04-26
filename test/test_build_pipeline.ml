@@ -209,6 +209,56 @@ let src_main_let_arithmetic =
 }|}
 (* a = 7, b = 14, result = 13 *)
 
+(* Issue #36: Bool, comparisons, and if/else *)
+let src_bool_true =
+  {|fn main() -> Int ! pure {
+  if true { 1 } else { 0 }
+}|}
+
+let src_bool_false =
+  {|fn main() -> Int ! pure {
+  if false { 1 } else { 0 }
+}|}
+
+let src_if_eq =
+  {|fn main() -> Int ! pure {
+  if eq(3, 3) { 42 } else { 0 }
+}|}
+
+let src_if_neq =
+  {|fn main() -> Int ! pure {
+  if neq(3, 4) { 7 } else { 0 }
+}|}
+
+let src_if_lte =
+  {|fn main() -> Int ! pure {
+  if lte(3, 3) { 1 } else { 0 }
+}|}
+
+let src_if_gte =
+  {|fn main() -> Int ! pure {
+  if gte(5, 3) { 1 } else { 0 }
+}|}
+
+let src_bool_to_int =
+  {|fn bool_to_int(b: Bool) -> Int ! pure {
+  if b { 1 } else { 0 }
+}
+
+fn main() -> Int ! pure {
+  bool_to_int(true)
+}|}
+
+let src_abs =
+  {|fn abs(x: Int) -> Int ! pure {
+  if lt(x, 0) { neg(x) } else { x }
+}
+
+fn main() -> Int ! pure {
+  abs(neg(5))
+}|}
+(* neg(5) = -5, abs(-5) = 5 *)
+
 (* Issue #35: top-level functions and direct/recursive calls *)
 let src_calls_helper =
   {|fn double(x: Int) -> Int ! pure {
@@ -354,5 +404,15 @@ let () =
         ; Alcotest.test_case "fact(5) = 120"          `Quick (test_main_returns src_recursive_fact 120)
         ; Alcotest.test_case "do block = 13"          `Quick (test_main_returns src_do_block 13)
         ; Alcotest.test_case "letrec fact(5) = 120"   `Quick (test_main_returns src_letrec_fact 120)
+        ] )
+    ; ( "bool_and_if",
+        [ Alcotest.test_case "if true = 1"            `Quick (test_main_returns src_bool_true 1)
+        ; Alcotest.test_case "if false = 0"           `Quick (test_main_returns src_bool_false 0)
+        ; Alcotest.test_case "eq(3,3) -> 42"          `Quick (test_main_returns src_if_eq 42)
+        ; Alcotest.test_case "neq(3,4) -> 7"          `Quick (test_main_returns src_if_neq 7)
+        ; Alcotest.test_case "lte(3,3) -> 1"          `Quick (test_main_returns src_if_lte 1)
+        ; Alcotest.test_case "gte(5,3) -> 1"          `Quick (test_main_returns src_if_gte 1)
+        ; Alcotest.test_case "bool_to_int(true) = 1"  `Quick (test_main_returns src_bool_to_int 1)
+        ; Alcotest.test_case "abs(neg(5)) = 5"        `Quick (test_main_returns src_abs 5)
         ] )
     ]

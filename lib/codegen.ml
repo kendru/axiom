@@ -57,16 +57,19 @@ let alloc_local ctx =
 (* Primitive binary operations                                          *)
 (* ------------------------------------------------------------------ *)
 
-let primitives = ["add"; "sub"; "mul"; "eq"; "lt"; "gt"]
+let primitives = ["add"; "sub"; "mul"; "eq"; "neq"; "lt"; "gt"; "lte"; "le"; "gte"; "ge"]
 
 let instr_of_prim = function
-  | "add" -> I32Add
-  | "sub" -> I32Sub
-  | "mul" -> I32Mul
-  | "eq"  -> I32Eq
-  | "lt"  -> I32LtS
-  | "gt"  -> I32GtS
-  | _     -> assert false
+  | "add"        -> I32Add
+  | "sub"        -> I32Sub
+  | "mul"        -> I32Mul
+  | "eq"         -> I32Eq
+  | "neq"        -> I32Ne
+  | "lt"         -> I32LtS
+  | "gt"         -> I32GtS
+  | "lte" | "le" -> I32LeS
+  | "gte" | "ge" -> I32GeS
+  | _            -> assert false
 
 (* ------------------------------------------------------------------ *)
 (* Expression compiler                                                  *)
@@ -77,10 +80,17 @@ let rec compile_expr ctx expr =
   | Ast.IntLit n ->
     [I32Const (Int64.to_int n)]
 
+  | Ast.BoolLit b ->
+    [I32Const (if b then 1 else 0)]
+
   | Ast.Var x ->
     (match List.assoc_opt x ctx.env with
      | Some idx -> [LocalGet idx]
      | None     -> failwith ("Codegen: unbound variable: " ^ x))
+
+  (* Unary negation: neg(x) = 0 - x *)
+  | Ast.App ({ Ast.desc = Ast.Var "neg"; _ }, [a]) ->
+    [I32Const 0] @ compile_expr ctx a @ [I32Sub]
 
   (* Known binary primitives — matched before the general App case *)
   | Ast.App ({ Ast.desc = Ast.Var op; _ }, [a; b])

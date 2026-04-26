@@ -26,8 +26,11 @@ type instr =
   | I32Sub
   | I32Mul
   | I32Eq
+  | I32Ne
   | I32LtS
   | I32GtS
+  | I32LeS
+  | I32GeS
   | LocalGet of int
   | LocalSet of int
   | LocalTee of int
@@ -175,8 +178,11 @@ let rec put_instr buf instr =
   | I32Sub  -> put_byte buf 0x6B
   | I32Mul  -> put_byte buf 0x6C
   | I32Eq   -> put_byte buf 0x46
+  | I32Ne   -> put_byte buf 0x47
   | I32LtS  -> put_byte buf 0x48
   | I32GtS  -> put_byte buf 0x4A
+  | I32LeS  -> put_byte buf 0x4C
+  | I32GeS  -> put_byte buf 0x4E
   | LocalGet i ->
     put_byte buf 0x20;
     put_uleb128 buf i

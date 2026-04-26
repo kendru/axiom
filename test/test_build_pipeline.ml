@@ -195,6 +195,20 @@ fn color_id(c: Color) -> Color ! pure {
 }
 |}
 
+(* Issue #34: Int literals, arithmetic primitives, and let bindings *)
+let src_main_add_literals =
+  {|fn main() -> Int ! pure {
+  add(1, 2)
+}|}
+
+let src_main_let_arithmetic =
+  {|fn main() -> Int ! pure {
+  let a = add(3, 4) in
+  let b = mul(a, 2) in
+  sub(b, 1)
+}|}
+(* a = 7, b = 14, result = 13 *)
+
 (* ------------------------------------------------------------------ *)
 (* Build tests                                                         *)
 (* ------------------------------------------------------------------ *)
@@ -257,6 +271,18 @@ let test_main_returns_zero src () =
       | RunFail m  -> Alcotest.fail ("execution failed: " ^ m)
       | RunSkip m  -> Printf.printf "[SKIP] %s\n%!" m))
 
+let test_main_returns src expected () =
+  with_tmp_file ".axm" (fun s ->
+    with_tmp_file ".wasm" (fun d ->
+      write_file s src;
+      let rc = axiom_build ~src:s ~dst:d in
+      if rc <> 0 then Alcotest.fail "axiom build failed";
+      match execute_main d with
+      | Got n when n = expected -> ()
+      | Got n     -> Alcotest.failf "main returned %d, expected %d" n expected
+      | RunFail m -> Alcotest.fail ("execution failed: " ^ m)
+      | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
+
 (* ------------------------------------------------------------------ *)
 (* Suite                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -281,5 +307,9 @@ let () =
     ; ( "execution",
         [ Alcotest.test_case "main returns 0 (empty)"     `Quick (test_main_returns_zero src_empty)
         ; Alcotest.test_case "main returns 0 (simple fn)" `Quick (test_main_returns_zero src_simple_fn)
+        ] )
+    ; ( "codegen",
+        [ Alcotest.test_case "add(1,2) = 3"           `Quick (test_main_returns src_main_add_literals 3)
+        ; Alcotest.test_case "let+arithmetic = 13"    `Quick (test_main_returns src_main_let_arithmetic 13)
         ] )
     ]

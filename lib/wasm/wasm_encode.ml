@@ -460,3 +460,17 @@ let add_function m ?(export = "") params results locals instrs =
   let func_idx = add_func m type_idx locals instrs in
   if export <> "" then add_export m export (ExportFunc func_idx);
   func_idx
+
+(** Reserve a function slot (type + func-section entry) without a body.
+    Returns the function index. The caller must call [add_body] exactly once
+    per reserved slot, in index order, before calling [encode]. *)
+let reserve_function m params results =
+  let type_idx = add_type m { params; results } in
+  let func_idx = List.length m.imports + List.length m.funcs in
+  m.funcs <- m.funcs @ [type_idx];
+  func_idx
+
+(** Append a function body.  Must be called once for each slot produced by
+    [reserve_function] (or [add_func]), in the same index order. *)
+let add_body m locals instrs =
+  m.bodies <- m.bodies @ [(locals, instrs)]

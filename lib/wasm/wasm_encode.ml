@@ -43,6 +43,10 @@ type instr =
   | BrTable of int list * int  (** targets, default *)
   | Return
   | Drop
+  | GlobalGet of int
+  | GlobalSet of int
+  | I32Load of int * int   (** align, offset *)
+  | I32Store of int * int  (** align, offset *)
 
 (** Run-length encoded local variable group in a function body. *)
 type local_decl = {
@@ -228,6 +232,20 @@ let rec put_instr buf instr =
     put_uleb128 buf default
   | Return -> put_byte buf 0x0F
   | Drop   -> put_byte buf 0x1A
+  | GlobalGet i ->
+    put_byte buf 0x23;
+    put_uleb128 buf i
+  | GlobalSet i ->
+    put_byte buf 0x24;
+    put_uleb128 buf i
+  | I32Load (align, offset) ->
+    put_byte buf 0x28;
+    put_uleb128 buf align;
+    put_uleb128 buf offset
+  | I32Store (align, offset) ->
+    put_byte buf 0x36;
+    put_uleb128 buf align;
+    put_uleb128 buf offset
 
 (* ------------------------------------------------------------------ *)
 (* Section helpers                                                     *)

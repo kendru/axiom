@@ -299,6 +299,53 @@ let src_letrec_fact =
 (* fact(5) = 120 *)
 
 (* ------------------------------------------------------------------ *)
+(* Allocator execution helper                                          *)
+(* ------------------------------------------------------------------ *)
+
+(** Instantiate the module at [path] via Node.js, call __alloc twice,
+    write/read through the exported memory, and return the first
+    allocation address. *)
+let run_alloc_check path =
+  if not (Lazy.force has_node) then
+    RunSkip "no node.js runtime available"
+  else
+    let script =
+      Printf.sprintf
+        "const fs=require('fs');\
+         const buf=fs.readFileSync(%s);\
+         WebAssembly.instantiate(buf).then(({instance})=>{\
+           const e=instance.exports;\
+           const ptr=e.__alloc(8);\
+           if(ptr<1024){console.error('ptr too low:'+ptr);process.exit(1);}\
+           const mem=new Uint32Array(e.memory.buffer);\
+           mem[ptr>>2]=0xABCD;\
+           if(mem[ptr>>2]!==0xABCD){console.error('rw mismatch');process.exit(2);}\
+           const ptr2=e.__alloc(4);\
+           if(ptr2!==ptr+8){console.error('bump wrong:'+ptr2);process.exit(3);}\
+           console.log(ptr);\
+         }).catch(e=>{console.error(e.message);process.exit(4);});"
+        (Filename.quote path)
+    in
+    let tmp = Filename.temp_file "axiom_alloc_" ".txt" in
+    let rc =
+      Sys.command
+        (Printf.sprintf "node -e %s >%s 2>/dev/null"
+           (Filename.quote script) (Filename.quote tmp))
+    in
+    let out =
+      let ic = open_in tmp in
+      let s = try input_line ic with End_of_file -> "" in
+      close_in ic;
+      (try Sys.remove tmp with _ -> ());
+      String.trim s
+    in
+    if rc <> 0 then RunFail (Printf.sprintf "node exited %d" rc)
+    else
+      match int_of_string_opt out with
+      | Some n -> Got n
+      | None   -> RunFail (Printf.sprintf "unexpected output: %S" out)
+
+(* ------------------------------------------------------------------ *)
 (* Build tests                                                         *)
 (* ------------------------------------------------------------------ *)
 
@@ -372,6 +419,24 @@ let test_main_returns src expected () =
       | RunFail m -> Alcotest.fail ("execution failed: " ^ m)
       | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
 
+(** Check that every compiled module exports __alloc, and that calling
+    it twice with sizes 8 and 4 returns consecutive addresses >= 1024. *)
+let test_allocator_exported src () =
+  with_tmp_file ".axm" (fun s ->
+    with_tmp_file ".wasm" (fun d ->
+      write_file s src;
+      let rc = axiom_build ~src:s ~dst:d in
+      if rc <> 0 then Alcotest.fail "axiom build failed";
+      match validate_wasm d with
+      | Fail msg -> Alcotest.fail msg
+      | Skip msg -> Printf.printf "[SKIP] %s\n%!" msg
+      | Pass ->
+        match run_alloc_check d with
+        | Got n when n >= 1024 -> ()
+        | Got n    -> Alcotest.failf "__alloc returned %d, want >= 1024" n
+        | RunFail m -> Alcotest.fail ("allocator check failed: " ^ m)
+        | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
+
 (* ------------------------------------------------------------------ *)
 (* Suite                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -414,5 +479,9 @@ let () =
         ; Alcotest.test_case "gte(5,3) -> 1"          `Quick (test_main_returns src_if_gte 1)
         ; Alcotest.test_case "bool_to_int(true) = 1"  `Quick (test_main_returns src_bool_to_int 1)
         ; Alcotest.test_case "abs(neg(5)) = 5"        `Quick (test_main_returns src_abs 5)
+        ] )
+    ; ( "allocator",
+        [ Alcotest.test_case "__alloc exported (empty)"     `Quick (test_allocator_exported src_empty)
+        ; Alcotest.test_case "__alloc exported (simple fn)" `Quick (test_allocator_exported src_main_add_literals)
         ] )
     ]

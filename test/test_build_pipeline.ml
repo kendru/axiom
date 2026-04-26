@@ -209,6 +209,45 @@ let src_main_let_arithmetic =
 }|}
 (* a = 7, b = 14, result = 13 *)
 
+(* Issue #35: top-level functions and direct/recursive calls *)
+let src_calls_helper =
+  {|fn double(x: Int) -> Int ! pure {
+  add(x, x)
+}
+
+fn main() -> Int ! pure {
+  double(21)
+}|}
+
+let src_recursive_fact =
+  {|fn fact(n: Int) -> Int ! pure {
+  if eq(n, 0) { 1 } else { mul(n, fact(sub(n, 1))) }
+}
+
+fn main() -> Int ! pure {
+  fact(5)
+}|}
+(* fact(5) = 120 *)
+
+let src_do_block =
+  {|fn main() -> Int ! pure {
+  do {
+    let a = add(3, 4);
+    let b = mul(a, 2);
+    sub(b, 1)
+  }
+}|}
+(* a = 7, b = 14, result = 13 *)
+
+let src_letrec_fact =
+  {|fn main() -> Int ! pure {
+  letrec {
+    fact(n: Int): Int = if eq(n, 0) { 1 } else { mul(n, fact(sub(n, 1))) }
+  } in
+  fact(5)
+}|}
+(* fact(5) = 120 *)
+
 (* ------------------------------------------------------------------ *)
 (* Build tests                                                         *)
 (* ------------------------------------------------------------------ *)
@@ -311,5 +350,9 @@ let () =
     ; ( "codegen",
         [ Alcotest.test_case "add(1,2) = 3"           `Quick (test_main_returns src_main_add_literals 3)
         ; Alcotest.test_case "let+arithmetic = 13"    `Quick (test_main_returns src_main_let_arithmetic 13)
+        ; Alcotest.test_case "double(21) = 42"        `Quick (test_main_returns src_calls_helper 42)
+        ; Alcotest.test_case "fact(5) = 120"          `Quick (test_main_returns src_recursive_fact 120)
+        ; Alcotest.test_case "do block = 13"          `Quick (test_main_returns src_do_block 13)
+        ; Alcotest.test_case "letrec fact(5) = 120"   `Quick (test_main_returns src_letrec_fact 120)
         ] )
     ]

@@ -90,44 +90,71 @@ let rec compile_ctor ctx tag args =
     ) args)
   @ [LocalGet ptr_local]
 
-(* Chained if/else dispatch for match arms. scrut_local holds the ADT pointer;
-   tag_local holds the already-loaded tag. *)
-and compile_match ctx scrut_local tag_local arms =
+(* Compile a single pattern against scrut_local.
+   on_match ctx' = instructions to emit when the pattern matches (ctx' has new bindings).
+   on_fail       = instruction list to emit when the pattern does not match. *)
+and compile_pat ctx scrut_local pat on_match on_fail =
+  match pat.Ast.pat_desc with
+  | Ast.PWild ->
+    on_match ctx
+
+  | Ast.PVar x ->
+    on_match { ctx with env = (x, scrut_local) :: ctx.env }
+
+  | Ast.PLitInt n ->
+    [LocalGet scrut_local; I32Const (Int64.to_int n); I32Eq;
+     If (ValType I32, on_match ctx, Some on_fail)]
+
+  | Ast.PLitTrue ->
+    [LocalGet scrut_local; I32Const 1; I32Eq;
+     If (ValType I32, on_match ctx, Some on_fail)]
+
+  | Ast.PLitFalse ->
+    [LocalGet scrut_local; I32Const 0; I32Eq;
+     If (ValType I32, on_match ctx, Some on_fail)]
+
+  | Ast.PCtor (ctor_name, sub_pats) ->
+    let (tag, _) = List.assoc ctor_name ctx.ctor_map in
+    (* Allocate a local for each constructor field up front. *)
+    let field_locals = List.mapi (fun i _ -> (i, alloc_local ctx)) sub_pats in
+    (* Load each field from heap slot i+1 into its local. *)
+    let load_fields = List.concat_map (fun (i, li) ->
+      [LocalGet scrut_local; I32Load (2, (i + 1) * 4); LocalSet li]
+    ) field_locals in
+    (* Chain sub-pattern checks for each field. *)
+    let pairs = List.map2 (fun (_, li) p -> (li, p)) field_locals sub_pats in
+    let inner = chain_pats ctx pairs on_match on_fail in
+    [LocalGet scrut_local; I32Load (2, 0); I32Const tag; I32Eq;
+     If (ValType I32, load_fields @ inner, Some on_fail)]
+
+  | Ast.POr (p1, p2) ->
+    (* Try p1; on failure try p2. *)
+    let try_p2 = compile_pat ctx scrut_local p2 on_match on_fail in
+    compile_pat ctx scrut_local p1 on_match try_p2
+
+  | other ->
+    failwith (Format.asprintf "Codegen: unsupported pattern: %a"
+                Ast.pp_pattern_desc other)
+
+(* Chain a list of (field_local, sub_pattern) pairs for constructor field checks. *)
+and chain_pats ctx pairs on_match on_fail =
+  match pairs with
+  | [] -> on_match ctx
+  | (li, pat) :: rest ->
+    compile_pat ctx li pat
+      (fun ctx' -> chain_pats ctx' rest on_match on_fail)
+      on_fail
+
+(* Decision-tree dispatch for match arms. scrut_local holds the scrutinee value. *)
+and compile_match ctx scrut_local arms =
   match arms with
   | [] ->
     [I32Const 0]  (* exhaustive matches should not reach here *)
-
-  | { Ast.pattern = { pat_desc = Ast.PWild; _ }; arm_body } :: _ ->
-    compile_expr ctx arm_body
-
-  | { Ast.pattern = { pat_desc = Ast.PVar x; _ }; arm_body } :: _ ->
-    compile_expr { ctx with env = (x, scrut_local) :: ctx.env } arm_body
-
-  | { Ast.pattern = { pat_desc = Ast.PCtor (ctor_name, sub_pats); _ }; arm_body } :: rest ->
-    let (tag, _) = List.assoc ctor_name ctx.ctor_map in
-    (* Bind each PVar sub-pattern to a fresh local loaded from the ADT fields. *)
-    let field_bindings = List.filter_map (fun (i, p) ->
-      match p.Ast.pat_desc with
-      | Ast.PVar x ->
-        let li = alloc_local ctx in
-        Some (x, li, i + 1)   (* field slot i+1 in the heap word *)
-      | Ast.PWild -> None
-      | _ -> failwith "Codegen: nested patterns not supported"
-    ) (List.mapi (fun i p -> (i, p)) sub_pats) in
-    let field_setup = List.concat_map (fun (_, li, slot) ->
-      [LocalGet scrut_local; I32Load (2, slot * 4); LocalSet li]
-    ) field_bindings in
-    let new_env =
-      List.map (fun (x, li, _) -> (x, li)) field_bindings @ ctx.env
-    in
-    [LocalGet tag_local; I32Const tag; I32Eq;
-     If (ValType I32,
-         field_setup @ compile_expr { ctx with env = new_env } arm_body,
-         Some (compile_match ctx scrut_local tag_local rest))]
-
-  | { Ast.pattern = { pat_desc; _ }; _ } :: _ ->
-    failwith (Format.asprintf "Codegen: unsupported match pattern: %a"
-                Ast.pp_pattern_desc pat_desc)
+  | arm :: rest ->
+    let on_fail = compile_match ctx scrut_local rest in
+    compile_pat ctx scrut_local arm.Ast.pattern
+      (fun ctx' -> compile_expr ctx' arm.Ast.arm_body)
+      on_fail
 
 and compile_expr ctx expr =
   match expr.Ast.desc with
@@ -186,11 +213,9 @@ and compile_expr ctx expr =
 
   | Ast.Match { scrutinee; arms } ->
     let scrut_local = alloc_local ctx in
-    let tag_local   = alloc_local ctx in
     compile_expr ctx scrutinee
-    @ [LocalSet scrut_local;
-       LocalGet scrut_local; I32Load (2, 0); LocalSet tag_local]
-    @ compile_match ctx scrut_local tag_local arms
+    @ [LocalSet scrut_local]
+    @ compile_match ctx scrut_local arms
 
   | Ast.Do stmts ->
     compile_do ctx stmts

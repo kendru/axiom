@@ -407,6 +407,74 @@ let run_alloc_check path =
       | None   -> RunFail (Printf.sprintf "unexpected output: %S" out)
 
 (* ------------------------------------------------------------------ *)
+(* Issue #39: decision-tree pattern matching fixtures                  *)
+(* ------------------------------------------------------------------ *)
+
+(* Recursive ADT: length of a linked list *)
+let src_list_length =
+  {|type List = | Nil | Cons(Int, List)
+
+fn length(l: List) -> Int ! pure {
+  match l with {
+    | Nil => 0
+    | Cons(_, t) => add(1, length(t))
+  }
+}
+
+fn main() -> Int ! pure {
+  length(Cons(1, Cons(2, Cons(3, Nil))))
+}|}
+(* length([1,2,3]) = 3 *)
+
+(* Or-patterns: two constructors share one arm *)
+let src_or_pattern =
+  {|type Color = | Red | Green | Blue
+
+fn is_warm(c: Color) -> Int ! pure {
+  match c with {
+    | Red | Green => 1
+    | Blue => 0
+  }
+}
+
+fn main() -> Int ! pure {
+  is_warm(Green)
+}|}
+(* Green is warm => 1 *)
+
+(* Nested constructor patterns: extract the head of the tail *)
+let src_nested_pattern =
+  {|type List = | Nil | Cons(Int, List)
+
+fn head_of_tail(l: List) -> Int ! pure {
+  match l with {
+    | Cons(_, Cons(h, _)) => h
+    | _ => 0
+  }
+}
+
+fn main() -> Int ! pure {
+  head_of_tail(Cons(1, Cons(42, Cons(3, Nil))))
+}|}
+(* second element = 42 *)
+
+(* 3-level nested constructor pattern *)
+let src_triple_nested =
+  {|type List = | Nil | Cons(Int, List)
+
+fn third(l: List) -> Int ! pure {
+  match l with {
+    | Cons(_, Cons(_, Cons(h, _))) => h
+    | _ => 0
+  }
+}
+
+fn main() -> Int ! pure {
+  third(Cons(1, Cons(2, Cons(99, Nil))))
+}|}
+(* third element = 99 *)
+
+(* ------------------------------------------------------------------ *)
 (* Build tests                                                         *)
 (* ------------------------------------------------------------------ *)
 
@@ -554,5 +622,19 @@ let () =
         ; Alcotest.test_case "get_x(Point(42,7)) = 42"      `Quick (test_main_returns src_point_get_x 42)
         ; Alcotest.test_case "get_y(Point(3,99)) = 99"      `Quick (test_main_returns src_point_get_y 99)
         ; Alcotest.test_case "wildcard: is_circle(Square)=0" `Quick (test_main_returns src_wildcard_match 0)
+        ] )
+    ; ( "pattern_matching",
+        [ Alcotest.test_case "build: list length"           `Quick (test_build_produces_file src_list_length)
+        ; Alcotest.test_case "validate: list length"        `Quick (test_validates src_list_length)
+        ; Alcotest.test_case "length([1,2,3]) = 3"          `Quick (test_main_returns src_list_length 3)
+        ; Alcotest.test_case "build: or-pattern"            `Quick (test_build_produces_file src_or_pattern)
+        ; Alcotest.test_case "validate: or-pattern"         `Quick (test_validates src_or_pattern)
+        ; Alcotest.test_case "is_warm(Green) = 1"           `Quick (test_main_returns src_or_pattern 1)
+        ; Alcotest.test_case "build: nested pattern"        `Quick (test_build_produces_file src_nested_pattern)
+        ; Alcotest.test_case "validate: nested pattern"     `Quick (test_validates src_nested_pattern)
+        ; Alcotest.test_case "head_of_tail([1,42,3]) = 42" `Quick (test_main_returns src_nested_pattern 42)
+        ; Alcotest.test_case "build: triple-nested pattern" `Quick (test_build_produces_file src_triple_nested)
+        ; Alcotest.test_case "validate: triple-nested"      `Quick (test_validates src_triple_nested)
+        ; Alcotest.test_case "third([1,2,99]) = 99"         `Quick (test_main_returns src_triple_nested 99)
         ] )
     ]

@@ -171,6 +171,24 @@ and compile_letrec ctx bindings body =
 
 let emit (prog : Ast.program) : bytes =
   let m       = create () in
+  (* Linear memory: one 64 KiB page; no upper bound. *)
+  add_memory m { min = 1; max = None };
+  add_export m "memory" (ExportMem 0);
+  (* Mutable heap pointer; bump-allocator starts above a 1 KiB reserved zone. *)
+  let heap_ptr_idx = add_global m I32 true (GlobI32 1024) in
+  (* __alloc(size: i32) -> i32 — bumps __heap_ptr by size, returns old value.
+     local[0]=size (param), local[1]=saved old ptr (extra). *)
+  let _ = add_function m ~export:"__alloc"
+    [I32] [I32]
+    [{ count = 1; ty = I32 }]
+    [ GlobalGet heap_ptr_idx   (* push old __heap_ptr *)
+    ; LocalTee 1               (* save it; still on stack *)
+    ; LocalGet 0               (* push size *)
+    ; I32Add                   (* old + size *)
+    ; GlobalSet heap_ptr_idx   (* __heap_ptr = old + size *)
+    ; LocalGet 1               (* return old __heap_ptr *)
+    ]
+  in
   let pending = ref [] in
   (* Collect top-level function declarations whose types we can handle,
      extracting the fields we need as a plain tuple to avoid inline-record

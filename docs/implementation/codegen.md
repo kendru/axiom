@@ -101,12 +101,13 @@ I32Add                LocalSet idx        If (bt, then_, else_)
 I32Sub                LocalTee idx        Block (bt, body)
 I32Mul                Return              Loop (bt, body)
 I32Eq                 Drop                Br label
-I32LtS                                    BrIf label
-I32GtS                                    BrTable (labels, default)
+I32LtS                GlobalGet idx       BrIf label
+I32GtS                GlobalSet idx       BrTable (labels, default)
+                      I32Load (al, off)
+                      I32Store (al, off)
 ```
 
-No floating-point instructions, no memory load/store, no SIMD, no
-GC proposal types.
+No floating-point instructions, no SIMD, no GC proposal types.
 
 ### Public functions
 
@@ -158,13 +159,87 @@ indices, and integer immediates throughout the binary format.
 
 - **Instruction set**: only the MVP subset listed above; no `i64`/`f32`/`f64`
   constants as instructions (though globals can hold those values), no
-  memory access, no atomics, no SIMD, no multi-value blocks beyond the
-  `results` array on `func_type`.
+  atomics, no SIMD, no multi-value blocks beyond the `results` array on
+  `func_type`.
 - **Imports**: function imports only (`ImportFunc`); table/memory/global
   imports are not encoded.
 - **Segments**: active segments only (memory 0 for data, table 0 for
   elements); passive segments are not supported.
 - **No Memory64, GC proposal, or exception-handling proposal.**
+
+---
+
+---
+
+## Linear memory and bump allocator (Milestone 2 prerequisite)
+
+### Memory section
+
+Every module emitted by `codegen.ml` includes a single linear memory of
+**one page (65 536 bytes)** with no declared maximum.  The memory is
+exported under the name `"memory"` so host embedders and tests can
+inspect it.
+
+```
+(memory (export "memory") 1)
+```
+
+### `__heap_ptr` global
+
+A mutable `i32` global named `__heap_ptr` (global index 0) is emitted
+before any user-defined globals.  Its initial value is **1024**, leaving
+the first 1 KiB as a reserved static zone (currently unused; reserved
+for future static-data segments).
+
+```
+(global $__heap_ptr (mut i32) (i32.const 1024))
+```
+
+### `__alloc` function
+
+`__alloc` is function index 0 in every module.  Its signature is:
+
+```
+(func $__alloc (export "__alloc") (param $size i32) (result i32)
+  ;; Save old heap_ptr, bump by size, return old value.
+  global.get $__heap_ptr
+  local.tee $saved          ;; local[1]: saved old ptr
+  local.get $size           ;; local[0]: size param
+  i32.add
+  global.set $__heap_ptr
+  local.get $saved)
+```
+
+Calling `__alloc(n)` returns the address of a freshly allocated `n`-byte
+region and advances `__heap_ptr` by `n`.  There is no alignment
+guarantee beyond what the caller requests; callers allocating word-sized
+fields should round `n` up to a multiple of 4 themselves.
+
+No freeing, no GC, no growth beyond one page — out of scope for now.
+
+### Boxed-value layout
+
+ADT constructor values are represented as **tagged heap records**:
+
+```
+offset +0 : i32  tag        (constructor index, 0-based)
+offset +4 : i32  field[0]   (first payload field)
+offset +8 : i32  field[1]   ...
+...
+```
+
+All payload fields are `i32` in v1.  A field holds either:
+
+- A 32-bit integer or boolean value packed directly, or
+- A heap pointer (i32 address) to another boxed value.
+
+**Allocation size** for a constructor with `k` fields is `4 * (1 + k)`
+bytes.  The emitter calls `__alloc(4 * (1 + k))`, then uses
+`i32.store` at `ptr + 0` for the tag and `ptr + 4*i` for field `i`.
+
+**Alignment rule**: every allocation is a multiple of 4 bytes and
+`__heap_ptr` starts at 1024 (also a multiple of 4), so all word
+accesses are naturally aligned.
 
 ---
 

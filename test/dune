@@ -44,6 +44,11 @@
  (libraries wasm_encode alcotest))
 
 (test
+ (name test_elaboration)
+ (modules test_elaboration)
+ (libraries axiom_lib alcotest str))
+
+(test
  (name test_build_pipeline)
  (modules test_build_pipeline)
  (libraries axiom_lib alcotest)

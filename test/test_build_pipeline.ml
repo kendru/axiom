@@ -298,6 +298,67 @@ let src_letrec_fact =
 }|}
 (* fact(5) = 120 *)
 
+(* Issue #38: ADT constructors and pattern matching *)
+
+(* Nullary enum: match returns tag as Int *)
+let src_color_match =
+  {|type Color = | Red | Green | Blue
+
+fn color_to_int(c: Color) -> Int ! pure {
+  match c with {
+    | Red   => 0
+    | Green => 1
+    | Blue  => 2
+  }
+}
+
+fn main() -> Int ! pure {
+  color_to_int(Green)
+}|}
+
+(* Point(x, y) constructor + field projection *)
+let src_point_get_x =
+  {|type Point = | Point(Int, Int)
+
+fn get_x(p: Point) -> Int ! pure {
+  match p with {
+    | Point(x, y) => x
+  }
+}
+
+fn main() -> Int ! pure {
+  get_x(Point(42, 7))
+}|}
+
+(* Wildcard arm *)
+let src_wildcard_match =
+  {|type Shape = | Circle | Square | Triangle
+
+fn is_circle(s: Shape) -> Int ! pure {
+  match s with {
+    | Circle => 1
+    | _      => 0
+  }
+}
+
+fn main() -> Int ! pure {
+  is_circle(Square)
+}|}
+
+(* Match on constructor with two fields, return second field *)
+let src_point_get_y =
+  {|type Point = | Point(Int, Int)
+
+fn get_y(p: Point) -> Int ! pure {
+  match p with {
+    | Point(x, y) => y
+  }
+}
+
+fn main() -> Int ! pure {
+  get_y(Point(3, 99))
+}|}
+
 (* ------------------------------------------------------------------ *)
 (* Allocator execution helper                                          *)
 (* ------------------------------------------------------------------ *)
@@ -483,5 +544,15 @@ let () =
     ; ( "allocator",
         [ Alcotest.test_case "__alloc exported (empty)"     `Quick (test_allocator_exported src_empty)
         ; Alcotest.test_case "__alloc exported (simple fn)" `Quick (test_allocator_exported src_main_add_literals)
+        ] )
+    ; ( "adt",
+        [ Alcotest.test_case "build: color enum"            `Quick (test_build_produces_file src_color_match)
+        ; Alcotest.test_case "validate: color enum"         `Quick (test_validates src_color_match)
+        ; Alcotest.test_case "color_to_int(Green) = 1"      `Quick (test_main_returns src_color_match 1)
+        ; Alcotest.test_case "build: Point get_x"           `Quick (test_build_produces_file src_point_get_x)
+        ; Alcotest.test_case "validate: Point get_x"        `Quick (test_validates src_point_get_x)
+        ; Alcotest.test_case "get_x(Point(42,7)) = 42"      `Quick (test_main_returns src_point_get_x 42)
+        ; Alcotest.test_case "get_y(Point(3,99)) = 99"      `Quick (test_main_returns src_point_get_y 99)
+        ; Alcotest.test_case "wildcard: is_circle(Square)=0" `Quick (test_main_returns src_wildcard_match 0)
         ] )
     ]

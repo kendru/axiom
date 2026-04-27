@@ -16,12 +16,11 @@ open Wasm_encode
 (* ------------------------------------------------------------------ *)
 
 let val_type_of_type_expr = function
-  | Ast.TyName "Int"  -> I32
-  | Ast.TyName "Bool" -> I32
+  | Ast.TyName _ -> I32   (* Int, Bool, and all ADT types lower to i32 *)
   | _ -> failwith "Codegen: unsupported type"
 
 let is_supported_type = function
-  | Ast.TyName "Int" | Ast.TyName "Bool" -> true
+  | Ast.TyName _ -> true
   | _ -> false
 
 (* ------------------------------------------------------------------ *)
@@ -29,20 +28,24 @@ let is_supported_type = function
 (* ------------------------------------------------------------------ *)
 
 type ctx = {
-  env          : (string * int) list;   (** variable name -> local index *)
-  next_local   : int ref;               (** next free local slot *)
-  extra_locals : local_decl list ref;   (** additional locals beyond params *)
-  func_map     : (string * int) list;   (** function name -> wasm func index *)
+  env          : (string * int) list;         (** variable name -> local index *)
+  next_local   : int ref;                     (** next free local slot *)
+  extra_locals : local_decl list ref;         (** additional locals beyond params *)
+  func_map     : (string * int) list;         (** function name -> wasm func index *)
+  ctor_map     : (string * (int * int)) list; (** ctor name -> (tag, arity) *)
+  alloc_idx    : int;                         (** func index of __alloc *)
   module_      : module_builder;
   (** Accumulator for (func_idx, locals, instrs); sorted and flushed in emit. *)
   pending      : (int * local_decl list * instr list) list ref;
 }
 
-let make_ctx params func_map module_ pending =
+let make_ctx params func_map ctor_map alloc_idx module_ pending =
   { env          = List.mapi (fun i (name, _) -> (name, i)) params
   ; next_local   = ref (List.length params)
   ; extra_locals = ref []
   ; func_map     = func_map
+  ; ctor_map     = ctor_map
+  ; alloc_idx    = alloc_idx
   ; module_      = module_
   ; pending      = pending
   }
@@ -75,13 +78,71 @@ let instr_of_prim = function
 (* Expression compiler                                                  *)
 (* ------------------------------------------------------------------ *)
 
-let rec compile_expr ctx expr =
+(* Allocate an ADT value: tag at offset 0, fields at offsets 4, 8, ...
+   Returns pointer via the last LocalGet. *)
+let rec compile_ctor ctx tag args =
+  let arity = List.length args in
+  let ptr_local = alloc_local ctx in
+  [I32Const ((1 + arity) * 4); Call ctx.alloc_idx; LocalTee ptr_local;
+   I32Const tag; I32Store (2, 0)]
+  @ List.concat (List.mapi (fun i arg ->
+      [LocalGet ptr_local] @ compile_expr ctx arg @ [I32Store (2, (i + 1) * 4)]
+    ) args)
+  @ [LocalGet ptr_local]
+
+(* Chained if/else dispatch for match arms. scrut_local holds the ADT pointer;
+   tag_local holds the already-loaded tag. *)
+and compile_match ctx scrut_local tag_local arms =
+  match arms with
+  | [] ->
+    [I32Const 0]  (* exhaustive matches should not reach here *)
+
+  | { Ast.pattern = { pat_desc = Ast.PWild; _ }; arm_body } :: _ ->
+    compile_expr ctx arm_body
+
+  | { Ast.pattern = { pat_desc = Ast.PVar x; _ }; arm_body } :: _ ->
+    compile_expr { ctx with env = (x, scrut_local) :: ctx.env } arm_body
+
+  | { Ast.pattern = { pat_desc = Ast.PCtor (ctor_name, sub_pats); _ }; arm_body } :: rest ->
+    let (tag, _) = List.assoc ctor_name ctx.ctor_map in
+    (* Bind each PVar sub-pattern to a fresh local loaded from the ADT fields. *)
+    let field_bindings = List.filter_map (fun (i, p) ->
+      match p.Ast.pat_desc with
+      | Ast.PVar x ->
+        let li = alloc_local ctx in
+        Some (x, li, i + 1)   (* field slot i+1 in the heap word *)
+      | Ast.PWild -> None
+      | _ -> failwith "Codegen: nested patterns not supported"
+    ) (List.mapi (fun i p -> (i, p)) sub_pats) in
+    let field_setup = List.concat_map (fun (_, li, slot) ->
+      [LocalGet scrut_local; I32Load (2, slot * 4); LocalSet li]
+    ) field_bindings in
+    let new_env =
+      List.map (fun (x, li, _) -> (x, li)) field_bindings @ ctx.env
+    in
+    [LocalGet tag_local; I32Const tag; I32Eq;
+     If (ValType I32,
+         field_setup @ compile_expr { ctx with env = new_env } arm_body,
+         Some (compile_match ctx scrut_local tag_local rest))]
+
+  | { Ast.pattern = { pat_desc; _ }; _ } :: _ ->
+    failwith (Format.asprintf "Codegen: unsupported match pattern: %a"
+                Ast.pp_pattern_desc pat_desc)
+
+and compile_expr ctx expr =
   match expr.Ast.desc with
   | Ast.IntLit n ->
     [I32Const (Int64.to_int n)]
 
   | Ast.BoolLit b ->
     [I32Const (if b then 1 else 0)]
+
+  (* Nullary constructor used as a value *)
+  | Ast.Var name when List.mem_assoc name ctx.ctor_map ->
+    let (tag, arity) = List.assoc name ctx.ctor_map in
+    if arity <> 0 then
+      failwith ("Codegen: constructor " ^ name ^ " requires arguments");
+    compile_ctor ctx tag []
 
   | Ast.Var x ->
     (match List.assoc_opt x ctx.env with
@@ -96,6 +157,12 @@ let rec compile_expr ctx expr =
   | Ast.App ({ Ast.desc = Ast.Var op; _ }, [a; b])
     when List.mem op primitives ->
     compile_expr ctx a @ compile_expr ctx b @ [instr_of_prim op]
+
+  (* Constructor application *)
+  | Ast.App ({ Ast.desc = Ast.Var name; _ }, args)
+    when List.mem_assoc name ctx.ctor_map ->
+    let (tag, _) = List.assoc name ctx.ctor_map in
+    compile_ctor ctx tag args
 
   (* General function call via Call instruction *)
   | Ast.App ({ Ast.desc = Ast.Var name; _ }, args) ->
@@ -116,6 +183,14 @@ let rec compile_expr ctx expr =
     [If (ValType I32,
          compile_expr ctx then_,
          Some (compile_expr ctx else_))]
+
+  | Ast.Match { scrutinee; arms } ->
+    let scrut_local = alloc_local ctx in
+    let tag_local   = alloc_local ctx in
+    compile_expr ctx scrutinee
+    @ [LocalSet scrut_local;
+       LocalGet scrut_local; I32Load (2, 0); LocalSet tag_local]
+    @ compile_match ctx scrut_local tag_local arms
 
   | Ast.Do stmts ->
     compile_do ctx stmts
@@ -159,7 +234,10 @@ and compile_letrec ctx bindings body =
     @ ctx.func_map
   in
   List.iter (fun (b, idx, param_tys) ->
-    let fn_ctx = make_ctx param_tys new_func_map ctx.module_ ctx.pending in
+    let fn_ctx =
+      make_ctx param_tys new_func_map ctx.ctor_map ctx.alloc_idx
+        ctx.module_ ctx.pending
+    in
     let instrs  = compile_expr fn_ctx b.Ast.letrec_body in
     ctx.pending := !(ctx.pending) @ [(idx, !(fn_ctx.extra_locals), instrs)]
   ) entries;
@@ -178,7 +256,7 @@ let emit (prog : Ast.program) : bytes =
   let heap_ptr_idx = add_global m I32 true (GlobI32 1024) in
   (* __alloc(size: i32) -> i32 — bumps __heap_ptr by size, returns old value.
      local[0]=size (param), local[1]=saved old ptr (extra). *)
-  let _ = add_function m ~export:"__alloc"
+  let alloc_idx = add_function m ~export:"__alloc"
     [I32] [I32]
     [{ count = 1; ty = I32 }]
     [ GlobalGet heap_ptr_idx   (* push old __heap_ptr *)
@@ -190,6 +268,18 @@ let emit (prog : Ast.program) : bytes =
     ]
   in
   let pending = ref [] in
+  (* Build constructor map: ctor_name -> (tag, arity).
+     Each DeclType assigns consecutive tags starting at 0 to its constructors. *)
+  let ctor_map =
+    List.concat_map (fun d ->
+      match d.Ast.decl_desc with
+      | Ast.DeclType { ctors; _ } ->
+        List.mapi (fun tag c ->
+          (c.Ast.ctor_name, (tag, List.length c.Ast.ctor_params))
+        ) ctors
+      | _ -> []
+    ) prog
+  in
   (* Collect top-level function declarations whose types we can handle,
      extracting the fields we need as a plain tuple to avoid inline-record
      binding restrictions. *)
@@ -219,7 +309,7 @@ let emit (prog : Ast.program) : bytes =
   let func_map = List.map (fun (fn_name, idx, _, _) -> (fn_name, idx)) fn_entries in
   (* Pass 2: compile each function body, accumulating into pending. *)
   List.iter (fun (_, idx, param_tys, decl_body) ->
-    let ctx    = make_ctx param_tys func_map m pending in
+    let ctx    = make_ctx param_tys func_map ctor_map alloc_idx m pending in
     let instrs = compile_expr ctx decl_body in
     pending := !pending @ [(idx, !(ctx.extra_locals), instrs)]
   ) fn_entries;

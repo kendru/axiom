@@ -351,7 +351,20 @@ and compile_ehandle ctx handled handlers =
     ) handlers)
   in
   let ctx' = { ctx with env = ev_locals @ ctx.env } in
-  List.concat ev_setups @ compile_eexpr ctx' handled
+  let handled_code = List.concat ev_setups @ compile_eexpr ctx' handled in
+  (* Apply each handler's return clause (if present), left-to-right.
+     Each clause transforms the result of the handled expression. *)
+  List.fold_left (fun instrs (h : eeffect_handler) ->
+    match h.return_handler with
+    | None -> instrs
+    | Some rh ->
+      let result_local = alloc_local ctx in
+      instrs
+      @ [LocalSet result_local]
+      @ compile_eexpr
+          { ctx with env = (rh.return_var, result_local) :: ctx.env }
+          rh.return_body
+  ) handled_code handlers
 
 (* ------------------------------------------------------------------ *)
 (* Module emitter                                                       *)

@@ -543,6 +543,98 @@ fn main() -> Int ! pure {
 (* tick()=42 twice; add(42,42)=84 *)
 
 (* ------------------------------------------------------------------ *)
+(* Issue #42: handle ... with return clause and abort handlers         *)
+(* ------------------------------------------------------------------ *)
+
+(* State-style: two-op effect (get/put); get returns constant 42; return clause
+   is identity.  put's result is discarded by the do-block Drop.
+   Final result: get() = 42. *)
+let src_state_get_put =
+  {|effect State {
+  get: () -> Int,
+  put: (Int) -> Int
+}
+
+fn program() -> Int ! {State} {
+  do {
+    perform State.put(10);
+    perform State.get()
+  }
+}
+
+fn main() -> Int ! pure {
+  handle program() with {
+    State {
+      get() => resume(42)
+      put(s) => resume(s)
+      return v => v
+    }
+  }
+}|}
+(* put(10) -> handler returns 10, dropped; get() -> handler returns 42;
+   return v => v is identity; result = 42 *)
+
+(* State-style: single get() with a non-trivial return clause.
+   get() = 41; return v => add(v, 1); result = 42. *)
+let src_state_return_clause =
+  {|effect State {
+  get: () -> Int
+}
+
+fn program() -> Int ! {State} {
+  perform State.get()
+}
+
+fn main() -> Int ! pure {
+  handle program() with {
+    State {
+      get() => resume(41)
+      return v => add(v, 1)
+    }
+  }
+}|}
+(* get() = 41; return clause adds 1; result = 42 *)
+
+(* Throw-style abort: perform Throw.abort(0) in the zero-division branch.
+   Handler returns code directly (no resume).  Result = 0. *)
+let src_throw_abort =
+  {|effect Throw {
+  abort: (Int) -> Int
+}
+
+fn safe_div(a: Int, b: Int) -> Int ! {Throw} {
+  if eq(b, 0) { perform Throw.abort(0) } else { a }
+}
+
+fn main() -> Int ! pure {
+  handle safe_div(10, 0) with {
+    Throw {
+      abort(code) => code
+    }
+  }
+}|}
+(* b = 0 -> abort handler returns code = 0; result = 0 *)
+
+(* Throw-style: no abort triggered; normal path returns a = 10. *)
+let src_throw_no_abort =
+  {|effect Throw {
+  abort: (Int) -> Int
+}
+
+fn safe_div(a: Int, b: Int) -> Int ! {Throw} {
+  if eq(b, 0) { perform Throw.abort(0) } else { a }
+}
+
+fn main() -> Int ! pure {
+  handle safe_div(10, 2) with {
+    Throw {
+      abort(code) => code
+    }
+  }
+}|}
+(* b != 0 -> else branch returns a = 10; result = 10 *)
+
+(* ------------------------------------------------------------------ *)
 (* Build tests                                                         *)
 (* ------------------------------------------------------------------ *)
 
@@ -715,5 +807,18 @@ let () =
         ; Alcotest.test_case "build: perform in do"         `Quick (test_build_produces_file src_perform_in_do)
         ; Alcotest.test_case "validate: perform in do"      `Quick (test_validates src_perform_in_do)
         ; Alcotest.test_case "tick()+tick() = 84"           `Quick (test_main_returns src_perform_in_do 84)
+        (* Issue #42: return clause and abort handlers *)
+        ; Alcotest.test_case "build: state get/put"         `Quick (test_build_produces_file src_state_get_put)
+        ; Alcotest.test_case "validate: state get/put"      `Quick (test_validates src_state_get_put)
+        ; Alcotest.test_case "state get/put = 42"           `Quick (test_main_returns src_state_get_put 42)
+        ; Alcotest.test_case "build: state return clause"   `Quick (test_build_produces_file src_state_return_clause)
+        ; Alcotest.test_case "validate: state return clause" `Quick (test_validates src_state_return_clause)
+        ; Alcotest.test_case "state get(41)+1 = 42"         `Quick (test_main_returns src_state_return_clause 42)
+        ; Alcotest.test_case "build: throw abort"           `Quick (test_build_produces_file src_throw_abort)
+        ; Alcotest.test_case "validate: throw abort"        `Quick (test_validates src_throw_abort)
+        ; Alcotest.test_case "throw abort: code = 0"        `Quick (test_main_returns src_throw_abort 0)
+        ; Alcotest.test_case "build: throw no-abort"        `Quick (test_build_produces_file src_throw_no_abort)
+        ; Alcotest.test_case "validate: throw no-abort"     `Quick (test_validates src_throw_no_abort)
+        ; Alcotest.test_case "throw no-abort: a = 10"       `Quick (test_main_returns src_throw_no_abort 10)
         ] )
     ]

@@ -45,6 +45,20 @@ let has_wasm_validate = lazy (command_exists "wasm-validate")
 let has_wasmtime      = lazy (command_exists "wasmtime")
 let has_node          = lazy (command_exists "node")
 
+(* Path to the pre-built runtime.wasm, relative to the repo root. *)
+let runtime_wasm_path =
+  let here = Filename.dirname Sys.argv.(0) in
+  let candidates =
+    [ Filename.concat here "../../runtime/runtime.wasm"
+    ; Filename.concat (Sys.getcwd ()) "runtime/runtime.wasm"
+    ]
+  in
+  match List.find_opt Sys.file_exists candidates with
+  | Some p -> p
+  | None   -> "runtime/runtime.wasm"   (* will be absent => tests skip *)
+
+let has_runtime = lazy (Sys.file_exists runtime_wasm_path)
+
 (* ------------------------------------------------------------------ *)
 (* Temp-file / IO helpers                                              *)
 (* ------------------------------------------------------------------ *)
@@ -170,6 +184,67 @@ let execute_main path =
   if Lazy.force has_wasmtime then run_via_wasmtime path
   else if Lazy.force has_node then run_via_node path
   else RunSkip "no wasm runtime available (install wasmtime or node)"
+
+(** Run [axiom_path] via the Axiom runtime:
+    1. Instantiate [axiom_path] normally (it exports [main]).
+    2. Instantiate [runtime.wasm] with the Axiom module's [main] as the
+       [axiom_program.main] import.
+    3. Call [_start] on the runtime instance.
+    4. Return the value from [get_exit_code]. *)
+let run_via_runtime axiom_path =
+  if not (Lazy.force has_node) then
+    RunSkip "no node.js runtime available"
+  else if not (Lazy.force has_runtime) then
+    RunSkip (Printf.sprintf "runtime.wasm not found at %s (run 'make' in runtime/)" runtime_wasm_path)
+  else
+    let script =
+      Printf.sprintf
+        "const fs=require('fs');\
+         const axiomBuf=fs.readFileSync(%s);\
+         const rtBuf=fs.readFileSync(%s);\
+         WebAssembly.instantiate(axiomBuf)\
+           .then(({instance:ai})=>{\
+             const axiomMain=ai.exports.main;\
+             return WebAssembly.instantiate(rtBuf,{axiom_program:{main:axiomMain}});\
+           })\
+           .then(({instance:ri})=>{\
+             ri.exports._start();\
+             console.log(ri.exports.get_exit_code());\
+           })\
+           .catch(e=>{console.error(e.message);process.exit(1);})"
+        (Filename.quote axiom_path)
+        (Filename.quote runtime_wasm_path)
+    in
+    let tmp = Filename.temp_file "axiom_runtime_" ".txt" in
+    let rc =
+      Sys.command
+        (Printf.sprintf "node -e %s >%s 2>/dev/null"
+           (Filename.quote script) (Filename.quote tmp))
+    in
+    let out =
+      let ic = open_in tmp in
+      let s = try input_line ic with End_of_file -> "" in
+      close_in ic;
+      (try Sys.remove tmp with _ -> ());
+      String.trim s
+    in
+    if rc = 0 then
+      (match int_of_string_opt out with
+       | Some n -> Got n
+       | None   -> RunFail (Printf.sprintf "unexpected output: %S" out))
+    else RunFail (Printf.sprintf "node exited %d" rc)
+
+let test_main_returns_via_runtime src expected () =
+  with_tmp_file ".axm" (fun s ->
+    with_tmp_file ".wasm" (fun d ->
+      write_file s src;
+      let rc = axiom_build ~src:s ~dst:d in
+      if rc <> 0 then Alcotest.fail "axiom build failed";
+      match run_via_runtime d with
+      | Got n when n = expected -> ()
+      | Got n     -> Alcotest.failf "runtime returned %d, expected %d" n expected
+      | RunFail m -> Alcotest.fail ("runtime execution failed: " ^ m)
+      | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
 
 (* ------------------------------------------------------------------ *)
 (* Source fixtures                                                     *)
@@ -975,5 +1050,28 @@ let () =
             (test_main_returns_flags ~flags:"--no-tail-calls" src_count_million 0)
         ; Alcotest.test_case "letrec loop(100)=7 (trampoline)"   `Quick
             (test_main_returns_flags ~flags:"--no-tail-calls" src_letrec_tail_loop 7)
+        ] )
+    ; ( "runtime",
+        (* Issue #44: programs run unchanged via the Axiom runtime.
+           Each test compiles an Axiom program, then runs it through the
+           runtime module (runtime/runtime.wasm) using the two-module host
+           pattern: the Axiom module's `main` export is passed as
+           `axiom_program.main` to the runtime, then `_start` is called and
+           `get_exit_code` is read back.  Tests skip gracefully when
+           runtime.wasm is absent (run `make` in runtime/ to build it). *)
+        [ Alcotest.test_case "runtime: add(1,2) = 3"        `Quick
+            (test_main_returns_via_runtime src_main_add_literals 3)
+        ; Alcotest.test_case "runtime: let+arithmetic = 13" `Quick
+            (test_main_returns_via_runtime src_main_let_arithmetic 13)
+        ; Alcotest.test_case "runtime: fact(5) = 120"       `Quick
+            (test_main_returns_via_runtime src_recursive_fact 120)
+        ; Alcotest.test_case "runtime: abs(neg(5)) = 5"     `Quick
+            (test_main_returns_via_runtime src_abs 5)
+        ; Alcotest.test_case "runtime: color_to_int(Green)=1" `Quick
+            (test_main_returns_via_runtime src_color_match 1)
+        ; Alcotest.test_case "runtime: double(5) = 10 (effect)" `Quick
+            (test_main_returns_via_runtime src_perform_double 10)
+        ; Alcotest.test_case "runtime: tail count(10) = 42" `Quick
+            (test_main_returns_via_runtime src_tail_if 42)
         ] )
     ]

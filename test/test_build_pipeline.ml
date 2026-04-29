@@ -475,6 +475,74 @@ fn main() -> Int ! pure {
 (* third element = 99 *)
 
 (* ------------------------------------------------------------------ *)
+(* Issue #41: perform / handle codegen                                 *)
+(* ------------------------------------------------------------------ *)
+
+(* Single-op effect: handler doubles its argument; perform returns it *)
+let src_perform_double =
+  {|effect Arith {
+  double: (Int) -> Int
+}
+
+fn apply(x: Int) -> Int ! {Arith} {
+  perform Arith.double(x)
+}
+
+fn main() -> Int ! pure {
+  handle apply(5) with {
+    Arith {
+      double(n) => resume(add(n, n))
+    }
+  }
+}|}
+(* double(5) = 5+5 = 10 *)
+
+(* Two-op effect: handler adds or multiplies *)
+let src_two_op_effect =
+  {|effect Math {
+  add_one: (Int) -> Int,
+  square: (Int) -> Int
+}
+
+fn compute(x: Int) -> Int ! {Math} {
+  add(perform Math.add_one(x), perform Math.square(x))
+}
+
+fn main() -> Int ! pure {
+  handle compute(3) with {
+    Math {
+      add_one(n) => resume(add(n, 1))
+      square(n)  => resume(mul(n, n))
+    }
+  }
+}|}
+(* add_one(3)=4, square(3)=9, add(4,9)=13 *)
+
+(* Perform inside a do block *)
+let src_perform_in_do =
+  {|effect Counter {
+  tick: () -> Int
+}
+
+fn run() -> Int ! {Counter} {
+  do {
+    let a = perform Counter.tick();
+    let b = perform Counter.tick();
+    add(a, b)
+  }
+}
+
+fn main() -> Int ! pure {
+  let count = 0 in
+  handle run() with {
+    Counter {
+      tick() => resume(42)
+    }
+  }
+}|}
+(* tick()=42 twice; add(42,42)=84 *)
+
+(* ------------------------------------------------------------------ *)
 (* Build tests                                                         *)
 (* ------------------------------------------------------------------ *)
 
@@ -636,5 +704,16 @@ let () =
         ; Alcotest.test_case "build: triple-nested pattern" `Quick (test_build_produces_file src_triple_nested)
         ; Alcotest.test_case "validate: triple-nested"      `Quick (test_validates src_triple_nested)
         ; Alcotest.test_case "third([1,2,99]) = 99"         `Quick (test_main_returns src_triple_nested 99)
+        ] )
+    ; ( "effects",
+        [ Alcotest.test_case "build: perform double"        `Quick (test_build_produces_file src_perform_double)
+        ; Alcotest.test_case "validate: perform double"     `Quick (test_validates src_perform_double)
+        ; Alcotest.test_case "double(5) = 10"               `Quick (test_main_returns src_perform_double 10)
+        ; Alcotest.test_case "build: two-op effect"         `Quick (test_build_produces_file src_two_op_effect)
+        ; Alcotest.test_case "validate: two-op effect"      `Quick (test_validates src_two_op_effect)
+        ; Alcotest.test_case "add_one(3)+square(3) = 13"    `Quick (test_main_returns src_two_op_effect 13)
+        ; Alcotest.test_case "build: perform in do"         `Quick (test_build_produces_file src_perform_in_do)
+        ; Alcotest.test_case "validate: perform in do"      `Quick (test_validates src_perform_in_do)
+        ; Alcotest.test_case "tick()+tick() = 84"           `Quick (test_main_returns src_perform_in_do 84)
         ] )
     ]

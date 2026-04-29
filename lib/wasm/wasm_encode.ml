@@ -45,8 +45,9 @@ type instr =
   | Drop
   | GlobalGet of int
   | GlobalSet of int
-  | I32Load of int * int   (** align, offset *)
-  | I32Store of int * int  (** align, offset *)
+  | I32Load of int * int        (** align, offset *)
+  | I32Store of int * int       (** align, offset *)
+  | CallIndirect of int * int   (** type_idx, table_idx *)
 
 (** Run-length encoded local variable group in a function body. *)
 type local_decl = {
@@ -246,6 +247,10 @@ let rec put_instr buf instr =
     put_byte buf 0x36;
     put_uleb128 buf align;
     put_uleb128 buf offset
+  | CallIndirect (type_idx, table_idx) ->
+    put_byte buf 0x11;
+    put_uleb128 buf type_idx;
+    put_uleb128 buf table_idx
 
 (* ------------------------------------------------------------------ *)
 (* Section helpers                                                     *)

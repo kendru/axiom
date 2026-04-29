@@ -22,25 +22,16 @@ instantiates the module:
 
 ## Building
 
-### With Zig (primary)
-
-Requires Zig 0.12+:
+Requires Zig 0.16.0:
 
 ```sh
 cd runtime
 zig build -Doptimize=ReleaseSmall
-# Output: runtime.wasm  (copied from zig-out/bin/)
+# Output: zig-out/bin/runtime.wasm
 ```
 
-### With clang (fallback)
-
-Requires `clang` with a `wasm32` target and `wasm-ld`:
-
-```sh
-cd runtime
-make
-# Output: runtime.wasm
-```
+`runtime.wasm` is a compiler artifact and is **not** tracked in the
+repository.  Build it locally before running the runtime test group.
 
 ## Running programs via the runtime
 
@@ -49,7 +40,7 @@ Node.js:
 
 ```js
 const fs = require('fs');
-const runtimeBuf = fs.readFileSync('runtime/runtime.wasm');
+const runtimeBuf = fs.readFileSync('runtime/zig-out/bin/runtime.wasm');
 const axiomBuf   = fs.readFileSync('program.wasm');
 
 const axiomMod   = await WebAssembly.instantiate(axiomBuf);

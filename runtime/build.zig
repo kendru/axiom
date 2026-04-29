@@ -15,24 +15,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Do not emit a default `_start`; we define our own.
+    // We define our own `_start`; suppress the compiler-generated entry.
     exe.entry = .disabled;
 
-    // Export all `pub export` symbols.
+    // Export every `pub export` symbol.
     exe.rdynamic = true;
 
-    // Allow the `main` import from "axiom_program" to be unresolved at
-    // library-build time; it is resolved when the host links this module
-    // with a compiled Axiom application.
-    exe.import_memory = false;
-
+    // Output goes to zig-out/bin/runtime.wasm.
     b.installArtifact(exe);
-
-    // zig build produces zig-out/bin/runtime.wasm
-    // Copy it to runtime.wasm in the runtime/ directory for convenience.
-    const install_step = b.addInstallFile(
-        exe.getEmittedBin(),
-        "../runtime.wasm",
-    );
-    b.getInstallStep().dependOn(&install_step.step);
 }

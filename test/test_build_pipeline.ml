@@ -45,17 +45,18 @@ let has_wasm_validate = lazy (command_exists "wasm-validate")
 let has_wasmtime      = lazy (command_exists "wasmtime")
 let has_node          = lazy (command_exists "node")
 
-(* Path to the pre-built runtime.wasm, relative to the repo root. *)
+(* Path to runtime.wasm produced by `zig build` in runtime/.
+   This is a build artifact, not a tracked file; tests skip when absent. *)
 let runtime_wasm_path =
   let here = Filename.dirname Sys.argv.(0) in
   let candidates =
-    [ Filename.concat here "../../runtime/runtime.wasm"
-    ; Filename.concat (Sys.getcwd ()) "runtime/runtime.wasm"
+    [ Filename.concat here "../../runtime/zig-out/bin/runtime.wasm"
+    ; Filename.concat (Sys.getcwd ()) "runtime/zig-out/bin/runtime.wasm"
     ]
   in
   match List.find_opt Sys.file_exists candidates with
   | Some p -> p
-  | None   -> "runtime/runtime.wasm"   (* will be absent => tests skip *)
+  | None   -> "runtime/zig-out/bin/runtime.wasm"   (* absent => tests skip *)
 
 let has_runtime = lazy (Sys.file_exists runtime_wasm_path)
 
@@ -195,7 +196,7 @@ let run_via_runtime axiom_path =
   if not (Lazy.force has_node) then
     RunSkip "no node.js runtime available"
   else if not (Lazy.force has_runtime) then
-    RunSkip (Printf.sprintf "runtime.wasm not found at %s (run 'make' in runtime/)" runtime_wasm_path)
+    RunSkip (Printf.sprintf "runtime.wasm not found at %s (run 'zig build' in runtime/)" runtime_wasm_path)
   else
     let script =
       Printf.sprintf

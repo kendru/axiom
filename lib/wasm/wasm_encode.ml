@@ -48,6 +48,8 @@ type instr =
   | I32Load of int * int        (** align, offset *)
   | I32Store of int * int       (** align, offset *)
   | CallIndirect of int * int   (** type_idx, table_idx *)
+  | ReturnCall of int           (** tail call by func index (opcode 0x12) *)
+  | ReturnCallIndirect of int * int (** tail call indirect: type_idx, table_idx (opcode 0x13) *)
 
 (** Run-length encoded local variable group in a function body. *)
 type local_decl = {
@@ -249,6 +251,13 @@ let rec put_instr buf instr =
     put_uleb128 buf offset
   | CallIndirect (type_idx, table_idx) ->
     put_byte buf 0x11;
+    put_uleb128 buf type_idx;
+    put_uleb128 buf table_idx
+  | ReturnCall i ->
+    put_byte buf 0x12;
+    put_uleb128 buf i
+  | ReturnCallIndirect (type_idx, table_idx) ->
+    put_byte buf 0x13;
     put_uleb128 buf type_idx;
     put_uleb128 buf table_idx
 

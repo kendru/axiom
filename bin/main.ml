@@ -1,13 +1,16 @@
-let usage = "Usage: axiom build <input.axm> -o <output.wasm>"
+let usage = "Usage: axiom build <input.axm> [-o <output.wasm>] [--no-tail-calls]"
 
 let () =
-  let input_file = ref "" in
-  let output_file = ref "" in
+  let input_file   = ref "" in
+  let output_file  = ref "" in
+  let no_tail_calls = ref false in
   let specs =
-    [ ("-o", Arg.Set_string output_file, "<file>  Output .wasm file") ]
+    [ ("-o", Arg.Set_string output_file, "<file>  Output .wasm file")
+    ; ("--no-tail-calls", Arg.Set no_tail_calls,
+       "        Lower tail calls via a trampoline loop instead of return_call")
+    ]
   in
   let anon s =
-    (* First anonymous arg is the subcommand, second is the input file. *)
     if !input_file = "" then input_file := s
   in
   (match Array.to_list Sys.argv with
@@ -51,7 +54,8 @@ let () =
      Printf.eprintf "axiom build: type error: %s\n" msg;
      exit 1);
   let _elaborated = Axiom_lib.Elaboration.elaborate_program prog in
-  let wasm_bytes = Axiom_lib.Codegen.emit prog in
+  let use_tail_calls = not !no_tail_calls in
+  let wasm_bytes = Axiom_lib.Codegen.emit ~use_tail_calls prog in
   (try
      let oc = open_out_bin !output_file in
      output_bytes oc wasm_bytes;

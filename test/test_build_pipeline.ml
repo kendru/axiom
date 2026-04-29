@@ -727,6 +727,120 @@ let test_allocator_exported src () =
         | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
 
 (* ------------------------------------------------------------------ *)
+(* Issue #43: tail-call codegen                                        *)
+(* ------------------------------------------------------------------ *)
+
+(* Tail call in the if-then branch *)
+let src_tail_if =
+  {|fn count_down(n: Int) -> Int ! pure {
+  if eq(n, 0) { 42 } else { count_down(sub(n, 1)) }
+}
+
+fn main() -> Int ! pure {
+  count_down(10)
+}|}
+(* count_down(10) ... count_down(0) = 42 *)
+
+(* Tail call in the if-else branch *)
+let src_tail_else =
+  {|fn count_up(n: Int, limit: Int) -> Int ! pure {
+  if eq(n, limit) { n } else { count_up(add(n, 1), limit) }
+}
+
+fn main() -> Int ! pure {
+  count_up(0, 7)
+}|}
+(* count_up(0,7) = 7 *)
+
+(* Tail call in the last statement of a do block *)
+let src_tail_do =
+  {|fn go(n: Int) -> Int ! pure {
+  do {
+    let m = sub(n, 1);
+    if eq(m, 0) { 99 } else { go(m) }
+  }
+}
+
+fn main() -> Int ! pure {
+  go(5)
+}|}
+(* go(5)->go(4)->go(3)->go(2)->go(1)->99 *)
+
+(* Tail call in match arms *)
+let src_tail_match =
+  {|type Step = | Zero | Pos(Int)
+
+fn walk(s: Step) -> Int ! pure {
+  match s with {
+    | Zero    => 55
+    | Pos(n)  => walk(if eq(n, 0) { Zero } else { Pos(sub(n, 1)) })
+  }
+}
+
+fn main() -> Int ! pure {
+  walk(Pos(4))
+}|}
+(* walk(Pos(4))->walk(Pos(3))->...->walk(Zero)=55 *)
+
+(* Counting to 1,000,000 via tail recursion — must not stack-overflow *)
+let src_count_million =
+  {|fn count(n: Int) -> Int ! pure {
+  if eq(n, 0) { 0 } else { count(sub(n, 1)) }
+}
+
+fn main() -> Int ! pure {
+  count(1000000)
+}|}
+(* result = 0 *)
+
+(* letrec tail-recursive loop *)
+let src_letrec_tail_loop =
+  {|fn main() -> Int ! pure {
+  letrec {
+    loop(n: Int): Int = if eq(n, 0) { 7 } else { loop(sub(n, 1)) }
+  } in
+  loop(100)
+}|}
+(* loop(100) ... loop(0) = 7 *)
+
+(* ------------------------------------------------------------------ *)
+(* Helpers for tests with extra CLI flags                              *)
+(* ------------------------------------------------------------------ *)
+
+let axiom_build_flags ~flags ~src ~dst =
+  let cmd =
+    Printf.sprintf "%s build %s -o %s %s 2>/dev/null"
+      (Filename.quote axiom_exe)
+      (Filename.quote src)
+      (Filename.quote dst)
+      flags
+  in
+  Sys.command cmd
+
+let test_main_returns_flags ~flags src expected () =
+  with_tmp_file ".axm" (fun s ->
+    with_tmp_file ".wasm" (fun d ->
+      write_file s src;
+      let rc = axiom_build_flags ~flags ~src:s ~dst:d in
+      if rc <> 0 then Alcotest.fail "axiom build failed";
+      match execute_main d with
+      | Got n when n = expected -> ()
+      | Got n     -> Alcotest.failf "main returned %d, expected %d" n expected
+      | RunFail m -> Alcotest.fail ("execution failed: " ^ m)
+      | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
+
+let test_validates_flags ~flags src () =
+  with_tmp_file ".axm" (fun s ->
+    with_tmp_file ".wasm" (fun d ->
+      write_file s src;
+      let rc = axiom_build_flags ~flags ~src:s ~dst:d in
+      if rc <> 0 then Alcotest.fail "axiom build failed";
+      match validate_wasm d with
+      | Pass     -> ()
+      | Fail msg -> Alcotest.fail msg
+      | Skip msg -> Printf.printf "[SKIP] %s\n%!" msg))
+
+(* ------------------------------------------------------------------ *)
 (* Suite                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -820,5 +934,46 @@ let () =
         ; Alcotest.test_case "build: throw no-abort"        `Quick (test_build_produces_file src_throw_no_abort)
         ; Alcotest.test_case "validate: throw no-abort"     `Quick (test_validates src_throw_no_abort)
         ; Alcotest.test_case "throw no-abort: a = 10"       `Quick (test_main_returns src_throw_no_abort 10)
+        ] )
+    ; ( "tail_calls",
+        (* return_call mode (default) *)
+        [ Alcotest.test_case "build: tail if"               `Quick (test_build_produces_file src_tail_if)
+        ; Alcotest.test_case "validate: tail if"            `Quick (test_validates src_tail_if)
+        ; Alcotest.test_case "tail if = 42"                 `Quick (test_main_returns src_tail_if 42)
+        ; Alcotest.test_case "build: tail else"             `Quick (test_build_produces_file src_tail_else)
+        ; Alcotest.test_case "validate: tail else"          `Quick (test_validates src_tail_else)
+        ; Alcotest.test_case "tail else = 7"                `Quick (test_main_returns src_tail_else 7)
+        ; Alcotest.test_case "build: tail do"               `Quick (test_build_produces_file src_tail_do)
+        ; Alcotest.test_case "validate: tail do"            `Quick (test_validates src_tail_do)
+        ; Alcotest.test_case "tail do = 99"                 `Quick (test_main_returns src_tail_do 99)
+        ; Alcotest.test_case "build: tail match"            `Quick (test_build_produces_file src_tail_match)
+        ; Alcotest.test_case "validate: tail match"         `Quick (test_validates src_tail_match)
+        ; Alcotest.test_case "tail match = 55"              `Quick (test_main_returns src_tail_match 55)
+        ; Alcotest.test_case "build: letrec tail loop"      `Quick (test_build_produces_file src_letrec_tail_loop)
+        ; Alcotest.test_case "validate: letrec tail loop"   `Quick (test_validates src_letrec_tail_loop)
+        ; Alcotest.test_case "letrec loop(100) = 7"         `Quick (test_main_returns src_letrec_tail_loop 7)
+        (* count to 1,000,000 — verifies no stack overflow in return_call mode *)
+        ; Alcotest.test_case "build: count 1M"              `Quick (test_build_produces_file src_count_million)
+        ; Alcotest.test_case "validate: count 1M"           `Quick (test_validates src_count_million)
+        ; Alcotest.test_case "count(1000000) = 0"           `Quick (test_main_returns src_count_million 0)
+        (* --no-tail-calls trampoline mode *)
+        ; Alcotest.test_case "validate: tail if (trampoline)"    `Quick
+            (test_validates_flags ~flags:"--no-tail-calls" src_tail_if)
+        ; Alcotest.test_case "tail if = 42 (trampoline)"         `Quick
+            (test_main_returns_flags ~flags:"--no-tail-calls" src_tail_if 42)
+        ; Alcotest.test_case "validate: tail else (trampoline)"  `Quick
+            (test_validates_flags ~flags:"--no-tail-calls" src_tail_else)
+        ; Alcotest.test_case "tail else = 7 (trampoline)"        `Quick
+            (test_main_returns_flags ~flags:"--no-tail-calls" src_tail_else 7)
+        ; Alcotest.test_case "validate: tail do (trampoline)"    `Quick
+            (test_validates_flags ~flags:"--no-tail-calls" src_tail_do)
+        ; Alcotest.test_case "tail do = 99 (trampoline)"         `Quick
+            (test_main_returns_flags ~flags:"--no-tail-calls" src_tail_do 99)
+        ; Alcotest.test_case "validate: count 1M (trampoline)"   `Quick
+            (test_validates_flags ~flags:"--no-tail-calls" src_count_million)
+        ; Alcotest.test_case "count(1M)=0 (trampoline)"          `Quick
+            (test_main_returns_flags ~flags:"--no-tail-calls" src_count_million 0)
+        ; Alcotest.test_case "letrec loop(100)=7 (trampoline)"   `Quick
+            (test_main_returns_flags ~flags:"--no-tail-calls" src_letrec_tail_loop 7)
         ] )
     ]

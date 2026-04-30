@@ -58,3 +58,13 @@ fn first_match<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Option<a> ! pure 
     | Cons(h, t) => if pred(h) { some(h) } else { first_match(pred, t) }
   }
 }
+
+fn main() -> Int ! pure {
+  let s = square(5) in
+  let d = distance(0, 0, 3, 4) in
+  let b = bool_to_int(true) in
+  let a = abs(neg(7)) in
+  let p = make_point(10, 20) in
+  let x = get_x(move_right(p, 5)) in
+  add(add(s, d), add(add(b, a), x))
+}

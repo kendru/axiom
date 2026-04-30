@@ -406,6 +406,69 @@ let test_query_interface_in_tools_list () =
       (List.mem "query_interface" names)
   )
 
+let verify_exhaustive_call id module_name =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"verify_exhaustive","arguments":{"module_name":"%s"}}}|}
+    id (json_string_escape module_name)
+
+let exhaustive_source =
+  {|type Color = | Red | Green | Blue
+fn describe(c: Color) -> Int ! pure {
+  match c with {
+    | Red   => 0
+    | Green => 1
+    | Blue  => 2
+  }
+}|}
+
+let test_verify_exhaustive_in_tools_list () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
+    let line = read_line () in
+    let json = mini_parse line in
+    let result = json_field "result" json in
+    let tools = json_field "tools" result in
+    let names = match tools with
+      | `List items ->
+        List.filter_map (fun item ->
+          match json_field "name" item with
+          | `String s -> Some s
+          | _ -> None) items
+      | _ -> []
+    in
+    Alcotest.(check bool) "verify_exhaustive in tools/list" true
+      (List.mem "verify_exhaustive" names)
+  )
+
+let test_verify_exhaustive_exhaustive_module () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 exhaustive_source "mymod");
+    ignore (read_line ());
+    write_line (verify_exhaustive_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let warnings = json_field "warnings" result in
+    Alcotest.(check bool) "warnings is empty list" true
+      (match warnings with `List [] -> true | _ -> false)
+  )
+
+let test_verify_exhaustive_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (verify_exhaustive_call 2 "nonexistent");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
 let () =
   ignore well_typed_source;
   ignore ill_typed_source;
@@ -427,5 +490,10 @@ let () =
       Alcotest.test_case "function signatures have no body"                  `Quick test_query_interface_fn_has_no_body;
       Alcotest.test_case "returns error when module not found"               `Quick test_query_interface_module_not_found;
       Alcotest.test_case "appears in tools/list"                             `Quick test_query_interface_in_tools_list;
+    ]);
+    ("verify_exhaustive", [
+      Alcotest.test_case "appears in tools/list"                             `Quick test_verify_exhaustive_in_tools_list;
+      Alcotest.test_case "returns empty warnings for exhaustive module"      `Quick test_verify_exhaustive_exhaustive_module;
+      Alcotest.test_case "returns error when module not found"               `Quick test_verify_exhaustive_module_not_found;
     ]);
   ]

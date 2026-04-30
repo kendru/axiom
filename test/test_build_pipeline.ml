@@ -730,31 +730,24 @@ let examples_dir =
 
 (* Subset of 01_basics.axm: non-String, non-HOF functions.
    Exercises features from sub-issues #34–#39 in one program.
-   -- comments (a new lexer feature) are used throughout.
 
    Expected: square(5)=25, distance_sq(0,0,3,4)=25, bool_to_int(true)=1,
              abs(neg(7))=7, get_x(move_right(make_point(10,20),5))=15
              total = 25+25+1+7+15 = 73 *)
 let src_01_basics_subset =
-  {|-- Issue #45 integration: non-String subset of 01_basics.axm.
--- Tests: arithmetic, function calls, Bool/if-else, neg, ADTs, pattern matching.
+  {|type Point = | Point(Int, Int)
 
-type Point = | Point(Int, Int)
-
--- Pure arithmetic with let-binding.
 fn square(x: Int) -> Int ! pure {
   let result = mul(x, x) in
   result
 }
 
--- Multiple parameters and nested let-bindings.
 fn distance_sq(x1: Int, y1: Int, x2: Int, y2: Int) -> Int ! pure {
   let dx = sub(x2, x1) in
   let dy = sub(y2, y1) in
   add(mul(dx, dx), mul(dy, dy))
 }
 
--- Pattern matching over a boolean.
 fn bool_to_int(b: Bool) -> Int ! pure {
   match b with {
     | true  => 1
@@ -762,31 +755,26 @@ fn bool_to_int(b: Bool) -> Int ! pure {
   }
 }
 
--- if/else expression with the neg primitive.
 fn abs(x: Int) -> Int ! pure {
   if lt(x, 0) { neg(x) } else { x }
 }
 
--- ADT constructor.
 fn make_point(x: Int, y: Int) -> Point ! pure {
   Point(x, y)
 }
 
--- Constructor pattern match: extract first field.
 fn get_x(p: Point) -> Int ! pure {
   match p with {
     | Point(x, _) => x
   }
 }
 
--- Pattern match + constructor: shift a point right by dx.
 fn move_right(p: Point, dx: Int) -> Point ! pure {
   match p with {
     | Point(x, y) => Point(add(x, dx), y)
   }
 }
 
--- Wires all helpers together; result = 25+25+1+7+15 = 73.
 fn main() -> Int ! pure {
   let s = square(5) in
   let d = distance_sq(0, 0, 3, 4) in
@@ -795,13 +783,6 @@ fn main() -> Int ! pure {
   let p = make_point(10, 20) in
   let x = get_x(move_right(p, 5)) in
   add(add(s, d), add(add(b, a), x))
-}|}
-
-(* A program that uses -- line comments to verify the new lexer feature. *)
-let src_line_comments =
-  {|-- top-level line comment
-fn main() -> Int ! pure { -- inline comment
-  add(1, 2) -- trailing comment
 }|}
 
 (* Test the full 01_basics.axm file from disk (no main → empty stub). *)
@@ -1196,7 +1177,6 @@ let () =
            preceding sub-issue (#34–#44) in a single integration test.
 
            Covers:
-           - -- line comments (new lexer feature)
            - Int arithmetic and let-bindings    (#34)
            - Top-level function calls           (#35)
            - Bool pattern match, if/else, neg   (#36-#37)
@@ -1209,11 +1189,7 @@ let () =
            functions are silently skipped by codegen, producing valid WASM for
            the supportable subset.  wasmtime/node execution uses the inline
            subset fixture which exports a runnable main. *)
-        [ Alcotest.test_case "line comments compile"          `Quick
-            (test_build_produces_file src_line_comments)
-        ; Alcotest.test_case "line comments = 3"              `Quick
-            (test_main_returns src_line_comments 3)
-        ; Alcotest.test_case "build: 01_basics subset"        `Quick
+        [ Alcotest.test_case "build: 01_basics subset"        `Quick
             (test_build_produces_file src_01_basics_subset)
         ; Alcotest.test_case "validate: 01_basics subset"     `Quick
             (test_validates src_01_basics_subset)

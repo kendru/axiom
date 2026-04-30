@@ -289,8 +289,6 @@ returning 0.
 
 | Test | What it checks |
 |------|---------------|
-| `line comments compile` | `--` line comments are silently skipped by the lexer |
-| `line comments = 3` | program with only `--` comments produces correct output |
 | `build: 01_basics subset` | inline subset of `01_basics.axm` compiles |
 | `validate: 01_basics subset` | output passes `wasm-validate` / Node WebAssembly.validate |
 | `01_basics subset = 73` | `main()` returns `square(5)+distance_sq(0,0,3,4)+bool_to_int(true)+abs(neg(7))+get_x(move_right(make_point(10,20),5))` = 73 |

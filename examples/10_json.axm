@@ -1,14 +1,6 @@
--- 10_json.axm
--- JSON-like data representation and traversal.
--- Demonstrates recursive types, pattern matching, and effect-based error reporting.
-
 type List<a> = | Nil | Cons(a, List<a>)
 type Option<a> = | None | Some(a)
 type Pair<a, b> = | Pair(a, b)
-
--- ----------------------------------------------------------------
--- JSON value type
--- ----------------------------------------------------------------
 
 type Json
   = | JNull
@@ -18,10 +10,6 @@ type Json
   | JString(String)
   | JArray(List<Json>)
   | JObject(List<Pair<String, Json>>)
-
--- ----------------------------------------------------------------
--- Constructors (ergonomic helpers — stdlib candidates)
--- ----------------------------------------------------------------
 
 fn json_object(fields: List<Pair<String, Json>>) -> Json ! pure {
   j_object(fields)
@@ -46,10 +34,6 @@ fn json_bool(b: Bool) -> Json ! pure {
 fn json_null() -> Json ! pure {
   j_null()
 }
-
--- ----------------------------------------------------------------
--- Accessors with error effects
--- ----------------------------------------------------------------
 
 type JsonError
   = | NotAnObject(Json)
@@ -103,11 +87,6 @@ fn as_bool(j: Json) -> Bool ! {Throw<JsonError>} {
   }
 }
 
--- ----------------------------------------------------------------
--- Traversal and transformation
--- ----------------------------------------------------------------
-
--- Map a function over all values in a JSON tree (post-order).
 fn json_map(f: (j: Json) -> Json ! pure, j: Json) -> Json ! pure {
   match j with {
     | JArray(items) =>
@@ -136,7 +115,6 @@ fn map_json_fields(
   }
 }
 
--- Collect all string values in a JSON tree.
 fn collect_strings(j: Json) -> List<String> ! pure {
   match j with {
     | JString(s) => cons(s, nil())
@@ -166,10 +144,6 @@ fn flat_map_fields(
   }
 }
 
--- ----------------------------------------------------------------
--- Path-based access: "a.b.c" style dotted paths
--- ----------------------------------------------------------------
-
 type Path = | Path(List<String>)
 
 fn get_path(path: Path, j: Json) -> Json ! {Throw<JsonError>} {
@@ -186,10 +160,6 @@ fn follow_path(segments: List<String>, j: Json) -> Json ! {Throw<JsonError>} {
       follow_path(rest, child)
   }
 }
-
--- ----------------------------------------------------------------
--- Helpers
--- ----------------------------------------------------------------
 
 fn lookup_field(
   key: String,
@@ -209,10 +179,6 @@ fn list_nth<a>(n: Int, xs: List<a>) -> Option<a> ! pure {
       if eq(n, 0) { some(h) } else { list_nth(sub(n, 1), t) }
   }
 }
-
--- ----------------------------------------------------------------
--- Example: extract data from a JSON structure
--- ----------------------------------------------------------------
 
 fn example_json() -> Json ! pure {
   j_object(

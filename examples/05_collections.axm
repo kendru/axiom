@@ -1,16 +1,8 @@
--- 05_collections.axm
--- List and Map operations. These guide what the stdlib should include.
-
 type List<a> = | Nil | Cons(a, List<a>)
 type Option<a> = | None | Some(a)
 type Pair<a, b> = | Pair(a, b)
 type Ordering = | LT | EQ | GT
 
--- ----------------------------------------------------------------
--- List utilities beyond the basics in 02_data_types
--- ----------------------------------------------------------------
-
--- Take the first n elements.
 fn take<a>(n: Int, xs: List<a>) -> List<a> ! pure {
   if lte(n, 0) {
     nil()
@@ -22,7 +14,6 @@ fn take<a>(n: Int, xs: List<a>) -> List<a> ! pure {
   }
 }
 
--- Drop the first n elements.
 fn drop<a>(n: Int, xs: List<a>) -> List<a> ! pure {
   if lte(n, 0) {
     xs
@@ -34,7 +25,6 @@ fn drop<a>(n: Int, xs: List<a>) -> List<a> ! pure {
   }
 }
 
--- Zip two lists into a list of pairs.
 fn zip<a, b>(xs: List<a>, ys: List<b>) -> List<Pair<a, b>> ! pure {
   match xs with {
     | Nil => nil()
@@ -46,7 +36,6 @@ fn zip<a, b>(xs: List<a>, ys: List<b>) -> List<Pair<a, b>> ! pure {
   }
 }
 
--- Unzip a list of pairs.
 fn unzip<a, b>(ps: List<Pair<a, b>>) -> Pair<List<a>, List<b>> ! pure {
   match ps with {
     | Nil => pair(nil(), nil())
@@ -58,7 +47,6 @@ fn unzip<a, b>(ps: List<Pair<a, b>>) -> Pair<List<a>, List<b>> ! pure {
   }
 }
 
--- Find the first element satisfying a predicate.
 fn find<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Option<a> ! pure {
   match xs with {
     | Nil => none()
@@ -66,7 +54,6 @@ fn find<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Option<a> ! pure {
   }
 }
 
--- Check if any element satisfies a predicate.
 fn any<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Bool ! pure {
   match xs with {
     | Nil => false
@@ -74,7 +61,6 @@ fn any<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Bool ! pure {
   }
 }
 
--- Check if all elements satisfy a predicate.
 fn all<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Bool ! pure {
   match xs with {
     | Nil => true
@@ -82,7 +68,6 @@ fn all<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> Bool ! pure {
   }
 }
 
--- Flat-map over a list.
 fn flat_map<a, b>(f: (x: a) -> List<b> ! pure, xs: List<a>) -> List<b> ! pure {
   match xs with {
     | Nil => nil()
@@ -90,7 +75,6 @@ fn flat_map<a, b>(f: (x: a) -> List<b> ! pure, xs: List<a>) -> List<b> ! pure {
   }
 }
 
--- Intersperse a separator between elements.
 fn intersperse<a>(sep: a, xs: List<a>) -> List<a> ! pure {
   match xs with {
     | Nil => nil()
@@ -99,7 +83,6 @@ fn intersperse<a>(sep: a, xs: List<a>) -> List<a> ! pure {
   }
 }
 
--- Sort using merge sort.
 fn sort<a>(cmp: (x: a, y: a) -> Ordering ! pure, xs: List<a>) -> List<a> ! pure {
   match xs with {
     | Nil => nil()
@@ -132,10 +115,6 @@ fn split_half<a>(xs: List<a>) -> Pair<List<a>, List<a>> ! pure {
   let half = div(n, 2) in
   pair(take(half, xs), drop(half, xs))
 }
-
--- ----------------------------------------------------------------
--- Association list (simple key-value map)
--- ----------------------------------------------------------------
 
 type AssocList<k, v> = | AssocList(List<Pair<k, v>>)
 

@@ -1,16 +1,7 @@
--- 09_pipeline.axm
--- Data transformation pipelines using function composition.
--- Demonstrates higher-order functions and effect-polymorphic pipelines.
-
 type List<a> = | Nil | Cons(a, List<a>)
 type Option<a> = | None | Some(a)
 type Pair<a, b> = | Pair(a, b)
 
--- ----------------------------------------------------------------
--- Function composition
--- ----------------------------------------------------------------
-
--- Compose two pure functions: returns the result of f(g(x)).
 fn compose_apply<a, b, c>(
   f: (x: b) -> c ! pure,
   g: (x: a) -> b ! pure,
@@ -19,30 +10,18 @@ fn compose_apply<a, b, c>(
   f(g(x))
 }
 
--- Pipe a value through a function (flip of application).
 fn pipe<a, b>(x: a, f: (x: a) -> b ! pure) -> b ! pure {
   f(x)
 }
 
--- ----------------------------------------------------------------
--- Pipeline type: a reusable chain of transformations
--- ----------------------------------------------------------------
-
--- A Step is a named transformation.
 type Step<a, b> = | Step(String, (x: a) -> b ! pure)
 
--- Apply a single step.
 fn apply_step<a, b>(step: Step<a, b>, input: a) -> b ! pure {
   match step with {
     | Step(_, f) => f(input)
   }
 }
 
--- ----------------------------------------------------------------
--- Effectful pipelines
--- ----------------------------------------------------------------
-
--- Run a logged step that can fail.
 fn run_step_logged<a, b>(
   step: Step<a, b>,
   input: a
@@ -57,7 +36,6 @@ fn run_step_logged<a, b>(
   }
 }
 
--- Run a list of homogeneous steps in sequence.
 fn run_pipeline<a>(
   steps: List<Step<a, a>>,
   input: a
@@ -69,10 +47,6 @@ fn run_pipeline<a>(
       run_pipeline(rest, output)
   }
 }
-
--- ----------------------------------------------------------------
--- Example: text processing pipeline
--- ----------------------------------------------------------------
 
 fn normalize_whitespace(s: String) -> String ! pure {
   replace_all(s, "  ", " ")
@@ -96,10 +70,6 @@ fn text_pipeline() -> List<Step<String, String>> ! pure {
   cons(step("truncate", fn (s: String) -> String ! pure { truncate(200, s) }),
   nil())))
 }
-
--- ----------------------------------------------------------------
--- Example: numeric data pipeline
--- ----------------------------------------------------------------
 
 type DataPoint = | DataPoint(String, Float64) @# label, value #@
 
@@ -134,10 +104,6 @@ fn numeric_pipeline() -> List<Step<DataPoint, DataPoint>> ! pure {
   nil())))
 }
 
--- ----------------------------------------------------------------
--- Batch processing: apply pipeline to a collection
--- ----------------------------------------------------------------
-
 fn process_batch<a>(
   steps: List<Step<a, a>>,
   items: List<a>
@@ -151,7 +117,6 @@ fn process_batch<a>(
   }
 }
 
--- Count items that pass a predicate after processing.
 fn count_matching<a>(
   pred: (x: a) -> Bool ! pure,
   steps: List<Step<a, a>>,

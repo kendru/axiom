@@ -1,15 +1,7 @@
--- 08_config.axm
--- Configuration loading with layered effect handling.
--- Demonstrates nested handlers and translating between effects.
-
 type List<a> = | Nil | Cons(a, List<a>)
 type Option<a> = | None | Some(a)
 type Result<a, e> = | Ok(a) | Err(e)
 type Pair<a, b> = | Pair(a, b)
-
--- ----------------------------------------------------------------
--- Configuration types
--- ----------------------------------------------------------------
 
 type ConfigValue
   = | CString(String)
@@ -22,10 +14,6 @@ type ConfigError
   = | KeyNotFound(String)
   | TypeMismatch(String, String) @# key, expected type #@
 
--- ----------------------------------------------------------------
--- Effects for configuration
--- ----------------------------------------------------------------
-
 effect ConfigRead {
   get_config: (String) -> ConfigValue
 }
@@ -33,10 +21,6 @@ effect ConfigRead {
 effect Env {
   get_env: (String) -> Option<String>
 }
-
--- ----------------------------------------------------------------
--- Reading typed config values
--- ----------------------------------------------------------------
 
 fn get_string(key: String) -> String ! {ConfigRead, Throw<ConfigError>} {
   match perform ConfigRead.get_config(key) with {
@@ -66,10 +50,6 @@ fn get_string_or(key: String, default: String) -> String ! {ConfigRead} {
   }
 }
 
--- ----------------------------------------------------------------
--- Application configuration
--- ----------------------------------------------------------------
-
 type AppConfig = | AppConfig(String, Int, Bool, String)
   @# host, port, debug, log_path #@
 
@@ -83,11 +63,6 @@ fn load_app_config() -> AppConfig ! {ConfigRead, Throw<ConfigError>} {
   }
 }
 
--- ----------------------------------------------------------------
--- Handlers: different config sources
--- ----------------------------------------------------------------
-
--- Handler that reads from a static Config value (in-memory map).
 fn with_static_config<a>(
   cfg: Config,
   computation: (u: Unit) -> a ! {ConfigRead}
@@ -103,7 +78,6 @@ fn with_static_config<a>(
   }
 }
 
--- Handler that reads from environment variables (translating effects).
 fn with_env_config<a>(
   computation: (u: Unit) -> a ! {ConfigRead}
 ) -> a ! {Env, Throw<ConfigError>} {
@@ -118,7 +92,6 @@ fn with_env_config<a>(
   }
 }
 
--- Layered handler: try static config first, fall back to env.
 fn with_layered_config<a>(
   cfg: Config,
   computation: (u: Unit) -> a ! {ConfigRead}
@@ -138,10 +111,6 @@ fn with_layered_config<a>(
   }
 }
 
--- ----------------------------------------------------------------
--- Config lookup helper
--- ----------------------------------------------------------------
-
 fn config_lookup(key: String, cfg: Config) -> Option<ConfigValue> ! pure {
   match cfg with {
     | Config(entries) => lookup_by_key(key, entries)
@@ -158,10 +127,6 @@ fn lookup_by_key(
       if string_eq(k, key) { some(v) } else { lookup_by_key(key, rest) }
   }
 }
-
--- ----------------------------------------------------------------
--- Example: building a config and using it
--- ----------------------------------------------------------------
 
 fn example_config() -> Config ! pure {
   config(

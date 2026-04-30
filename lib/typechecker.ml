@@ -1482,3 +1482,103 @@ let check_program (prog : program) : env * effect_env =
   in
   List.iter check_decl prog;
   (env0, eenv0)
+
+(* ------------------------------------------------------------------ *)
+(* Exhaustiveness warning collection (non-raising)                     *)
+(* ------------------------------------------------------------------ *)
+
+type match_warning = {
+  mw_line    : int;
+  mw_col     : int;
+  mw_missing : string list;
+}
+
+(** Walk [prog] and return one [match_warning] per non-exhaustive match
+    expression.  Uses [type_ctor_env] (rebuilt from [prog]) for ADT
+    constructor lookup.  Because the AST carries no source positions,
+    [mw_line] and [mw_col] are always 0. *)
+let collect_match_warnings (prog : program) : match_warning list =
+  type_ctor_env := stdlib_type_ctor_env @ build_type_ctor_env prog;
+  let warnings = ref [] in
+  let add_warning missing =
+    warnings := { mw_line = 0; mw_col = 0; mw_missing = missing } :: !warnings
+  in
+  let check_match_pats arms =
+    let flat =
+      List.concat_map flatten_or_pat (List.map (fun a -> a.pattern) arms)
+    in
+    if List.exists
+        (fun p -> match p.pat_desc with PWild | PVar _ -> true | _ -> false)
+        flat
+    then ()
+    else begin
+      let ctor_names = List.filter_map (fun p ->
+          match p.pat_desc with PCtor (n, _) -> Some n | _ -> None) flat in
+      let has_true  = List.exists (fun p -> p.pat_desc = PLitTrue)  flat in
+      let has_false = List.exists (fun p -> p.pat_desc = PLitFalse) flat in
+      if ctor_names <> [] then begin
+        match List.find_opt (fun (_, ctors) ->
+            List.exists (fun c -> List.mem c ctor_names) ctors)
+            !type_ctor_env
+        with
+        | None -> ()
+        | Some (_, all_ctors) ->
+          let missing =
+            List.filter (fun c -> not (List.mem c ctor_names)) all_ctors
+          in
+          if missing <> [] then add_warning missing
+      end else if has_true || has_false then begin
+        let missing =
+          (if has_true  then [] else ["true"]) @
+          (if has_false then [] else ["false"])
+        in
+        if missing <> [] then add_warning missing
+      end
+    end
+  in
+  let rec walk_expr e =
+    match e.desc with
+    | Match { scrutinee; arms } ->
+      walk_expr scrutinee;
+      List.iter (fun arm -> walk_expr arm.arm_body) arms;
+      check_match_pats arms
+    | Let { value; body; _ } ->
+      walk_expr value; walk_expr body
+    | App (f, args) ->
+      walk_expr f; List.iter walk_expr args
+    | Fn { fn_body; _ } ->
+      walk_expr fn_body
+    | If { cond; then_; else_ } ->
+      walk_expr cond; walk_expr then_; walk_expr else_
+    | Do stmts ->
+      List.iter (function
+        | StmtLet { value; _ } -> walk_expr value
+        | StmtExpr e -> walk_expr e) stmts
+    | Letrec (bindings, body) ->
+      List.iter (fun b -> walk_expr b.letrec_body) bindings;
+      walk_expr body
+    | Record fields ->
+      List.iter (fun (_, e) -> walk_expr e) fields
+    | RecordUpdate (base, fields) ->
+      walk_expr base; List.iter (fun (_, e) -> walk_expr e) fields
+    | Project (e, _) ->
+      walk_expr e
+    | Perform { args; _ } ->
+      List.iter walk_expr args
+    | Handle { handled; handlers } ->
+      walk_expr handled;
+      List.iter (fun h ->
+          List.iter (fun op -> walk_expr op.op_handler_body) h.op_handlers;
+          Option.iter (fun r -> walk_expr r.return_body) h.return_handler)
+        handlers
+    | Var _ | IntLit _ | FloatLit _ | StringLit _
+    | BoolLit _ | UnitLit -> ()
+  in
+  let rec walk_decl d =
+    match d.decl_desc with
+    | DeclFn { decl_body; _ } -> walk_expr decl_body
+    | DeclModule { body; _ } -> List.iter walk_decl body
+    | DeclType _ | DeclEffect _ | DeclRequire _ | DeclImport _ -> ()
+  in
+  List.iter walk_decl prog;
+  List.rev !warnings

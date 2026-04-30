@@ -1469,6 +1469,79 @@ let test_stdlib_example_02_result () =
     |}
 
 (* ------------------------------------------------------------------ *)
+(* collect_match_warnings tests                                         *)
+(* ------------------------------------------------------------------ *)
+
+let test_collect_warnings_exhaustive () =
+  let prog = parse_program
+      {|
+        type Color = | Red | Green | Blue
+
+        fn describe(c: Color) -> Int ! pure {
+          match c with {
+            | Red   => 0
+            | Green => 1
+            | Blue  => 2
+          }
+        }
+      |}
+  in
+  let warnings = collect_match_warnings prog in
+  Alcotest.(check int) "no warnings for exhaustive match" 0 (List.length warnings)
+
+let test_collect_warnings_non_exhaustive () =
+  let prog = parse_program
+      {|
+        type Color = | Red | Green | Blue
+
+        fn bad(c: Color) -> Int ! pure {
+          match c with {
+            | Red => 0
+          }
+        }
+      |}
+  in
+  let warnings = collect_match_warnings prog in
+  Alcotest.(check bool) "one warning" true (List.length warnings = 1);
+  let w = List.hd warnings in
+  Alcotest.(check bool) "Green missing" true (List.mem "Green" w.mw_missing);
+  Alcotest.(check bool) "Blue missing"  true (List.mem "Blue"  w.mw_missing)
+
+let test_collect_warnings_wildcard_covers () =
+  let prog = parse_program
+      {|
+        type Color = | Red | Green | Blue
+
+        fn any(c: Color) -> Int ! pure {
+          match c with {
+            | Red => 0
+            | _   => 1
+          }
+        }
+      |}
+  in
+  let warnings = collect_match_warnings prog in
+  Alcotest.(check int) "wildcard suppresses warning" 0 (List.length warnings)
+
+let test_collect_warnings_multiple_matches () =
+  let prog = parse_program
+      {|
+        type AB = | A | B
+        type XY = | X | Y
+
+        fn f(a: AB) -> Int ! pure {
+          match a with { | A => 0 }
+        }
+
+        fn g(x: XY) -> Int ! pure {
+          match x with { | X => 0 }
+        }
+      |}
+  in
+  let warnings = collect_match_warnings prog in
+  Alcotest.(check int) "two non-exhaustive matches produce two warnings" 2 (List.length warnings)
+
+(* ------------------------------------------------------------------ *)
 (* Test runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -1615,6 +1688,12 @@ let () =
         ; Alcotest.test_case "record literal field"      `Quick test_exhaustive_record_literal_field
         ; Alcotest.test_case "record multi-pattern"      `Quick test_exhaustive_record_multi_pattern
         ; Alcotest.test_case "record open pattern"       `Quick test_exhaustive_record_open_pattern
+        ] )
+    ; ( "collect_match_warnings",
+        [ Alcotest.test_case "exhaustive match — no warnings"         `Quick test_collect_warnings_exhaustive
+        ; Alcotest.test_case "non-exhaustive match — missing ctors"   `Quick test_collect_warnings_non_exhaustive
+        ; Alcotest.test_case "wildcard arm covers all"                `Quick test_collect_warnings_wildcard_covers
+        ; Alcotest.test_case "multiple non-exhaustive matches"        `Quick test_collect_warnings_multiple_matches
         ] )
     ; ( "open-effect-rows",
         [ Alcotest.test_case "open row parses"           `Quick test_row_var_open_row_parses

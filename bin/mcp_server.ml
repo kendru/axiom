@@ -239,6 +239,19 @@ let tool_query_interface_schema =
     ]);
   ]
 
+let tool_verify_exhaustive_schema =
+  Object [
+    ("name", String "verify_exhaustive");
+    ("description", String "Check every match expression in a previously submitted module for non-exhaustive patterns; returns warnings with missing constructor names");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("module_name", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "module_name"]);
+    ]);
+  ]
+
 let handle_submit_module state args =
   let source      = match obj_get "source"      args with String s -> s | _ -> "" in
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
@@ -301,6 +314,21 @@ let render_interface_decl decl =
     Some (Printer.print_decl decl)
   | _ -> None
 
+let handle_verify_exhaustive state args =
+  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
+  match Hashtbl.find_opt state.modules module_name with
+  | None ->
+    Object [("ok", Bool false);
+            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
+  | Some ms ->
+    let warnings = Typechecker.collect_match_warnings ms.typed_ast in
+    let json_warnings = List.map (fun (w : Typechecker.match_warning) ->
+        Object [
+          ("location", Object [("line", Int w.mw_line); ("col", Int w.mw_col)]);
+          ("missing_patterns", Array (List.map (fun s -> String s) w.mw_missing));
+        ]) warnings in
+    Object [("warnings", Array json_warnings)]
+
 let handle_query_interface state args =
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
   match Hashtbl.find_opt state.modules module_name with
@@ -327,7 +355,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -356,6 +384,13 @@ let handle state msg =
        ]))
      | "query_interface" ->
        let result = handle_query_interface state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "verify_exhaustive" ->
+       let result = handle_verify_exhaustive state args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

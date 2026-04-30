@@ -252,6 +252,20 @@ let tool_verify_exhaustive_schema =
     ]);
   ]
 
+let tool_verify_effects_schema =
+  Object [
+    ("name", String "verify_effects");
+    ("description", String "Check that every effect performed on any reachable call path from an entry-point function is handled before reaching the entry point's boundary; returns unhandled effect entries with effect name and call-site location");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("module_name",  Object [("type", String "string")]);
+        ("entry_point",  Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "module_name"; String "entry_point"]);
+    ]);
+  ]
+
 let handle_submit_module state args =
   let source      = match obj_get "source"      args with String s -> s | _ -> "" in
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
@@ -329,6 +343,29 @@ let handle_verify_exhaustive state args =
         ]) warnings in
     Object [("warnings", Array json_warnings)]
 
+let handle_verify_effects state args =
+  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
+  let entry_point = match obj_get "entry_point" args with String s -> s | _ -> "" in
+  match Hashtbl.find_opt state.modules module_name with
+  | None ->
+    Object [("ok", Bool false);
+            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
+  | Some ms ->
+    (try
+       let sites = Typechecker.collect_unhandled_effects ms.typed_ast entry_point in
+       let json_sites = List.map (fun (s : Typechecker.effect_site) ->
+           Object [
+             ("effect", String s.es_effect);
+             ("site", Object [
+               ("function", String s.es_function);
+               ("line",     Int s.es_line);
+               ("col",      Int s.es_col);
+             ]);
+           ]) sites in
+       Object [("unhandled", Array json_sites)]
+     with Failure msg ->
+       Object [("ok", Bool false); ("error", String msg)])
+
 let handle_query_interface state args =
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
   match Hashtbl.find_opt state.modules module_name with
@@ -355,7 +392,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -391,6 +428,13 @@ let handle state msg =
        ]))
      | "verify_exhaustive" ->
        let result = handle_verify_exhaustive state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "verify_effects" ->
+       let result = handle_verify_effects state args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

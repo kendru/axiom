@@ -469,6 +469,120 @@ let test_verify_exhaustive_module_not_found () =
       (match err with `String s -> String.length s > 0 | _ -> false)
   )
 
+let verify_effects_call id module_name entry_point =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"verify_effects","arguments":{"module_name":"%s","entry_point":"%s"}}}|}
+    id (json_string_escape module_name) (json_string_escape entry_point)
+
+(* A module where main handles all effects performed by its callees. *)
+let effects_all_handled_source =
+  {|effect Log { log: (String) -> Unit }
+fn helper() -> Unit ! {Log} { perform Log.log("hello") }
+fn main() -> Unit ! pure {
+  handle helper() with {
+    Log { log(msg) => () }
+  }
+}|}
+
+(* A module where main calls a function that performs an unhandled effect. *)
+let effects_unhandled_source =
+  {|effect Log { log: (String) -> Unit }
+fn helper() -> Unit ! {Log} { perform Log.log("hello") }
+fn main() -> Unit ! {Log} { helper() }|}
+
+let test_verify_effects_in_tools_list () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
+    let line = read_line () in
+    let json = mini_parse line in
+    let result = json_field "result" json in
+    let tools = json_field "tools" result in
+    let names = match tools with
+      | `List items ->
+        List.filter_map (fun item ->
+          match json_field "name" item with
+          | `String s -> Some s
+          | _ -> None) items
+      | _ -> []
+    in
+    Alcotest.(check bool) "verify_effects in tools/list" true
+      (List.mem "verify_effects" names)
+  )
+
+let test_verify_effects_all_handled () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 effects_all_handled_source "mymod");
+    ignore (read_line ());
+    write_line (verify_effects_call 3 "mymod" "main");
+    let result = parse_response (read_line ()) in
+    let unhandled = json_field "unhandled" result in
+    Alcotest.(check bool) "unhandled is empty list" true
+      (match unhandled with `List [] -> true | _ -> false)
+  )
+
+let test_verify_effects_unhandled () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 effects_unhandled_source "mymod");
+    ignore (read_line ());
+    write_line (verify_effects_call 3 "mymod" "main");
+    let result = parse_response (read_line ()) in
+    let unhandled = json_field "unhandled" result in
+    Alcotest.(check bool) "unhandled is non-empty" true
+      (match unhandled with `List (_ :: _) -> true | _ -> false);
+    (match unhandled with
+     | `List (entry :: _) ->
+       let eff = json_field "effect" entry in
+       Alcotest.(check bool) "effect name is a non-empty string" true
+         (match eff with `String s -> String.length s > 0 | _ -> false);
+       let site = json_field "site" entry in
+       let fn_field = json_field "function" site in
+       Alcotest.(check bool) "site has function field" true
+         (match fn_field with `String s -> String.length s > 0 | _ -> false);
+       let line = json_field "line" site in
+       Alcotest.(check bool) "site has line field" true
+         (match line with `Int _ -> true | _ -> false);
+       let col = json_field "col" site in
+       Alcotest.(check bool) "site has col field" true
+         (match col with `Int _ -> true | _ -> false)
+     | _ -> ())
+  )
+
+let test_verify_effects_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (verify_effects_call 2 "nonexistent" "main");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_verify_effects_entry_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 effects_all_handled_source "mymod");
+    ignore (read_line ());
+    write_line (verify_effects_call 3 "mymod" "nonexistent_fn");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
 let () =
   ignore well_typed_source;
   ignore ill_typed_source;
@@ -495,5 +609,12 @@ let () =
       Alcotest.test_case "appears in tools/list"                             `Quick test_verify_exhaustive_in_tools_list;
       Alcotest.test_case "returns empty warnings for exhaustive module"      `Quick test_verify_exhaustive_exhaustive_module;
       Alcotest.test_case "returns error when module not found"               `Quick test_verify_exhaustive_module_not_found;
+    ]);
+    ("verify_effects", [
+      Alcotest.test_case "appears in tools/list"                             `Quick test_verify_effects_in_tools_list;
+      Alcotest.test_case "returns empty unhandled when all effects handled"  `Quick test_verify_effects_all_handled;
+      Alcotest.test_case "returns unhandled entries when effects escape"     `Quick test_verify_effects_unhandled;
+      Alcotest.test_case "returns error when module not found"               `Quick test_verify_effects_module_not_found;
+      Alcotest.test_case "returns error when entry point not found"          `Quick test_verify_effects_entry_not_found;
     ]);
   ]

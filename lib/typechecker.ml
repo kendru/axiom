@@ -1582,3 +1582,106 @@ let collect_match_warnings (prog : program) : match_warning list =
   in
   List.iter walk_decl prog;
   List.rev !warnings
+
+(* ------------------------------------------------------------------ *)
+(* Unhandled effect collection                                          *)
+(* ------------------------------------------------------------------ *)
+
+type effect_site = {
+  es_effect   : string;
+  es_function : string;
+  es_line     : int;
+  es_col      : int;
+}
+
+(** [collect_unhandled_effects prog entry_point] walks the call graph
+    reachable from [entry_point] and reports [Perform] nodes whose effect
+    is not covered by an enclosing [Handle] on any path from [entry_point].
+    Raises [Failure] if [entry_point] is not declared in [prog]. *)
+let collect_unhandled_effects (prog : program) (entry_point : string)
+    : effect_site list =
+  let fn_map : (string, expr) Hashtbl.t = Hashtbl.create 16 in
+  let rec index_decls ds =
+    List.iter (fun d ->
+        match d.decl_desc with
+        | DeclFn { fn_name; decl_body; _ } ->
+          Hashtbl.replace fn_map fn_name decl_body
+        | DeclModule { body; _ } -> index_decls body
+        | _ -> ()
+      ) ds
+  in
+  index_decls prog;
+  if not (Hashtbl.mem fn_map entry_point) then
+    failwith (Printf.sprintf "Entry point '%s' not found in module" entry_point);
+  let seen     : (string * string, unit) Hashtbl.t = Hashtbl.create 8 in
+  let unhandled = ref [] in
+  let in_flight = Hashtbl.create 8 in
+  let rec walk_fn fn_name handled =
+    if not (Hashtbl.mem in_flight fn_name) then
+      match Hashtbl.find_opt fn_map fn_name with
+      | None -> ()
+      | Some body ->
+        Hashtbl.replace in_flight fn_name ();
+        walk_expr fn_name handled body;
+        Hashtbl.remove in_flight fn_name
+  and walk_expr fn_name handled e =
+    match e.desc with
+    | Perform { effect_name; args; _ } ->
+      List.iter (walk_expr fn_name handled) args;
+      if not (List.mem effect_name handled) then begin
+        let key = (effect_name, fn_name) in
+        if not (Hashtbl.mem seen key) then begin
+          Hashtbl.replace seen key ();
+          unhandled :=
+            { es_effect = effect_name; es_function = fn_name;
+              es_line = 0; es_col = 0 } :: !unhandled
+        end
+      end
+    | Handle { handled = inner; handlers } ->
+      let new_effs     = List.map (fun h -> h.effect_handler) handlers in
+      let inner_handled = new_effs @ handled in
+      walk_expr fn_name inner_handled inner;
+      List.iter (fun h ->
+          List.iter (fun op ->
+              walk_expr fn_name handled op.op_handler_body) h.op_handlers;
+          Option.iter (fun r ->
+              walk_expr fn_name handled r.return_body) h.return_handler
+        ) handlers
+    | App ({ desc = Var callee; _ }, args) ->
+      List.iter (walk_expr fn_name handled) args;
+      walk_fn callee handled
+    | App (f, args) ->
+      walk_expr fn_name handled f;
+      List.iter (walk_expr fn_name handled) args
+    | Fn { fn_body; _ } ->
+      walk_expr fn_name handled fn_body
+    | Let { value; body; _ } ->
+      walk_expr fn_name handled value;
+      walk_expr fn_name handled body
+    | If { cond; then_; else_ } ->
+      walk_expr fn_name handled cond;
+      walk_expr fn_name handled then_;
+      walk_expr fn_name handled else_
+    | Do stmts ->
+      List.iter (function
+          | StmtLet { value; _ } -> walk_expr fn_name handled value
+          | StmtExpr e           -> walk_expr fn_name handled e
+        ) stmts
+    | Letrec (bindings, body) ->
+      List.iter (fun b -> walk_expr fn_name handled b.letrec_body) bindings;
+      walk_expr fn_name handled body
+    | Record fields ->
+      List.iter (fun (_, e) -> walk_expr fn_name handled e) fields
+    | RecordUpdate (base, fields) ->
+      walk_expr fn_name handled base;
+      List.iter (fun (_, e) -> walk_expr fn_name handled e) fields
+    | Project (e, _) ->
+      walk_expr fn_name handled e
+    | Match { scrutinee; arms } ->
+      walk_expr fn_name handled scrutinee;
+      List.iter (fun arm -> walk_expr fn_name handled arm.arm_body) arms
+    | Var _ | IntLit _ | FloatLit _ | StringLit _
+    | BoolLit _ | UnitLit -> ()
+  in
+  walk_fn entry_point [];
+  List.rev !unhandled

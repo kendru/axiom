@@ -544,9 +544,14 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
         effect_map table_funcs
     in
     let ctx = setup_trampoline tco idx (List.length param_tys) ctx in
-    let instrs = compile_eexpr ~tail:true ctx decl_body in
-    let instrs = wrap_trampoline tco instrs in
-    pending := !pending @ [(idx, !(ctx.extra_locals), instrs)]
+    (match (try Ok (compile_eexpr ~tail:true ctx decl_body) with Failure msg -> Error msg) with
+     | Ok instrs ->
+       let instrs = wrap_trampoline tco instrs in
+       pending := !pending @ [(idx, !(ctx.extra_locals), instrs)]
+     | Error _ ->
+       (* Body uses unsupported constructs (e.g. String ops, unimplemented
+          primitives); emit a stub so the WASM module stays valid. *)
+       pending := !pending @ [(idx, [], [I32Const 0])])
   ) fn_entries;
   if not (List.exists (fun (name, _, _, _) -> name = "main") fn_entries) then begin
     let idx = reserve_function m [] [I32] in

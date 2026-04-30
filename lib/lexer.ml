@@ -324,6 +324,11 @@ let tokenize (src : string) : token list =
     | Some '<' -> advance st; push LAngle;  loop ()
     | Some '>' -> advance st; push RAngle;  loop ()
     | Some '+' -> advance st; push Plus;    loop ()
+    (* Line comments: -- ... newline *)
+    | Some '-' when peek2 st = Some '-' ->
+      while st.pos < st.len && st.src.[st.pos] <> '\n' do advance st done;
+      loop ()
+
     | Some '-' -> advance st; push Minus;   loop ()
     | Some '*' -> advance st; push Star;    loop ()
     | Some '/' -> advance st; push Slash;   loop ()

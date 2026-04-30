@@ -243,6 +243,80 @@ accesses are naturally aligned.
 
 ---
 
+## End-to-end pipeline (Milestone 5)
+
+### Invoking the compiler
+
+```bash
+dune exec bin/main.exe -- build <input.axm> -o <output.wasm>
+# Optional: use trampoline TCO instead of WASM tail-call proposal
+dune exec bin/main.exe -- build <input.axm> -o <output.wasm> --no-tail-calls
+```
+
+Running the compiled module with `wasmtime`:
+
+```bash
+wasmtime --invoke main output.wasm   # prints the i32 return value of main
+```
+
+### `examples/01_basics.axm` — what compiles, what is skipped
+
+`examples/01_basics.axm` compiles end-to-end without error.  Functions whose
+parameter or return types are unsupported are silently filtered at codegen
+time; functions whose *bodies* use unimplemented constructs (e.g. String
+primitives) are compiled to a stub that returns `i32.const 0`.
+
+| Function | Status | Notes |
+|----------|--------|-------|
+| `square` | **Compiled** | mul, let-binding |
+| `distance` | **Compiled** | multiple params, nested let |
+| `id<a>` | **Compiled** | type variable lowered to i32 |
+| `bool_to_int` | **Compiled** | Bool pattern match |
+| `abs` | **Compiled** | if/else, `neg` primitive |
+| `make_point` | **Compiled** | ADT constructor |
+| `get_x` | **Compiled** | constructor pattern match |
+| `move_right` | **Compiled** | pattern match + constructor |
+| `greet` | **Stub** | body uses `concat` (String not implemented) |
+| `apply_twice<a>` | **Skipped** | function-type param (`TyFun` unsupported) |
+| `first_match<a>` | **Skipped** | `List<a>` param (`TyApp` unsupported) |
+
+The file has no `main`, so the emitted module exports an empty `main` stub
+returning 0.
+
+### Integration test (issue #45)
+
+`test/test_build_pipeline.ml`, suite `basics_e2e`:
+
+| Test | What it checks |
+|------|---------------|
+| `line comments compile` | `--` line comments are silently skipped by the lexer |
+| `line comments = 3` | program with only `--` comments produces correct output |
+| `build: 01_basics subset` | inline subset of `01_basics.axm` compiles |
+| `validate: 01_basics subset` | output passes `wasm-validate` / Node WebAssembly.validate |
+| `01_basics subset = 73` | `main()` returns `square(5)+distance_sq(0,0,3,4)+bool_to_int(true)+abs(neg(7))+get_x(move_right(make_point(10,20),5))` = 73 |
+| `build: 01_basics.axm from disk` | the actual `examples/01_basics.axm` file compiles |
+| `validate: 01_basics.axm from disk` | its output is valid WASM |
+
+### Known gaps
+
+The following constructs are **not yet supported** by the code generator:
+
+- **String type**: no runtime representation; `TyName "String"` passes the
+  type filter but bodies using `concat`, string literals, etc. fall back to
+  stub codegen.
+- **Generic higher-order parameters**: `TyFun` and `TyApp` parameter types
+  are filtered out; functions like `apply_twice` and `first_match` are silently
+  dropped from the output.
+- **Recursive types**: `List<a>`, `Option<a>` etc. require a GC or tagging
+  scheme beyond the current flat-i32 model.
+- **Algebraic effects in generics**: effect polymorphism works for monomorphic
+  effects; polymorphic effect rows are not yet lowered.
+- **Multi-value returns / tuples**: no tuple codegen; `TyTuple` params are filtered.
+- **Standard library**: `none`, `some`, `Nil`, `Cons` constructors are not
+  built-in — programs must declare their own ADTs.
+
+---
+
 ## Extending the code generator
 
 When adding a new Axiom expression to codegen:

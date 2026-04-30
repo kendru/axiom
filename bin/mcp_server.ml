@@ -226,6 +226,19 @@ let tool_query_signature_schema =
     ]);
   ]
 
+let tool_query_interface_schema =
+  Object [
+    ("name", String "query_interface");
+    ("description", String "Return the public API of a previously submitted module: pub type aliases, pub effect declarations, and pub function signatures");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("module_name", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "module_name"]);
+    ]);
+  ]
+
 let handle_submit_module state args =
   let source      = match obj_get "source"      args with String s -> s | _ -> "" in
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
@@ -267,6 +280,38 @@ let handle_query_signature state args =
       let sig_str = Format.asprintf "%a" Typechecker.pp_ty scheme.body in
       Object [("ok", Bool true); ("signature", String sig_str)]
 
+let render_interface_decl decl =
+  match decl.Ast.decl_desc with
+  | Ast.DeclFn { pub = true; fn_name; type_params; params; return_type; effects; _ } ->
+    let tp_s =
+      if type_params = [] then ""
+      else "<" ^ String.concat ", " type_params ^ ">"
+    in
+    let ann = match return_type, effects with
+      | Some ret, Some eff ->
+        " -> " ^ Printer.print_type_expr ret ^ " ! " ^ Printer.print_effect_set eff
+      | Some ret, None -> " -> " ^ Printer.print_type_expr ret
+      | _ -> ""
+    in
+    Some ("pub fn " ^ fn_name ^ tp_s ^ "(" ^
+          String.concat ", " (List.map Printer.print_param params) ^ ")" ^ ann)
+  | Ast.DeclType { pub = true; _ } ->
+    Some (Printer.print_decl decl)
+  | Ast.DeclEffect { pub = true; _ } ->
+    Some (Printer.print_decl decl)
+  | _ -> None
+
+let handle_query_interface state args =
+  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
+  match Hashtbl.find_opt state.modules module_name with
+  | None ->
+    Object [("ok", Bool false);
+            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
+  | Some ms ->
+    let lines = List.filter_map render_interface_decl ms.typed_ast in
+    let iface = String.concat "\n" lines in
+    Object [("interface", String iface)]
+
 let handle state msg =
   let id     = obj_get "id" msg in
   let meth   = match obj_get "method" msg with String s -> s | _ -> "" in
@@ -282,7 +327,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -304,6 +349,13 @@ let handle state msg =
        ]))
      | "query_signature" ->
        let result = handle_query_signature state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "query_interface" ->
+       let result = handle_query_interface state args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

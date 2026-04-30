@@ -179,6 +179,11 @@ let query_signature_call id module_name function_name =
     {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_signature","arguments":{"module_name":"%s","function_name":"%s"}}}|}
     id (json_string_escape module_name) (json_string_escape function_name)
 
+let query_interface_call id module_name =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_interface","arguments":{"module_name":"%s"}}}|}
+    id (json_string_escape module_name)
+
 let test_verify_types_well_typed () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
@@ -314,6 +319,93 @@ let test_query_signature_in_tools_list () =
       (List.mem "query_signature" names)
   )
 
+let mixed_visibility_source =
+  {|pub fn add_one(x: Int) -> Int ! pure { add(x, 1) }
+fn internal_helper(x: Int) -> Int ! pure { x }
+pub type Color = | Red | Green | Blue|}
+
+let contains_substring haystack needle =
+  let hlen = String.length haystack and nlen = String.length needle in
+  if nlen = 0 then true
+  else if nlen > hlen then false
+  else
+    let found = ref false in
+    for i = 0 to hlen - nlen do
+      if not !found &&
+         String.sub haystack i nlen = needle then
+        found := true
+    done;
+    !found
+
+let test_query_interface_returns_only_pub () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 mixed_visibility_source "mymod");
+    ignore (read_line ());
+    write_line (query_interface_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let iface = json_field "interface" result in
+    let iface_str = match iface with `String s -> s | _ -> "" in
+    Alcotest.(check bool) "interface contains pub fn" true
+      (contains_substring iface_str "pub fn add_one");
+    Alcotest.(check bool) "interface contains pub type" true
+      (contains_substring iface_str "pub type Color");
+    Alcotest.(check bool) "interface excludes private fn" true
+      (not (contains_substring iface_str "internal_helper"))
+  )
+
+let test_query_interface_fn_has_no_body () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 mixed_visibility_source "mymod");
+    ignore (read_line ());
+    write_line (query_interface_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let iface = json_field "interface" result in
+    let iface_str = match iface with `String s -> s | _ -> "" in
+    Alcotest.(check bool) "interface is a non-empty string" true
+      (String.length iface_str > 0);
+    Alcotest.(check bool) "interface has no fn body braces" true
+      (not (String.contains iface_str '{'))
+  )
+
+let test_query_interface_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (query_interface_call 2 "nonexistent");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_interface_in_tools_list () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
+    let line = read_line () in
+    let json = mini_parse line in
+    let result = json_field "result" json in
+    let tools = json_field "tools" result in
+    let names = match tools with
+      | `List items ->
+        List.filter_map (fun item ->
+          match json_field "name" item with
+          | `String s -> Some s
+          | _ -> None) items
+      | _ -> []
+    in
+    Alcotest.(check bool) "query_interface in tools/list" true
+      (List.mem "query_interface" names)
+  )
+
 let () =
   ignore well_typed_source;
   ignore ill_typed_source;
@@ -329,5 +421,11 @@ let () =
       Alcotest.test_case "returns error when module not found"               `Quick test_query_signature_module_not_found;
       Alcotest.test_case "returns error when function not found in module"   `Quick test_query_signature_function_not_found;
       Alcotest.test_case "appears in tools/list"                             `Quick test_query_signature_in_tools_list;
+    ]);
+    ("query_interface", [
+      Alcotest.test_case "returns only pub declarations"                     `Quick test_query_interface_returns_only_pub;
+      Alcotest.test_case "function signatures have no body"                  `Quick test_query_interface_fn_has_no_body;
+      Alcotest.test_case "returns error when module not found"               `Quick test_query_interface_module_not_found;
+      Alcotest.test_case "appears in tools/list"                             `Quick test_query_interface_in_tools_list;
     ]);
   ]

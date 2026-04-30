@@ -212,6 +212,20 @@ let tool_verify_types_schema =
     ]);
   ]
 
+let tool_query_signature_schema =
+  Object [
+    ("name", String "query_signature");
+    ("description", String "Return the type and effect signature of a named function from a previously submitted module");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("module_name",   Object [("type", String "string")]);
+        ("function_name", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "module_name"; String "function_name"]);
+    ]);
+  ]
+
 let handle_submit_module state args =
   let source      = match obj_get "source"      args with String s -> s | _ -> "" in
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
@@ -237,6 +251,22 @@ let handle_verify_types args =
   with Failure msg ->
     Object [("errors", Array [format_type_error msg])]
 
+let handle_query_signature state args =
+  let module_name   = match obj_get "module_name"   args with String s -> s | _ -> "" in
+  let function_name = match obj_get "function_name" args with String s -> s | _ -> "" in
+  match Hashtbl.find_opt state.modules module_name with
+  | None ->
+    Object [("ok", Bool false);
+            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
+  | Some ms ->
+    match List.assoc_opt function_name ms.type_env with
+    | None ->
+      Object [("ok", Bool false);
+              ("error", String (Printf.sprintf "Function '%s' not found in module '%s'" function_name module_name))]
+    | Some scheme ->
+      let sig_str = Format.asprintf "%a" Typechecker.pp_ty scheme.body in
+      Object [("ok", Bool true); ("signature", String sig_str)]
+
 let handle state msg =
   let id     = obj_get "id" msg in
   let meth   = match obj_get "method" msg with String s -> s | _ -> "" in
@@ -252,7 +282,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -267,6 +297,13 @@ let handle state msg =
        ]))
      | "verify_types" ->
        let result = handle_verify_types args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "query_signature" ->
+       let result = handle_query_signature state args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

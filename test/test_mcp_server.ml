@@ -174,6 +174,11 @@ let submit_module_call id src name =
     {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"submit_module","arguments":{"source":"%s","module_name":"%s"}}}|}
     id (json_string_escape src) (json_string_escape name)
 
+let query_signature_call id module_name function_name =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_signature","arguments":{"module_name":"%s","function_name":"%s"}}}|}
+    id (json_string_escape module_name) (json_string_escape function_name)
+
 let test_verify_types_well_typed () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
@@ -242,6 +247,73 @@ let test_tools_list_includes_verify_types () =
       (List.mem "verify_types" names)
   )
 
+let test_query_signature_success () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 well_typed_source "mymod");
+    ignore (read_line ());
+    write_line (query_signature_call 3 "mymod" "double");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is true" true
+      (match ok with `Bool true -> true | _ -> false);
+    let sig_ = json_field "signature" result in
+    Alcotest.(check bool) "signature is a non-empty string" true
+      (match sig_ with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_signature_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (query_signature_call 2 "nonexistent" "double");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error message is a non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_signature_function_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 well_typed_source "mymod");
+    ignore (read_line ());
+    write_line (query_signature_call 3 "mymod" "nonexistent_fn");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error message is a non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_signature_in_tools_list () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
+    let line = read_line () in
+    let json = mini_parse line in
+    let result = json_field "result" json in
+    let tools = json_field "tools" result in
+    let names = match tools with
+      | `List items ->
+        List.filter_map (fun item ->
+          match json_field "name" item with
+          | `String s -> Some s
+          | _ -> None) items
+      | _ -> []
+    in
+    Alcotest.(check bool) "query_signature in tools/list" true
+      (List.mem "query_signature" names)
+  )
+
 let () =
   ignore well_typed_source;
   ignore ill_typed_source;
@@ -251,5 +323,11 @@ let () =
       Alcotest.test_case "ill-typed program returns non-empty errors" `Quick test_verify_types_type_error;
       Alcotest.test_case "does not update server state"               `Quick test_verify_types_does_not_update_state;
       Alcotest.test_case "appears in tools/list"                      `Quick test_tools_list_includes_verify_types;
+    ]);
+    ("query_signature", [
+      Alcotest.test_case "returns signature for known function"              `Quick test_query_signature_success;
+      Alcotest.test_case "returns error when module not found"               `Quick test_query_signature_module_not_found;
+      Alcotest.test_case "returns error when function not found in module"   `Quick test_query_signature_function_not_found;
+      Alcotest.test_case "appears in tools/list"                             `Quick test_query_signature_in_tools_list;
     ]);
   ]

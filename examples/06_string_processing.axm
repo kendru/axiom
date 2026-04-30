@@ -1,17 +1,8 @@
--- 06_string_processing.axm
--- String manipulation and text transformation.
--- Guides stdlib design for String and Char operations.
-
 type List<a> = | Nil | Cons(a, List<a>)
 type Option<a> = | None | Some(a)
 type Result<a, e> = | Ok(a) | Err(e)
 type Pair<a, b> = | Pair(a, b)
 
--- ----------------------------------------------------------------
--- Basic string operations (stdlib candidates)
--- ----------------------------------------------------------------
-
--- Join a list of strings with a separator.
 fn join(sep: String, parts: List<String>) -> String ! pure {
   match parts with {
     | Nil => ""
@@ -20,12 +11,10 @@ fn join(sep: String, parts: List<String>) -> String ! pure {
   }
 }
 
--- Repeat a string n times.
 fn repeat(s: String, n: Int) -> String ! pure {
   if lte(n, 0) { "" } else { concat(s, repeat(s, sub(n, 1))) }
 }
 
--- Pad a string on the left to a given width.
 fn pad_left(width: Int, pad_char: String, s: String) -> String ! pure {
   let len = string_length(s) in
   if gte(len, width) {
@@ -35,7 +24,6 @@ fn pad_left(width: Int, pad_char: String, s: String) -> String ! pure {
   }
 }
 
--- Pad a string on the right.
 fn pad_right(width: Int, pad_char: String, s: String) -> String ! pure {
   let len = string_length(s) in
   if gte(len, width) {
@@ -44,10 +32,6 @@ fn pad_right(width: Int, pad_char: String, s: String) -> String ! pure {
     concat(s, repeat(pad_char, sub(width, len)))
   }
 }
-
--- ----------------------------------------------------------------
--- Character classification (stdlib candidates)
--- ----------------------------------------------------------------
 
 fn is_whitespace(c: Char) -> Bool ! pure {
   if eq_char(c, space_char()) { true } else { eq_char(c, tab_char()) }
@@ -71,11 +55,6 @@ fn is_alphanumeric(c: Char) -> Bool ! pure {
   if is_alpha(c) { true } else { is_digit(c) }
 }
 
--- ----------------------------------------------------------------
--- String transformations
--- ----------------------------------------------------------------
-
--- Convert a list of chars to a string.
 fn chars_to_string(cs: List<Char>) -> String ! pure {
   match cs with {
     | Nil => ""
@@ -83,7 +62,6 @@ fn chars_to_string(cs: List<Char>) -> String ! pure {
   }
 }
 
--- Convert to uppercase (operating on chars).
 fn to_upper_char(c: Char) -> Char ! pure {
   if is_lower(c) {
     code_to_char(sub(char_code(c), 32))
@@ -104,7 +82,6 @@ fn map_chars(f: (c: Char) -> Char ! pure, cs: List<Char>) -> List<Char> ! pure {
   }
 }
 
--- Trim leading whitespace.
 fn trim_left(s: String) -> String ! pure {
   let cs = string_to_chars(s) in
   chars_to_string(drop_while_chars(is_whitespace, cs))
@@ -118,15 +95,9 @@ fn drop_while_chars(pred: (c: Char) -> Bool ! pure, cs: List<Char>) -> List<Char
   }
 }
 
--- ----------------------------------------------------------------
--- Simple template rendering
--- ----------------------------------------------------------------
-
--- A template is a list of segments: literal text or variable references.
 type Segment = | Literal(String) | Variable(String)
 type Template = | Template(List<Segment>)
 
--- Render a template by looking up variables in an environment.
 fn render(
   tmpl: Template,
   env: List<Pair<String, String>>

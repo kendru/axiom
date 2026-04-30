@@ -1,10 +1,3 @@
--- 04_state_machine.axm
--- Modeling a connection state machine with types and effects.
-
--- ----------------------------------------------------------------
--- Types
--- ----------------------------------------------------------------
-
 type ConnState
   = | Disconnected
   | Connecting(String)
@@ -22,17 +15,9 @@ type ConnResult
   = | Transitioned(ConnState)
   | InvalidTransition(ConnState, ConnEvent)
 
--- ----------------------------------------------------------------
--- Effects
--- ----------------------------------------------------------------
-
 effect ConnLog {
   conn_log: (String) -> Unit
 }
-
--- ----------------------------------------------------------------
--- State transition function (pure core)
--- ----------------------------------------------------------------
 
 fn transition(state: ConnState, event: ConnEvent) -> ConnResult ! pure {
   match state with {
@@ -61,10 +46,6 @@ fn transition(state: ConnState, event: ConnEvent) -> ConnResult ! pure {
       }
   }
 }
-
--- ----------------------------------------------------------------
--- Effectful state machine driver
--- ----------------------------------------------------------------
 
 fn step(
   state: ConnState,
@@ -95,10 +76,6 @@ fn run_events(
   }
 }
 
--- ----------------------------------------------------------------
--- Display helpers
--- ----------------------------------------------------------------
-
 fn show_state(s: ConnState) -> String ! pure {
   match s with {
     | Disconnected => "Disconnected"
@@ -117,10 +94,6 @@ fn show_event(e: ConnEvent) -> String ! pure {
     | ConnError(msg) => concat("Error(", concat(msg, ")"))
   }
 }
-
--- ----------------------------------------------------------------
--- Example: running a full connection lifecycle
--- ----------------------------------------------------------------
 
 fn example_lifecycle() -> ConnState ! {ConnLog, Throw<String>} {
   let events = cons(connect("127.0.0.1:8080"),

@@ -1,23 +1,10 @@
--- 07_validation.axm
--- Data validation with structured error accumulation.
--- Demonstrates composing pure validation logic with effect-based reporting.
-
 type List<a> = | Nil | Cons(a, List<a>)
 type Option<a> = | None | Some(a)
 type Pair<a, b> = | Pair(a, b)
 
--- ----------------------------------------------------------------
--- Validation types
--- ----------------------------------------------------------------
-
--- A validation collects all errors rather than failing on the first one.
 type Validation<a, e> = | Valid(a) | Invalid(List<e>)
 
 type FieldError = | FieldError(String, String) @# field name, error message #@
-
--- ----------------------------------------------------------------
--- Validation combinators
--- ----------------------------------------------------------------
 
 fn map_valid<a, b, e>(f: (x: a) -> b ! pure, v: Validation<a, e>) -> Validation<b, e> ! pure {
   match v with {
@@ -26,7 +13,6 @@ fn map_valid<a, b, e>(f: (x: a) -> b ! pure, v: Validation<a, e>) -> Validation<
   }
 }
 
--- Combine two validations, accumulating errors from both.
 fn combine<a, b, e>(
   va: Validation<a, e>,
   vb: Validation<b, e>
@@ -45,7 +31,6 @@ fn combine<a, b, e>(
   }
 }
 
--- Lift a predicate into a validation.
 fn check<a, e>(
   pred: (x: a) -> Bool ! pure,
   err: e,
@@ -54,7 +39,6 @@ fn check<a, e>(
   if pred(value) { valid(value) } else { invalid(cons(err, nil())) }
 }
 
--- Chain: run a second validation only if the first succeeds.
 fn and_then<a, b, e>(
   f: (x: a) -> Validation<b, e> ! pure,
   v: Validation<a, e>
@@ -64,10 +48,6 @@ fn and_then<a, b, e>(
     | Invalid(errs) => invalid(errs)
   }
 }
-
--- ----------------------------------------------------------------
--- Domain: validating a user registration
--- ----------------------------------------------------------------
 
 type UserInput = | UserInput(String, String, Int) @# name, email, age #@
 
@@ -125,10 +105,6 @@ fn validate_age(age: Int) -> Validation<Int, FieldError> ! pure {
   }
 }
 
--- ----------------------------------------------------------------
--- Reporting validation errors via effects
--- ----------------------------------------------------------------
-
 effect Report {
   report_error: (FieldError) -> Unit
 }
@@ -155,7 +131,6 @@ fn report_all(errs: List<FieldError>) -> Unit ! {Report} {
   }
 }
 
--- Handler that collects reported errors into a list.
 fn collect_reports<a>(
   computation: (u: Unit) -> a ! {Report}
 ) -> a ! pure {

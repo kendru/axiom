@@ -1,40 +1,23 @@
--- 03_effects.axm
--- Effect declarations, performing effects, and writing handlers.
--- Effects are Axiom's central mechanism for managing side effects.
-
--- ----------------------------------------------------------------
--- Effect declarations
--- ----------------------------------------------------------------
-
--- Console I/O: printing text and reading input.
 effect Console {
   print: (String) -> Unit,
   read_line: () -> String
 }
 
--- Mutable state parameterized by the state type.
 effect State<s> {
   get: () -> s,
   put: (s) -> Unit
 }
 
--- Throwing errors (aborting computation).
 effect Throw<e> {
   throw: (e) -> Nothing
 }
 
--- Logging with severity levels.
 type LogLevel = | Debug | Info | Warn | Error
 
 effect Log {
   log: (LogLevel, String) -> Unit
 }
 
--- ----------------------------------------------------------------
--- Performing effects
--- ----------------------------------------------------------------
-
--- A function that reads a name and prints a greeting.
 fn greet_user() -> Unit ! {Console} {
   do {
     perform Console.print("What is your name?");
@@ -44,7 +27,6 @@ fn greet_user() -> Unit ! {Console} {
   }
 }
 
--- A function that uses state to count.
 fn count_up(n: Int) -> Int ! {State<Int>} {
   do {
     let current = perform State.get();
@@ -59,7 +41,6 @@ fn count_up(n: Int) -> Int ! {State<Int>} {
   }
 }
 
--- A function that logs its steps.
 fn process_item(item: String) -> String ! {Log} {
   do {
     perform Log.log(info(), concat("Processing: ", item));
@@ -69,7 +50,6 @@ fn process_item(item: String) -> String ! {Log} {
   }
 }
 
--- A function that can fail.
 type ParseError = | UnexpectedChar(Char) | UnexpectedEnd
 
 fn parse_digit(input: String) -> Int ! {Throw<ParseError>} {
@@ -84,7 +64,6 @@ fn parse_digit(input: String) -> Int ! {Throw<ParseError>} {
   }
 }
 
--- Combining multiple effects.
 fn interactive_sum() -> Int ! {Console, State<Int>, Throw<String>} {
   do {
     perform Console.print("Enter numbers (empty line to stop):");
@@ -109,11 +88,6 @@ fn read_loop() -> Int ! {Console, State<Int>, Throw<String>} {
   }
 }
 
--- ----------------------------------------------------------------
--- Handlers
--- ----------------------------------------------------------------
-
--- Handle Throw by converting to Result.
 fn catch<a, e>(computation: (u: Unit) -> a ! {Throw<e>}) -> Result<a, e> ! pure {
   handle computation(()) with {
     Throw {
@@ -123,7 +97,6 @@ fn catch<a, e>(computation: (u: Unit) -> a ! {Throw<e>}) -> Result<a, e> ! pure 
   }
 }
 
--- Handle State with an initial value, returning the final result.
 fn run_state<a, s>(init: s, computation: (u: Unit) -> a ! {State<s>}) -> a ! pure {
   handle computation(()) with {
     State {
@@ -133,7 +106,6 @@ fn run_state<a, s>(init: s, computation: (u: Unit) -> a ! {State<s>}) -> a ! pur
   }
 }
 
--- Handle Log by printing to the console (translating one effect to another).
 fn log_to_console<a>(computation: (u: Unit) -> a ! {Log}) -> a ! {Console} {
   handle computation(()) with {
     Log {
@@ -145,10 +117,6 @@ fn log_to_console<a>(computation: (u: Unit) -> a ! {Log}) -> a ! {Console} {
     }
   }
 }
-
--- ----------------------------------------------------------------
--- Helper declarations (would be in stdlib)
--- ----------------------------------------------------------------
 
 fn show_log_level(level: LogLevel) -> String ! pure {
   match level with {

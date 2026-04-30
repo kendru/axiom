@@ -1,32 +1,17 @@
--- 02_data_types.axm
--- Algebraic data types: defining and working with custom types.
-
--- Standard Option type.
 type Option<a> = | None | Some(a)
 
--- Standard Result type.
 type Result<a, e> = | Ok(a) | Err(e)
 
--- Linked list.
 type List<a> = | Nil | Cons(a, List<a>)
 
--- Binary tree.
 type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)
 
--- A pair type.
 type Pair<a, b> = | Pair(a, b)
 
--- Non-empty list: guarantees at least one element at the type level.
 type NonEmpty<a> = | NonEmpty(a, List<a>)
 
--- Ordering result for comparisons.
 type Ordering = | LT | EQ | GT
 
--- ----------------------------------------------------------------
--- Working with Option
--- ----------------------------------------------------------------
-
--- Unwrap an Option with a default value.
 fn unwrap_or<a>(opt: Option<a>, default: a) -> a ! pure {
   match opt with {
     | Some(x) => x
@@ -48,10 +33,6 @@ fn flat_map_option<a, b>(f: (x: a) -> Option<b> ! pure, opt: Option<a>) -> Optio
   }
 }
 
--- ----------------------------------------------------------------
--- Working with Result
--- ----------------------------------------------------------------
-
 fn map_result<a, b, e>(f: (x: a) -> b ! pure, r: Result<a, e>) -> Result<b, e> ! pure {
   match r with {
     | Ok(x) => ok(f(x))
@@ -72,10 +53,6 @@ fn result_to_option<a, e>(r: Result<a, e>) -> Option<a> ! pure {
     | Err(_) => none()
   }
 }
-
--- ----------------------------------------------------------------
--- Working with List
--- ----------------------------------------------------------------
 
 fn length<a>(xs: List<a>) -> Int ! pure {
   match xs with {
@@ -117,10 +94,6 @@ fn append<a>(xs: List<a>, ys: List<a>) -> List<a> ! pure {
   }
 }
 
--- ----------------------------------------------------------------
--- Working with Tree
--- ----------------------------------------------------------------
-
 fn tree_size<a>(t: Tree<a>) -> Int ! pure {
   match t with {
     | Leaf => 0
@@ -149,17 +122,12 @@ fn tree_fold<a, b>(f: (l: b, v: a, r: b) -> b ! pure, base: b, t: Tree<a>) -> b 
   }
 }
 
--- In-order traversal to a list.
 fn tree_to_list<a>(t: Tree<a>) -> List<a> ! pure {
   match t with {
     | Leaf => nil()
     | Node(l, v, r) => append(tree_to_list(l), cons(v, tree_to_list(r)))
   }
 }
-
--- ----------------------------------------------------------------
--- Working with NonEmpty
--- ----------------------------------------------------------------
 
 fn non_empty_head<a>(ne: NonEmpty<a>) -> a ! pure {
   match ne with {

@@ -266,6 +266,19 @@ let tool_verify_effects_schema =
     ]);
   ]
 
+let tool_verify_unused_schema =
+  Object [
+    ("name", String "verify_unused");
+    ("description", String "Find declared but unreferenced functions, types, and imports in a previously submitted module; pub declarations and main are never flagged");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("module_name", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "module_name"]);
+    ]);
+  ]
+
 let handle_submit_module state args =
   let source      = match obj_get "source"      args with String s -> s | _ -> "" in
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
@@ -377,6 +390,23 @@ let handle_query_interface state args =
     let iface = String.concat "\n" lines in
     Object [("interface", String iface)]
 
+let handle_verify_unused state args =
+  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
+  match Hashtbl.find_opt state.modules module_name with
+  | None ->
+    Object [("ok", Bool false);
+            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
+  | Some ms ->
+    let items = Typechecker.collect_unused ms.typed_ast in
+    let json_items = List.map (fun (u : Typechecker.unused_item) ->
+        Object [
+          ("name", String u.ui_name);
+          ("kind", String u.ui_kind);
+          ("line", Int u.ui_line);
+          ("col",  Int u.ui_col);
+        ]) items in
+    Object [("unused", Array json_items)]
+
 let handle state msg =
   let id     = obj_get "id" msg in
   let meth   = match obj_get "method" msg with String s -> s | _ -> "" in
@@ -392,7 +422,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema; tool_verify_unused_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -435,6 +465,13 @@ let handle state msg =
        ]))
      | "verify_effects" ->
        let result = handle_verify_effects state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "verify_unused" ->
+       let result = handle_verify_unused state args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

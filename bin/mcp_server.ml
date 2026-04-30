@@ -182,6 +182,9 @@ type state = {
   node_store          : Node_store.t;
 }
 
+let format_type_error msg =
+  Object [("message", String msg); ("line", Int 0); ("col", Int 0)]
+
 let tool_submit_module_schema =
   Object [
     ("name", String "submit_module");
@@ -193,6 +196,19 @@ let tool_submit_module_schema =
         ("module_name", Object [("type", String "string")]);
       ]);
       ("required", Array [String "source"; String "module_name"]);
+    ]);
+  ]
+
+let tool_verify_types_schema =
+  Object [
+    ("name", String "verify_types");
+    ("description", String "Typecheck a working-form Axiom module and return any type errors; does not update server state");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("source", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "source"]);
     ]);
   ]
 
@@ -209,11 +225,17 @@ let handle_submit_module state args =
     Hashtbl.replace state.modules module_name { typed_ast = ast; type_env; effect_env };
     Object [("ok", Bool true); ("hash", String hash_hex)]
   with Failure msg ->
-    Object [("ok", Bool false); ("error", Object [
-      ("message", String msg);
-      ("line",    Int 0);
-      ("col",     Int 0);
-    ])]
+    Object [("ok", Bool false); ("error", format_type_error msg)]
+
+let handle_verify_types args =
+  let source = match obj_get "source" args with String s -> s | _ -> "" in
+  try
+    let tokens = Lexer.tokenize source in
+    let ast    = Parser.parse_program tokens in
+    ignore (Typechecker.check_program ast);
+    Object [("errors", Array [])]
+  with Failure msg ->
+    Object [("errors", Array [format_type_error msg])]
 
 let handle state msg =
   let id     = obj_get "id" msg in
@@ -230,7 +252,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -238,6 +260,13 @@ let handle state msg =
     (match tool_name with
      | "submit_module" ->
        let result = handle_submit_module state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "verify_types" ->
+       let result = handle_verify_types args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

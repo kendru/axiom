@@ -53,3 +53,9 @@
  (modules test_build_pipeline)
  (libraries axiom_lib alcotest)
  (action (setenv AXIOM_EXE %{exe:../bin/main.exe} (run %{test}))))
+
+(test
+ (name test_mcp_server)
+ (modules test_mcp_server)
+ (libraries alcotest unix)
+ (action (setenv MCP_EXE %{exe:../bin/mcp_server.exe} (run %{test}))))

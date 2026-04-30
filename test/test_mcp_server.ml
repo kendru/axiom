@@ -583,6 +583,154 @@ let test_verify_effects_entry_not_found () =
       (match err with `String s -> String.length s > 0 | _ -> false)
   )
 
+let verify_unused_call id module_name =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"verify_unused","arguments":{"module_name":"%s"}}}|}
+    id (json_string_escape module_name)
+
+(* All non-pub declarations are referenced — expect empty unused list. *)
+let all_used_source =
+  {|fn helper(x: Int) -> Int ! pure { x }
+fn main() -> Int ! pure { helper(1) }|}
+
+(* One unreferenced private function. *)
+let one_unused_source =
+  {|fn used(x: Int) -> Int ! pure { x }
+fn unused_fn(x: Int) -> Int ! pure { x }
+fn main() -> Int ! pure { used(1) }|}
+
+(* Pub declaration — must NOT be flagged even though nothing calls it. *)
+let pub_unused_source =
+  {|pub fn exported(x: Int) -> Int ! pure { x }|}
+
+(* Mutual recursion: both sides referenced externally via main. *)
+let mutual_recursion_source =
+  {|fn ping(x: Int) -> Int ! pure { pong(x) }
+fn pong(x: Int) -> Int ! pure { ping(x) }
+fn main() -> Int ! pure { ping(0) }|}
+
+(* Mutual recursion: neither side reachable — both unused. *)
+let mutual_both_unused_source =
+  {|fn ping(x: Int) -> Int ! pure { pong(x) }
+fn pong(x: Int) -> Int ! pure { ping(x) }
+fn main() -> Int ! pure { 0 }|}
+
+let test_verify_unused_in_tools_list () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
+    let line = read_line () in
+    let json = mini_parse line in
+    let result = json_field "result" json in
+    let tools = json_field "tools" result in
+    let names = match tools with
+      | `List items ->
+        List.filter_map (fun item ->
+          match json_field "name" item with
+          | `String s -> Some s
+          | _ -> None) items
+      | _ -> []
+    in
+    Alcotest.(check bool) "verify_unused in tools/list" true
+      (List.mem "verify_unused" names)
+  )
+
+let test_verify_unused_all_used () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 all_used_source "mymod");
+    ignore (read_line ());
+    write_line (verify_unused_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let unused = json_field "unused" result in
+    Alcotest.(check bool) "unused is empty list" true
+      (match unused with `List [] -> true | _ -> false)
+  )
+
+let test_verify_unused_one_unused () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 one_unused_source "mymod");
+    ignore (read_line ());
+    write_line (verify_unused_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let unused = json_field "unused" result in
+    Alcotest.(check bool) "unused is non-empty" true
+      (match unused with `List (_ :: _) -> true | _ -> false);
+    (match unused with
+     | `List (entry :: _) ->
+       let name = json_field "name" entry in
+       Alcotest.(check bool) "entry has name field" true
+         (match name with `String s -> String.length s > 0 | _ -> false);
+       let kind = json_field "kind" entry in
+       Alcotest.(check bool) "entry has kind field" true
+         (match kind with `String s -> String.length s > 0 | _ -> false);
+       let line = json_field "line" entry in
+       Alcotest.(check bool) "entry has line field" true
+         (match line with `Int _ -> true | _ -> false);
+       let col = json_field "col" entry in
+       Alcotest.(check bool) "entry has col field" true
+         (match col with `Int _ -> true | _ -> false)
+     | _ -> ())
+  )
+
+let test_verify_unused_pub_not_flagged () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 pub_unused_source "mymod");
+    ignore (read_line ());
+    write_line (verify_unused_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let unused = json_field "unused" result in
+    Alcotest.(check bool) "pub declaration not flagged" true
+      (match unused with `List [] -> true | _ -> false)
+  )
+
+let test_verify_unused_mutual_recursion_both_reachable () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 mutual_recursion_source "mymod");
+    ignore (read_line ());
+    write_line (verify_unused_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let unused = json_field "unused" result in
+    Alcotest.(check bool) "mutually recursive pair reachable from main — empty unused" true
+      (match unused with `List [] -> true | _ -> false)
+  )
+
+let test_verify_unused_mutual_recursion_both_unreachable () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 mutual_both_unused_source "mymod");
+    ignore (read_line ());
+    write_line (verify_unused_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let unused = json_field "unused" result in
+    let count = match unused with `List xs -> List.length xs | _ -> -1 in
+    Alcotest.(check bool) "both sides of unreachable mutual pair are flagged" true
+      (count = 2)
+  )
+
+let test_verify_unused_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (verify_unused_call 2 "nonexistent");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
 let () =
   ignore well_typed_source;
   ignore ill_typed_source;
@@ -616,5 +764,14 @@ let () =
       Alcotest.test_case "returns unhandled entries when effects escape"     `Quick test_verify_effects_unhandled;
       Alcotest.test_case "returns error when module not found"               `Quick test_verify_effects_module_not_found;
       Alcotest.test_case "returns error when entry point not found"          `Quick test_verify_effects_entry_not_found;
+    ]);
+    ("verify_unused", [
+      Alcotest.test_case "appears in tools/list"                                         `Quick test_verify_unused_in_tools_list;
+      Alcotest.test_case "returns empty list when all declarations are used"             `Quick test_verify_unused_all_used;
+      Alcotest.test_case "returns entry for unreferenced function"                       `Quick test_verify_unused_one_unused;
+      Alcotest.test_case "does not flag pub declarations"                                `Quick test_verify_unused_pub_not_flagged;
+      Alcotest.test_case "mutual recursion reachable from main — no unused"             `Quick test_verify_unused_mutual_recursion_both_reachable;
+      Alcotest.test_case "mutual recursion unreachable from roots — both flagged"       `Quick test_verify_unused_mutual_recursion_both_unreachable;
+      Alcotest.test_case "returns error when module not found"                           `Quick test_verify_unused_module_not_found;
     ]);
   ]

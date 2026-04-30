@@ -1685,3 +1685,137 @@ let collect_unhandled_effects (prog : program) (entry_point : string)
   in
   walk_fn entry_point [];
   List.rev !unhandled
+
+(* ------------------------------------------------------------------ *)
+(* Unused declaration collection                                        *)
+(* ------------------------------------------------------------------ *)
+
+type unused_item = {
+  ui_name : string;
+  ui_kind : string;  (** "function", "type", or "import" *)
+  ui_line : int;
+  ui_col  : int;
+}
+
+(** [collect_unused prog] returns one [unused_item] per top-level declaration
+    that is defined but never referenced.  [pub] declarations and [main] are
+    treated as roots and are never flagged.  Mutual recursion is handled via a
+    BFS: a declaration is considered used iff it is reachable from any root
+    through the reference graph.  Because the AST carries no source positions,
+    [ui_line] and [ui_col] are always 0. *)
+let collect_unused (prog : program) : unused_item list =
+  (* Collect string references from an expression into acc. *)
+  let rec expr_refs acc e =
+    match e.desc with
+    | Var s -> acc := s :: !acc
+    | App (f, args) ->
+      expr_refs acc f; List.iter (expr_refs acc) args
+    | Fn { fn_body; _ } -> expr_refs acc fn_body
+    | Let { value; body; _ } ->
+      expr_refs acc value; expr_refs acc body
+    | If { cond; then_; else_ } ->
+      expr_refs acc cond; expr_refs acc then_; expr_refs acc else_
+    | Do stmts ->
+      List.iter (function
+        | StmtLet { value; _ } -> expr_refs acc value
+        | StmtExpr e -> expr_refs acc e) stmts
+    | Match { scrutinee; arms } ->
+      expr_refs acc scrutinee;
+      List.iter (fun arm -> expr_refs acc arm.arm_body) arms
+    | Letrec (bindings, body) ->
+      List.iter (fun b -> expr_refs acc b.letrec_body) bindings;
+      expr_refs acc body
+    | Record fields -> List.iter (fun (_, e) -> expr_refs acc e) fields
+    | RecordUpdate (base, fields) ->
+      expr_refs acc base;
+      List.iter (fun (_, e) -> expr_refs acc e) fields
+    | Project (e, _) -> expr_refs acc e
+    | Perform { effect_name; args; _ } ->
+      acc := effect_name :: !acc;
+      List.iter (expr_refs acc) args
+    | Handle { handled; handlers } ->
+      expr_refs acc handled;
+      List.iter (fun h ->
+        acc := h.effect_handler :: !acc;
+        List.iter (fun op -> expr_refs acc op.op_handler_body) h.op_handlers;
+        Option.iter (fun r -> expr_refs acc r.return_body) h.return_handler
+      ) handlers
+    | IntLit _ | FloatLit _ | StringLit _ | BoolLit _ | UnitLit -> ()
+  in
+  (* Collect string references from a type expression into acc. *)
+  let rec type_refs acc t =
+    match t with
+    | TyName s -> acc := s :: !acc
+    | TyApp (s, args) ->
+      acc := s :: !acc; List.iter (type_refs acc) args
+    | TyTuple ts -> List.iter (type_refs acc) ts
+    | TyFun (params, ret, _) ->
+      List.iter (type_refs acc) params; type_refs acc ret
+  in
+  (* Phase 1: index definitions and build the reference graph. *)
+  (* defs: (name, kind, is_pub) in source order *)
+  let defs : (string * string * bool) list ref = ref [] in
+  let refs_map : (string, string list) Hashtbl.t = Hashtbl.create 16 in
+  let import_canonical module_path alias =
+    match alias with
+    | Some a -> a
+    | None ->
+      let parts = String.split_on_char '/' module_path in
+      (match List.rev parts with s :: _ -> s | [] -> module_path)
+  in
+  let rec index ds =
+    List.iter (fun d ->
+      match d.decl_desc with
+      | DeclFn { fn_name; pub; params; return_type; decl_body; _ } ->
+        defs := (fn_name, "function", pub) :: !defs;
+        let acc = ref [] in
+        List.iter (fun p -> type_refs acc p.param_type) params;
+        Option.iter (type_refs acc) return_type;
+        expr_refs acc decl_body;
+        Hashtbl.replace refs_map fn_name !acc
+      | DeclType { type_name; pub; ctors; _ } ->
+        defs := (type_name, "type", pub) :: !defs;
+        let acc = ref [] in
+        List.iter (fun c -> List.iter (type_refs acc) c.ctor_params) ctors;
+        Hashtbl.replace refs_map type_name !acc
+      | DeclEffect { effect_name; pub; ops; _ } ->
+        defs := (effect_name, "type", pub) :: !defs;
+        let acc = ref [] in
+        List.iter (fun op ->
+          List.iter (type_refs acc) op.effect_op_params;
+          type_refs acc op.effect_op_return) ops;
+        Hashtbl.replace refs_map effect_name !acc
+      | DeclImport { module_path; alias } ->
+        let name = import_canonical module_path alias in
+        defs := (name, "import", false) :: !defs;
+        Hashtbl.replace refs_map name []
+      | DeclModule { body; _ } -> index body
+      | DeclRequire _ -> ()
+    ) ds
+  in
+  index prog;
+  (* Phase 2: BFS from roots (pub declarations and "main"). *)
+  let defined : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun (n, _, _) -> Hashtbl.replace defined n ()) !defs;
+  let used : (string, unit) Hashtbl.t = Hashtbl.create 16 in
+  let queue = Queue.create () in
+  let mark name =
+    if not (Hashtbl.mem used name) then begin
+      Hashtbl.replace used name ();
+      Queue.push name queue
+    end
+  in
+  List.iter (fun (name, _, pub) ->
+    if pub || name = "main" then mark name
+  ) !defs;
+  while not (Queue.is_empty queue) do
+    let name = Queue.pop queue in
+    List.iter (fun ref_name ->
+      if Hashtbl.mem defined ref_name then mark ref_name
+    ) (match Hashtbl.find_opt refs_map name with Some r -> r | None -> [])
+  done;
+  (* Phase 3: report declarations not reached by BFS. *)
+  List.filter_map (fun (name, kind, pub) ->
+    if pub || name = "main" || Hashtbl.mem used name then None
+    else Some { ui_name = name; ui_kind = kind; ui_line = 0; ui_col = 0 }
+  ) (List.rev !defs)

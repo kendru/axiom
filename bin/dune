@@ -5,4 +5,5 @@
 
 (executable
  (name mcp_server)
- (modules mcp_server))
+ (modules mcp_server)
+ (libraries axiom_lib unix))

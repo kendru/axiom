@@ -1,3 +1,5 @@
+open Axiom_lib
+
 (* Minimal JSON type *)
 type json =
   | Null
@@ -159,10 +161,59 @@ let error_response id code message =
     ("error", Object [("code", Int code); ("message", String message)]);
   ]
 
-(* Server state — will grow as tools are added in later issues *)
-type state = {
-  mutable initialized: bool;
+let bytes_to_hex b =
+  let n = Bytes.length b in
+  let buf = Buffer.create (n * 2) in
+  for i = 0 to n - 1 do
+    Buffer.add_string buf (Printf.sprintf "%02x" (Char.code (Bytes.get b i)))
+  done;
+  Buffer.contents buf
+
+(* Per-module state stored after a successful submit_module call *)
+type module_state = {
+  typed_ast  : Ast.program;
+  type_env   : Typechecker.env;
+  effect_env : Typechecker.effect_env;
 }
+
+type state = {
+  mutable initialized : bool;
+  modules             : (string, module_state) Hashtbl.t;
+  node_store          : Node_store.t;
+}
+
+let tool_submit_module_schema =
+  Object [
+    ("name", String "submit_module");
+    ("description", String "Parse, typecheck, and store a working-form Axiom module");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("source",      Object [("type", String "string")]);
+        ("module_name", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "source"; String "module_name"]);
+    ]);
+  ]
+
+let handle_submit_module state args =
+  let source      = match obj_get "source"      args with String s -> s | _ -> "" in
+  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
+  try
+    let tokens   = Lexer.tokenize source in
+    let ast      = Parser.parse_program tokens in
+    let (type_env, effect_env) = Typechecker.check_program ast in
+    let enc      = Node_store.as_encoding_store state.node_store in
+    let root     = Node_encoding.encode_program enc ast in
+    let hash_hex = bytes_to_hex root in
+    Hashtbl.replace state.modules module_name { typed_ast = ast; type_env; effect_env };
+    Object [("ok", Bool true); ("hash", String hash_hex)]
+  with Failure msg ->
+    Object [("ok", Bool false); ("error", Object [
+      ("message", String msg);
+      ("line",    Int 0);
+      ("col",     Int 0);
+    ])]
 
 let handle state msg =
   let id     = obj_get "id" msg in
@@ -179,16 +230,35 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema])]))
   | "tools/call" ->
-    send (error_response id (-32601) "Method not found")
+    let params    = obj_get "params" msg in
+    let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
+    let args      = obj_get "arguments" params in
+    (match tool_name with
+     | "submit_module" ->
+       let result = handle_submit_module state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | _ ->
+       send (error_response id (-32601) ("Unknown tool: " ^ tool_name)))
   | _ ->
     (match id with
      | Null -> ()
      | _ -> send (error_response id (-32601) ("Method not found: " ^ meth)))
 
 let () =
-  let state = { initialized = false } in
+  let store_dir  =
+    let path = Filename.temp_file "axiom_mcp_" "_dir" in
+    Sys.remove path;
+    Unix.mkdir path 0o700;
+    path
+  in
+  let node_store = Node_store.open_store store_dir in
+  let state      = { initialized = false; modules = Hashtbl.create 16; node_store } in
   (try
      while true do
        let line = String.trim (input_line stdin) in
@@ -202,4 +272,5 @@ let () =
          | exception Json_error e ->
            Printf.eprintf "[mcp] JSON parse error: %s\n%!" e
      done
-   with End_of_file -> ())
+   with End_of_file -> ());
+  Node_store.close_store state.node_store

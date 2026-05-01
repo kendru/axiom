@@ -858,6 +858,111 @@ let test_query_effects_multi_effect () =
        | _ -> false)
   )
 
+let query_callers_call id module_name function_name =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_callers","arguments":{"module_name":"%s","function_name":"%s"}}}|}
+    id (json_string_escape module_name) (json_string_escape function_name)
+
+(* helper is called from both main1 and main2 *)
+let multi_caller_source =
+  {|fn helper(x: Int) -> Int ! pure { x }
+fn main1() -> Int ! pure { helper(1) }
+fn main2() -> Int ! pure { helper(2) }|}
+
+(* helper is defined but never called *)
+let uncalled_fn_source =
+  {|fn helper(x: Int) -> Int ! pure { x }
+fn main() -> Int ! pure { 0 }|}
+
+let test_query_callers_in_tools_list () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
+    let line = read_line () in
+    let json = mini_parse line in
+    let result = json_field "result" json in
+    let tools = json_field "tools" result in
+    let names = match tools with
+      | `List items ->
+        List.filter_map (fun item ->
+          match json_field "name" item with
+          | `String s -> Some s
+          | _ -> None) items
+      | _ -> []
+    in
+    Alcotest.(check bool) "query_callers in tools/list" true
+      (List.mem "query_callers" names)
+  )
+
+let test_query_callers_multiple_callers () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 multi_caller_source "mymod");
+    ignore (read_line ());
+    write_line (query_callers_call 3 "mymod" "helper");
+    let result = parse_response (read_line ()) in
+    let callers = json_field "callers" result in
+    Alcotest.(check bool) "callers list has two entries" true
+      (match callers with `List xs -> List.length xs = 2 | _ -> false);
+    (match callers with
+     | `List (entry :: _) ->
+       let caller = json_field "caller" entry in
+       Alcotest.(check bool) "entry has non-empty caller field" true
+         (match caller with `String s -> String.length s > 0 | _ -> false);
+       let line = json_field "line" entry in
+       Alcotest.(check bool) "entry has line field" true
+         (match line with `Int _ -> true | _ -> false);
+       let col = json_field "col" entry in
+       Alcotest.(check bool) "entry has col field" true
+         (match col with `Int _ -> true | _ -> false)
+     | _ -> ())
+  )
+
+let test_query_callers_uncalled_function () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 uncalled_fn_source "mymod");
+    ignore (read_line ());
+    write_line (query_callers_call 3 "mymod" "helper");
+    let result = parse_response (read_line ()) in
+    let callers = json_field "callers" result in
+    Alcotest.(check bool) "callers is empty list for uncalled function" true
+      (match callers with `List [] -> true | _ -> false)
+  )
+
+let test_query_callers_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (query_callers_call 2 "nonexistent" "helper");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_callers_function_not_defined () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 multi_caller_source "mymod");
+    ignore (read_line ());
+    write_line (query_callers_call 3 "mymod" "nonexistent_fn");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
 let () =
   ignore well_typed_source;
   ignore ill_typed_source;
@@ -907,5 +1012,12 @@ let () =
       Alcotest.test_case "returns empty effects map for pure module"                     `Quick test_query_effects_pure_module;
       Alcotest.test_case "maps single effect to performing function"                     `Quick test_query_effects_single_effect;
       Alcotest.test_case "function with multiple effects appears under each"             `Quick test_query_effects_multi_effect;
+    ]);
+    ("query_callers", [
+      Alcotest.test_case "appears in tools/list"                                         `Quick test_query_callers_in_tools_list;
+      Alcotest.test_case "returns all call sites when function is called multiple times" `Quick test_query_callers_multiple_callers;
+      Alcotest.test_case "returns empty list for defined but uncalled function"          `Quick test_query_callers_uncalled_function;
+      Alcotest.test_case "returns error when module not found"                           `Quick test_query_callers_module_not_found;
+      Alcotest.test_case "returns error when function not defined in module"             `Quick test_query_callers_function_not_defined;
     ]);
   ]

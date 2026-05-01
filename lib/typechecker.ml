@@ -1819,3 +1819,82 @@ let collect_unused (prog : program) : unused_item list =
     if pub || name = "main" || Hashtbl.mem used name then None
     else Some { ui_name = name; ui_kind = kind; ui_line = 0; ui_col = 0 }
   ) (List.rev !defs)
+
+(* ------------------------------------------------------------------ *)
+(* Caller collection                                                    *)
+(* ------------------------------------------------------------------ *)
+
+type caller_site = {
+  cs_caller : string;
+  cs_line   : int;
+  cs_col    : int;
+}
+
+(** [collect_callers prog function_name] returns one [caller_site] for each
+    direct call to [function_name] found in [prog].  Returns an error string
+    if [function_name] is not defined in [prog].  Because the AST carries no
+    source positions, [cs_line] and [cs_col] are always 0. *)
+let collect_callers (prog : program) (function_name : string)
+    : (caller_site list, string) result =
+  let defined = List.exists (fun decl ->
+    match decl.decl_desc with
+    | DeclFn { fn_name; _ } -> fn_name = function_name
+    | _ -> false) prog
+  in
+  if not defined then
+    Error (Printf.sprintf "Function '%s' is not defined in the module" function_name)
+  else begin
+    let sites = ref [] in
+    let rec walk_expr current_fn e =
+      match e.desc with
+      | App ({ desc = Var callee; _ }, args) ->
+        if callee = function_name then
+          sites := { cs_caller = current_fn; cs_line = 0; cs_col = 0 } :: !sites;
+        List.iter (walk_expr current_fn) args
+      | App (f, args) ->
+        walk_expr current_fn f;
+        List.iter (walk_expr current_fn) args
+      | Fn { fn_body; _ } ->
+        walk_expr current_fn fn_body
+      | Let { value; body; _ } ->
+        walk_expr current_fn value;
+        walk_expr current_fn body
+      | If { cond; then_; else_ } ->
+        walk_expr current_fn cond;
+        walk_expr current_fn then_;
+        walk_expr current_fn else_
+      | Do stmts ->
+        List.iter (function
+          | StmtLet { value; _ } -> walk_expr current_fn value
+          | StmtExpr e           -> walk_expr current_fn e
+        ) stmts
+      | Letrec (bindings, body) ->
+        List.iter (fun b -> walk_expr current_fn b.letrec_body) bindings;
+        walk_expr current_fn body
+      | Record fields ->
+        List.iter (fun (_, e) -> walk_expr current_fn e) fields
+      | RecordUpdate (base, fields) ->
+        walk_expr current_fn base;
+        List.iter (fun (_, e) -> walk_expr current_fn e) fields
+      | Project (e, _) ->
+        walk_expr current_fn e
+      | Match { scrutinee; arms } ->
+        walk_expr current_fn scrutinee;
+        List.iter (fun arm -> walk_expr current_fn arm.arm_body) arms
+      | Handle { handled; handlers } ->
+        walk_expr current_fn handled;
+        List.iter (fun h ->
+          List.iter (fun op -> walk_expr current_fn op.op_handler_body) h.op_handlers;
+          Option.iter (fun r -> walk_expr current_fn r.return_body) h.return_handler
+        ) handlers
+      | Perform { args; _ } ->
+        List.iter (walk_expr current_fn) args
+      | Var _ | IntLit _ | FloatLit _ | StringLit _ | BoolLit _ | UnitLit -> ()
+    in
+    List.iter (fun decl ->
+      match decl.decl_desc with
+      | DeclFn { fn_name; decl_body; _ } -> walk_expr fn_name decl_body
+      | _ -> ()
+    ) prog;
+    Ok (List.rev !sites)
+  end

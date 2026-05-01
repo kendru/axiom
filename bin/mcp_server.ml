@@ -440,6 +440,20 @@ let tool_query_effects_schema =
     ]);
   ]
 
+let tool_query_callers_schema =
+  Object [
+    ("name", String "query_callers");
+    ("description", String "List all direct call sites of a named function within a previously submitted module; returns the containing function name and source location for each call");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("module_name",   Object [("type", String "string")]);
+        ("function_name", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "module_name"; String "function_name"]);
+    ]);
+  ]
+
 let handle_query_effects state args =
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
   match Hashtbl.find_opt state.modules module_name with
@@ -490,6 +504,26 @@ let handle_verify_unused state args =
         ]) items in
     Object [("unused", Array json_items)]
 
+let handle_query_callers state args =
+  let module_name   = match obj_get "module_name"   args with String s -> s | _ -> "" in
+  let function_name = match obj_get "function_name" args with String s -> s | _ -> "" in
+  match Hashtbl.find_opt state.modules module_name with
+  | None ->
+    Object [("ok", Bool false);
+            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
+  | Some ms ->
+    match Typechecker.collect_callers ms.typed_ast function_name with
+    | Error msg ->
+      Object [("ok", Bool false); ("error", String msg)]
+    | Ok sites ->
+      let json_sites = List.map (fun (s : Typechecker.caller_site) ->
+          Object [
+            ("caller", String s.cs_caller);
+            ("line",   Int s.cs_line);
+            ("col",    Int s.cs_col);
+          ]) sites in
+      Object [("callers", Array json_sites)]
+
 let handle state msg =
   let id     = obj_get "id" msg in
   let meth   = match obj_get "method" msg with String s -> s | _ -> "" in
@@ -505,7 +539,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema; tool_verify_unused_schema; tool_query_effects_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema; tool_verify_unused_schema; tool_query_effects_schema; tool_query_callers_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -562,6 +596,13 @@ let handle state msg =
        ]))
      | "query_effects" ->
        let result = handle_query_effects state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "query_callers" ->
+       let result = handle_query_callers state args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

@@ -1,0 +1,3 @@
+(library
+ (name mcp_lib)
+ (modules mcp_types))

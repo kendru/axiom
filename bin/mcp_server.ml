@@ -390,6 +390,89 @@ let handle_query_interface state args =
     let iface = String.concat "\n" lines in
     Object [("interface", String iface)]
 
+let rec ty_deref = function
+  | Typechecker.TyMeta { Typechecker.inst = Some t; _ } -> ty_deref t
+  | t -> t
+
+let rec row_deref = function
+  | Typechecker.RMeta { Typechecker.rinst = Some r; _ } -> row_deref r
+  | r -> r
+
+let collect_row_effects row =
+  let rec go acc r =
+    match row_deref r with
+    | Typechecker.RPure -> List.rev acc
+    | Typechecker.RCons (e, rest) -> go (e.Typechecker.eff_name :: acc) rest
+    | Typechecker.RMeta _ -> List.rev acc
+  in
+  go [] row
+
+(* Walk a (possibly curried) function type to find the innermost arrow's effect
+   row, which is where fn_scheme_of_decl places the declared effects. Returns
+   None for 0-parameter functions whose scheme body is not a TyFun. *)
+let rec fn_effect_row ty =
+  match ty_deref ty with
+  | Typechecker.TyForall (_, t) -> fn_effect_row t
+  | Typechecker.TyFun (_, ret, row) ->
+    (match ty_deref ret with
+     | Typechecker.TyFun _ as inner -> fn_effect_row inner
+     | _ -> Some row)
+  | _ -> None
+
+let effect_names_of_decl_annotation = function
+  | None | Some Ast.Pure -> []
+  | Some (Ast.Effects (ts, _)) ->
+    List.filter_map (function
+      | Ast.TyName n -> Some n
+      | Ast.TyApp (n, _) -> Some n
+      | _ -> None) ts
+
+let tool_query_effects_schema =
+  Object [
+    ("name", String "query_effects");
+    ("description", String "Return a map from each effect name to the list of top-level functions that perform it in a previously submitted module");
+    ("inputSchema", Object [
+      ("type", String "object");
+      ("properties", Object [
+        ("module_name", Object [("type", String "string")]);
+      ]);
+      ("required", Array [String "module_name"]);
+    ]);
+  ]
+
+let handle_query_effects state args =
+  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
+  match Hashtbl.find_opt state.modules module_name with
+  | None ->
+    Object [("ok", Bool false);
+            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
+  | Some ms ->
+    let effects_tbl : (string, string list) Hashtbl.t = Hashtbl.create 8 in
+    let add_fn_to_effect eff_name fn_name =
+      let existing = Option.value ~default:[] (Hashtbl.find_opt effects_tbl eff_name) in
+      if not (List.mem fn_name existing) then
+        Hashtbl.replace effects_tbl eff_name (existing @ [fn_name])
+    in
+    List.iter (fun decl ->
+      match decl.Ast.decl_desc with
+      | Ast.DeclFn { fn_name; effects; _ } ->
+        let eff_names =
+          match List.assoc_opt fn_name ms.type_env with
+          | None -> []
+          | Some scheme ->
+            (match fn_effect_row scheme.Typechecker.body with
+             | Some row -> collect_row_effects row
+             | None -> effect_names_of_decl_annotation effects)
+        in
+        List.iter (fun eff -> add_fn_to_effect eff fn_name) eff_names
+      | _ -> ()
+    ) ms.typed_ast;
+    let effects_json = Hashtbl.fold (fun eff fn_names acc ->
+        (eff, Array (List.map (fun n -> String n) fn_names)) :: acc
+      ) effects_tbl [] in
+    let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) effects_json in
+    Object [("effects", Object sorted)]
+
 let handle_verify_unused state args =
   let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
   match Hashtbl.find_opt state.modules module_name with
@@ -422,7 +505,7 @@ let handle state msg =
   | "notifications/initialized" ->
     ()
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema; tool_verify_unused_schema])]))
+    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema; tool_verify_unused_schema; tool_query_effects_schema])]))
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
@@ -472,6 +555,13 @@ let handle state msg =
        ]))
      | "verify_unused" ->
        let result = handle_verify_unused state args in
+       send (response id (Object [
+         ("content", Array [
+           Object [("type", String "text"); ("text", String (json_to_string result))]
+         ])
+       ]))
+     | "query_effects" ->
+       let result = handle_query_effects state args in
        send (response id (Object [
          ("content", Array [
            Object [("type", String "text"); ("text", String (json_to_string result))]

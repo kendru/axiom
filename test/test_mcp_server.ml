@@ -731,6 +731,133 @@ let test_verify_unused_module_not_found () =
       (match err with `String s -> String.length s > 0 | _ -> false)
   )
 
+let query_effects_call id module_name =
+  Printf.sprintf
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_effects","arguments":{"module_name":"%s"}}}|}
+    id (json_string_escape module_name)
+
+(* Pure module — no effects at all. *)
+let pure_module_source =
+  {|fn add_one(x: Int) -> Int ! pure { add(x, 1) }
+fn double(x: Int) -> Int ! pure { add(x, x) }|}
+
+(* Module with one effectful function. *)
+let single_effect_source =
+  {|effect Log { log: (String) -> Unit }
+fn greet(msg: String) -> Unit ! {Log} { perform Log.log(msg) }
+fn pure_fn(x: Int) -> Int ! pure { x }|}
+
+(* Module where one function performs two effects, another performs one. *)
+let multi_effect_source =
+  {|effect Log { log: (String) -> Unit }
+effect Throw { throw: (String) -> Unit }
+fn do_both(x: Int) -> Unit ! {Log, Throw} { perform Log.log("hi") }
+fn do_log(x: Int) -> Unit ! {Log} { perform Log.log("x") }|}
+
+let test_query_effects_in_tools_list () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
+    let line = read_line () in
+    let json = mini_parse line in
+    let result = json_field "result" json in
+    let tools = json_field "tools" result in
+    let names = match tools with
+      | `List items ->
+        List.filter_map (fun item ->
+          match json_field "name" item with
+          | `String s -> Some s
+          | _ -> None) items
+      | _ -> []
+    in
+    Alcotest.(check bool) "query_effects in tools/list" true
+      (List.mem "query_effects" names)
+  )
+
+let test_query_effects_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (query_effects_call 2 "nonexistent");
+    let result = parse_response (read_line ()) in
+    let ok = json_field "ok" result in
+    Alcotest.(check bool) "ok is false" true
+      (match ok with `Bool false -> true | _ -> false);
+    let err = json_field "error" result in
+    Alcotest.(check bool) "error is non-empty string" true
+      (match err with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_effects_pure_module () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 pure_module_source "mymod");
+    ignore (read_line ());
+    write_line (query_effects_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let effects = json_field "effects" result in
+    Alcotest.(check bool) "effects is empty object" true
+      (match effects with `Assoc [] -> true | _ -> false)
+  )
+
+let test_query_effects_single_effect () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 single_effect_source "mymod");
+    ignore (read_line ());
+    write_line (query_effects_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let effects = json_field "effects" result in
+    let log_fns = match effects with
+      | `Assoc fields -> (match List.assoc_opt "Log" fields with Some v -> v | None -> `Null)
+      | _ -> `Null
+    in
+    Alcotest.(check bool) "Log effect maps to greet" true
+      (match log_fns with
+       | `List fns -> List.exists (fun f -> f = `String "greet") fns
+       | _ -> false);
+    Alcotest.(check bool) "pure_fn not in Log's list" true
+      (match log_fns with
+       | `List fns -> not (List.exists (fun f -> f = `String "pure_fn") fns)
+       | _ -> false)
+  )
+
+let test_query_effects_multi_effect () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (submit_module_call 2 multi_effect_source "mymod");
+    ignore (read_line ());
+    write_line (query_effects_call 3 "mymod");
+    let result = parse_response (read_line ()) in
+    let effects = json_field "effects" result in
+    let get_fns eff_name = match effects with
+      | `Assoc fields -> (match List.assoc_opt eff_name fields with Some v -> v | None -> `Null)
+      | _ -> `Null
+    in
+    let log_fns = get_fns "Log" in
+    let throw_fns = get_fns "Throw" in
+    Alcotest.(check bool) "do_both appears under Log" true
+      (match log_fns with
+       | `List fns -> List.exists (fun f -> f = `String "do_both") fns
+       | _ -> false);
+    Alcotest.(check bool) "do_log appears under Log" true
+      (match log_fns with
+       | `List fns -> List.exists (fun f -> f = `String "do_log") fns
+       | _ -> false);
+    Alcotest.(check bool) "do_both appears under Throw" true
+      (match throw_fns with
+       | `List fns -> List.exists (fun f -> f = `String "do_both") fns
+       | _ -> false);
+    Alcotest.(check bool) "do_log does not appear under Throw" true
+      (match throw_fns with
+       | `List fns -> not (List.exists (fun f -> f = `String "do_log") fns)
+       | _ -> false)
+  )
+
 let () =
   ignore well_typed_source;
   ignore ill_typed_source;
@@ -773,5 +900,12 @@ let () =
       Alcotest.test_case "mutual recursion reachable from main — no unused"             `Quick test_verify_unused_mutual_recursion_both_reachable;
       Alcotest.test_case "mutual recursion unreachable from roots — both flagged"       `Quick test_verify_unused_mutual_recursion_both_unreachable;
       Alcotest.test_case "returns error when module not found"                           `Quick test_verify_unused_module_not_found;
+    ]);
+    ("query_effects", [
+      Alcotest.test_case "appears in tools/list"                                         `Quick test_query_effects_in_tools_list;
+      Alcotest.test_case "returns error when module not found"                           `Quick test_query_effects_module_not_found;
+      Alcotest.test_case "returns empty effects map for pure module"                     `Quick test_query_effects_pure_module;
+      Alcotest.test_case "maps single effect to performing function"                     `Quick test_query_effects_single_effect;
+      Alcotest.test_case "function with multiple effects appears under each"             `Quick test_query_effects_multi_effect;
     ]);
   ]

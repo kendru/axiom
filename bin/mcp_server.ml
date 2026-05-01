@@ -1,19 +1,20 @@
 open Axiom_lib
+open Mcp_lib
 
-(* Minimal JSON type *)
+(* ─── Minimal JSON type ──────────────────────────────────────────────────── *)
 type json =
   | Null
-  | Bool of bool
-  | Int of int
+  | Bool   of bool
+  | Int    of int
   | String of string
-  | Array of json list
+  | Array  of json list
   | Object of (string * json) list
 
-(* JSON serializer *)
+(* ─── JSON serializer ────────────────────────────────────────────────────── *)
 let rec json_to_string = function
-  | Null -> "null"
+  | Null   -> "null"
   | Bool b -> if b then "true" else "false"
-  | Int n -> string_of_int n
+  | Int  n -> string_of_int n
   | String s ->
     let buf = Buffer.create (String.length s + 2) in
     Buffer.add_char buf '"';
@@ -32,7 +33,7 @@ let rec json_to_string = function
     "{" ^ String.concat "," (List.map (fun (k, v) ->
       json_to_string (String k) ^ ":" ^ json_to_string v) fields) ^ "}"
 
-(* Minimal recursive-descent JSON parser *)
+(* ─── JSON parser ────────────────────────────────────────────────────────── *)
 exception Json_error of string
 
 let parse_json s =
@@ -66,7 +67,6 @@ let parse_json s =
          | 'b'  -> Buffer.add_char buf '\b'
          | 'f'  -> Buffer.add_char buf '\012'
          | 'u'  ->
-           (* skip 4 hex digits; replace with '?' for simplicity *)
            for _ = 1 to 4 do ignore (next ()) done;
            Buffer.add_char buf '?'
          | c    -> raise (Json_error (Printf.sprintf "bad escape \\%c" c)));
@@ -145,7 +145,7 @@ let obj_get key = function
   | Object fields -> (match List.assoc_opt key fields with Some v -> v | None -> Null)
   | _ -> Null
 
-(* JSON-RPC output helpers *)
+(* ─── JSON-RPC helpers ───────────────────────────────────────────────────── *)
 let send json =
   print_string (json_to_string json);
   print_char '\n';
@@ -169,11 +169,15 @@ let bytes_to_hex b =
   done;
   Buffer.contents buf
 
-(* Per-module state stored after a successful submit_module call *)
+(* ─── Server state ───────────────────────────────────────────────────────── *)
+
+(* Per-module state stored after a successful write/submit_module command. *)
 type module_state = {
-  typed_ast  : Ast.program;
-  type_env   : Typechecker.env;
-  effect_env : Typechecker.effect_env;
+  typed_ast   : Ast.program;
+  type_env    : Typechecker.env;
+  effect_env  : Typechecker.effect_env;
+  root_hash   : string;  (* hex-encoded BLAKE3 hash of the program root node *)
+  decl_hashes : (string, string) Hashtbl.t;  (* decl name → hex hash *)
 }
 
 type state = {
@@ -182,213 +186,93 @@ type state = {
   node_store          : Node_store.t;
 }
 
-let format_type_error msg =
-  Object [("message", String msg); ("line", Int 0); ("col", Int 0)]
+(* ─── Diagnostic → JSON ──────────────────────────────────────────────────── *)
 
-let tool_submit_module_schema =
+let json_of_severity = function
+  | Mcp_types.Sev_error   -> String "error"
+  | Mcp_types.Sev_warning -> String "warning"
+  | Mcp_types.Sev_info    -> String "info"
+
+let json_of_location (loc : Mcp_types.location) =
+  let fields = [("line", Int loc.loc_line); ("col", Int loc.loc_col)] in
+  let fields = match loc.loc_module with
+    | None   -> fields
+    | Some m -> ("module", String m) :: fields
+  in
+  Object fields
+
+let json_of_related (r : Mcp_types.related_ref) =
+  let fields = [("message", String r.ref_message)] in
+  let fields = match r.ref_node with
+    | None   -> fields
+    | Some h -> ("node", String h) :: fields
+  in
+  Object fields
+
+let json_of_diagnostic (d : Mcp_types.diagnostic) =
   Object [
-    ("name", String "submit_module");
-    ("description", String "Parse, typecheck, and store a working-form Axiom module");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("source",      Object [("type", String "string")]);
-        ("module_name", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "source"; String "module_name"]);
-    ]);
+    ("severity", json_of_severity d.diag_severity);
+    ("code",     String d.diag_code);
+    ("message",  String d.diag_message);
+    ("node",     (match d.diag_node with None -> Null | Some h -> String h));
+    ("location", (match d.diag_location with None -> Null | Some l -> json_of_location l));
+    ("related",  Array (List.map json_of_related d.diag_related));
   ]
 
-let tool_verify_types_schema =
+(* ─── Batch response ─────────────────────────────────────────────────────── *)
+
+(* All four tool handlers share this single response shape, enforced by type. *)
+type batch_response = {
+  br_results     : json list;
+  br_stopped_at  : int option;
+  br_diagnostics : Mcp_types.diagnostic list;
+}
+
+let json_of_batch_response br =
   Object [
-    ("name", String "verify_types");
-    ("description", String "Typecheck a working-form Axiom module and return any type errors; does not update server state");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("source", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "source"]);
-    ]);
+    ("results",     Array br.br_results);
+    ("stopped_at",  (match br.br_stopped_at with None -> Null | Some i -> Int i));
+    ("diagnostics", Array (List.map json_of_diagnostic br.br_diagnostics));
   ]
 
-let tool_query_signature_schema =
-  Object [
-    ("name", String "query_signature");
-    ("description", String "Return the type and effect signature of a named function from a previously submitted module");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("module_name",   Object [("type", String "string")]);
-        ("function_name", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "module_name"; String "function_name"]);
-    ]);
-  ]
+(* ─── Command outcome ────────────────────────────────────────────────────── *)
 
-let tool_query_interface_schema =
-  Object [
-    ("name", String "query_interface");
-    ("description", String "Return the public API of a previously submitted module: pub type aliases, pub effect declarations, and pub function signatures");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("module_name", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "module_name"]);
-    ]);
-  ]
+(* Unrecoverable failures halt the batch at the current index.
+   Recoverable diagnostics (e.g. type/effect warnings) accumulate and allow
+   subsequent commands to continue. *)
+type cmd_outcome =
+  | Cmd_success of json * Mcp_types.diagnostic list
+  | Cmd_halt    of Mcp_types.diagnostic
 
-let tool_verify_exhaustive_schema =
-  Object [
-    ("name", String "verify_exhaustive");
-    ("description", String "Check every match expression in a previously submitted module for non-exhaustive patterns; returns warnings with missing constructor names");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("module_name", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "module_name"]);
-    ]);
-  ]
+(* ─── Batch executor ─────────────────────────────────────────────────────── *)
 
-let tool_verify_effects_schema =
-  Object [
-    ("name", String "verify_effects");
-    ("description", String "Check that every effect performed on any reachable call path from an entry-point function is handled before reaching the entry point's boundary; returns unhandled effect entries with effect name and call-site location");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("module_name",  Object [("type", String "string")]);
-        ("entry_point",  Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "module_name"; String "entry_point"]);
-    ]);
-  ]
+let batch_execute (dispatch : json -> cmd_outcome) (cmds : json list) : batch_response =
+  let results    = ref [] in
+  let diags      = ref [] in
+  let stopped_at = ref None in
+  let i          = ref 0 in
+  let go         = ref true in
+  let arr        = Array.of_list cmds in
+  let n          = Array.length arr in
+  while !go && !i < n do
+    (match dispatch arr.(!i) with
+     | Cmd_success (result, ds) ->
+       results := !results @ [result];
+       diags   := !diags @ ds;
+       incr i
+     | Cmd_halt d ->
+       diags      := !diags @ [d];
+       stopped_at := Some !i;
+       go         := false)
+  done;
+  { br_results = !results; br_stopped_at = !stopped_at; br_diagnostics = !diags }
 
-let tool_verify_unused_schema =
-  Object [
-    ("name", String "verify_unused");
-    ("description", String "Find declared but unreferenced functions, types, and imports in a previously submitted module; pub declarations and main are never flagged");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("module_name", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "module_name"]);
-    ]);
-  ]
+let get_commands args =
+  match obj_get "commands" args with
+  | Array cmds -> cmds
+  | _          -> []
 
-let handle_submit_module state args =
-  let source      = match obj_get "source"      args with String s -> s | _ -> "" in
-  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
-  try
-    let tokens   = Lexer.tokenize source in
-    let ast      = Parser.parse_program tokens in
-    let (type_env, effect_env) = Typechecker.check_program ast in
-    let enc      = Node_store.as_encoding_store state.node_store in
-    let root     = Node_encoding.encode_program enc ast in
-    let hash_hex = bytes_to_hex root in
-    Hashtbl.replace state.modules module_name { typed_ast = ast; type_env; effect_env };
-    Object [("ok", Bool true); ("hash", String hash_hex)]
-  with Failure msg ->
-    Object [("ok", Bool false); ("error", format_type_error msg)]
-
-let handle_verify_types args =
-  let source = match obj_get "source" args with String s -> s | _ -> "" in
-  try
-    let tokens = Lexer.tokenize source in
-    let ast    = Parser.parse_program tokens in
-    ignore (Typechecker.check_program ast);
-    Object [("errors", Array [])]
-  with Failure msg ->
-    Object [("errors", Array [format_type_error msg])]
-
-let handle_query_signature state args =
-  let module_name   = match obj_get "module_name"   args with String s -> s | _ -> "" in
-  let function_name = match obj_get "function_name" args with String s -> s | _ -> "" in
-  match Hashtbl.find_opt state.modules module_name with
-  | None ->
-    Object [("ok", Bool false);
-            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
-  | Some ms ->
-    match List.assoc_opt function_name ms.type_env with
-    | None ->
-      Object [("ok", Bool false);
-              ("error", String (Printf.sprintf "Function '%s' not found in module '%s'" function_name module_name))]
-    | Some scheme ->
-      let sig_str = Format.asprintf "%a" Typechecker.pp_ty scheme.body in
-      Object [("ok", Bool true); ("signature", String sig_str)]
-
-let render_interface_decl decl =
-  match decl.Ast.decl_desc with
-  | Ast.DeclFn { pub = true; fn_name; type_params; params; return_type; effects; _ } ->
-    let tp_s =
-      if type_params = [] then ""
-      else "<" ^ String.concat ", " type_params ^ ">"
-    in
-    let ann = match return_type, effects with
-      | Some ret, Some eff ->
-        " -> " ^ Printer.print_type_expr ret ^ " ! " ^ Printer.print_effect_set eff
-      | Some ret, None -> " -> " ^ Printer.print_type_expr ret
-      | _ -> ""
-    in
-    Some ("pub fn " ^ fn_name ^ tp_s ^ "(" ^
-          String.concat ", " (List.map Printer.print_param params) ^ ")" ^ ann)
-  | Ast.DeclType { pub = true; _ } ->
-    Some (Printer.print_decl decl)
-  | Ast.DeclEffect { pub = true; _ } ->
-    Some (Printer.print_decl decl)
-  | _ -> None
-
-let handle_verify_exhaustive state args =
-  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
-  match Hashtbl.find_opt state.modules module_name with
-  | None ->
-    Object [("ok", Bool false);
-            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
-  | Some ms ->
-    let warnings = Typechecker.collect_match_warnings ms.typed_ast in
-    let json_warnings = List.map (fun (w : Typechecker.match_warning) ->
-        Object [
-          ("location", Object [("line", Int w.mw_line); ("col", Int w.mw_col)]);
-          ("missing_patterns", Array (List.map (fun s -> String s) w.mw_missing));
-        ]) warnings in
-    Object [("warnings", Array json_warnings)]
-
-let handle_verify_effects state args =
-  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
-  let entry_point = match obj_get "entry_point" args with String s -> s | _ -> "" in
-  match Hashtbl.find_opt state.modules module_name with
-  | None ->
-    Object [("ok", Bool false);
-            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
-  | Some ms ->
-    (try
-       let sites = Typechecker.collect_unhandled_effects ms.typed_ast entry_point in
-       let json_sites = List.map (fun (s : Typechecker.effect_site) ->
-           Object [
-             ("effect", String s.es_effect);
-             ("site", Object [
-               ("function", String s.es_function);
-               ("line",     Int s.es_line);
-               ("col",      Int s.es_col);
-             ]);
-           ]) sites in
-       Object [("unhandled", Array json_sites)]
-     with Failure msg ->
-       Object [("ok", Bool false); ("error", String msg)])
-
-let handle_query_interface state args =
-  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
-  match Hashtbl.find_opt state.modules module_name with
-  | None ->
-    Object [("ok", Bool false);
-            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
-  | Some ms ->
-    let lines = List.filter_map render_interface_decl ms.typed_ast in
-    let iface = String.concat "\n" lines in
-    Object [("interface", String iface)]
+(* ─── Type pretty-printing helpers (carried over from old implementation) ── *)
 
 let rec ty_deref = function
   | Typechecker.TyMeta { Typechecker.inst = Some t; _ } -> ty_deref t
@@ -401,132 +285,377 @@ let rec row_deref = function
 let collect_row_effects row =
   let rec go acc r =
     match row_deref r with
-    | Typechecker.RPure -> List.rev acc
-    | Typechecker.RCons (e, rest) -> go (e.Typechecker.eff_name :: acc) rest
-    | Typechecker.RMeta _ -> List.rev acc
+    | Typechecker.RPure         -> List.rev acc
+    | Typechecker.RCons (e, tl) -> go (e.Typechecker.eff_name :: acc) tl
+    | Typechecker.RMeta _       -> List.rev acc
   in
   go [] row
 
-(* Walk a (possibly curried) function type to find the innermost arrow's effect
-   row, which is where fn_scheme_of_decl places the declared effects. Returns
-   None for 0-parameter functions whose scheme body is not a TyFun. *)
 let rec fn_effect_row ty =
   match ty_deref ty with
   | Typechecker.TyForall (_, t) -> fn_effect_row t
   | Typechecker.TyFun (_, ret, row) ->
     (match ty_deref ret with
      | Typechecker.TyFun _ as inner -> fn_effect_row inner
-     | _ -> Some row)
+     | _                            -> Some row)
   | _ -> None
 
 let effect_names_of_decl_annotation = function
   | None | Some Ast.Pure -> []
   | Some (Ast.Effects (ts, _)) ->
     List.filter_map (function
-      | Ast.TyName n -> Some n
-      | Ast.TyApp (n, _) -> Some n
-      | _ -> None) ts
+      | Ast.TyName n      -> Some n
+      | Ast.TyApp (n, _)  -> Some n
+      | _                 -> None) ts
 
-let tool_query_effects_schema =
-  Object [
-    ("name", String "query_effects");
-    ("description", String "Return a map from each effect name to the list of top-level functions that perform it in a previously submitted module");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("module_name", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "module_name"]);
-    ]);
-  ]
+(* ─── Public-interface rendering ─────────────────────────────────────────── *)
 
-let tool_query_callers_schema =
-  Object [
-    ("name", String "query_callers");
-    ("description", String "List all direct call sites of a named function within a previously submitted module; returns the containing function name and source location for each call");
-    ("inputSchema", Object [
-      ("type", String "object");
-      ("properties", Object [
-        ("module_name",   Object [("type", String "string")]);
-        ("function_name", Object [("type", String "string")]);
-      ]);
-      ("required", Array [String "module_name"; String "function_name"]);
-    ]);
-  ]
-
-let handle_query_effects state args =
-  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
-  match Hashtbl.find_opt state.modules module_name with
-  | None ->
-    Object [("ok", Bool false);
-            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
-  | Some ms ->
-    let effects_tbl : (string, string list) Hashtbl.t = Hashtbl.create 8 in
-    let add_fn_to_effect eff_name fn_name =
-      let existing = Option.value ~default:[] (Hashtbl.find_opt effects_tbl eff_name) in
-      if not (List.mem fn_name existing) then
-        Hashtbl.replace effects_tbl eff_name (existing @ [fn_name])
+let render_interface_decl decl =
+  match decl.Ast.decl_desc with
+  | Ast.DeclFn { pub = true; fn_name; type_params; params; return_type; effects; _ } ->
+    let tp_s =
+      if type_params = [] then ""
+      else "<" ^ String.concat ", " type_params ^ ">"
     in
-    List.iter (fun decl ->
-      match decl.Ast.decl_desc with
-      | Ast.DeclFn { fn_name; effects; _ } ->
-        let eff_names =
-          match List.assoc_opt fn_name ms.type_env with
-          | None -> []
-          | Some scheme ->
-            (match fn_effect_row scheme.Typechecker.body with
-             | Some row -> collect_row_effects row
-             | None -> effect_names_of_decl_annotation effects)
-        in
-        List.iter (fun eff -> add_fn_to_effect eff fn_name) eff_names
-      | _ -> ()
-    ) ms.typed_ast;
-    let effects_json = Hashtbl.fold (fun eff fn_names acc ->
-        (eff, Array (List.map (fun n -> String n) fn_names)) :: acc
-      ) effects_tbl [] in
-    let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) effects_json in
-    Object [("effects", Object sorted)]
+    let ann = match return_type, effects with
+      | Some ret, Some eff ->
+        " -> " ^ Printer.print_type_expr ret ^ " ! " ^ Printer.print_effect_set eff
+      | Some ret, None -> " -> " ^ Printer.print_type_expr ret
+      | _              -> ""
+    in
+    Some ("pub fn " ^ fn_name ^ tp_s ^ "(" ^
+          String.concat ", " (List.map Printer.print_param params) ^ ")" ^ ann)
+  | Ast.DeclType   { pub = true; _ } -> Some (Printer.print_decl decl)
+  | Ast.DeclEffect { pub = true; _ } -> Some (Printer.print_decl decl)
+  | _ -> None
 
-let handle_verify_unused state args =
-  let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
-  match Hashtbl.find_opt state.modules module_name with
-  | None ->
-    Object [("ok", Bool false);
-            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
-  | Some ms ->
-    let items = Typechecker.collect_unused ms.typed_ast in
-    let json_items = List.map (fun (u : Typechecker.unused_item) ->
-        Object [
-          ("name", String u.ui_name);
-          ("kind", String u.ui_kind);
-          ("line", Int u.ui_line);
-          ("col",  Int u.ui_col);
-        ]) items in
-    Object [("unused", Array json_items)]
+(* ─── Location helpers ───────────────────────────────────────────────────── *)
 
-let handle_query_callers state args =
-  let module_name   = match obj_get "module_name"   args with String s -> s | _ -> "" in
-  let function_name = match obj_get "function_name" args with String s -> s | _ -> "" in
-  match Hashtbl.find_opt state.modules module_name with
-  | None ->
-    Object [("ok", Bool false);
-            ("error", String (Printf.sprintf "Module '%s' not found" module_name))]
-  | Some ms ->
-    match Typechecker.collect_callers ms.typed_ast function_name with
-    | Error msg ->
-      Object [("ok", Bool false); ("error", String msg)]
-    | Ok sites ->
-      let json_sites = List.map (fun (s : Typechecker.caller_site) ->
-          Object [
-            ("caller", String s.cs_caller);
-            ("line",   Int s.cs_line);
-            ("col",    Int s.cs_col);
-          ]) sites in
-      Object [("callers", Array json_sites)]
+let make_loc ?module_name line col =
+  Mcp_types.{ loc_module = module_name; loc_line = line; loc_col = col }
+
+(* ─── Decl-name extraction (for hash look-up) ────────────────────────────── *)
+
+let decl_name decl =
+  match decl.Ast.decl_desc with
+  | Ast.DeclFn     { fn_name;     _ } -> Some fn_name
+  | Ast.DeclType   { type_name;   _ } -> Some type_name
+  | Ast.DeclEffect { effect_name; _ } -> Some effect_name
+  | Ast.DeclModule { module_name; _ } -> Some module_name
+  | _                                  -> None
+
+(* ─── Query tool ─────────────────────────────────────────────────────────── *)
+
+let dispatch_query state cmd =
+  let op   = match obj_get "op"   cmd with String s -> s | _ -> "" in
+  let args = obj_get "args" cmd in
+  match op with
+  | "signature" ->
+    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+    let fn_name  = match obj_get "name"   args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       match List.assoc_opt fn_name ms.type_env with
+       | None ->
+         Cmd_halt (Mcp_types.make_error "anchor/not-found"
+           (Printf.sprintf "Function '%s' not found in module '%s'" fn_name mod_name))
+       | Some scheme ->
+         let sig_str = Format.asprintf "%a" Typechecker.pp_ty scheme.Typechecker.body in
+         let node = Hashtbl.find_opt ms.decl_hashes fn_name in
+         Cmd_success (Object [("signature", String sig_str);
+                               ("node", match node with None -> Null | Some h -> String h)],
+                      []))
+
+  | "interface" ->
+    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       let lines = List.filter_map render_interface_decl ms.typed_ast in
+       Cmd_success (Object [("interface", String (String.concat "\n" lines));
+                             ("node", String ms.root_hash)],
+                    []))
+
+  | "effects" ->
+    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       let tbl : (string, string list) Hashtbl.t = Hashtbl.create 8 in
+       let add eff fn =
+         let xs = Option.value ~default:[] (Hashtbl.find_opt tbl eff) in
+         if not (List.mem fn xs) then Hashtbl.replace tbl eff (xs @ [fn])
+       in
+       List.iter (fun decl ->
+         match decl.Ast.decl_desc with
+         | Ast.DeclFn { fn_name; effects; _ } ->
+           let effs =
+             match List.assoc_opt fn_name ms.type_env with
+             | None        -> []
+             | Some scheme ->
+               (match fn_effect_row scheme.Typechecker.body with
+                | Some row -> collect_row_effects row
+                | None     -> effect_names_of_decl_annotation effects)
+           in
+           List.iter (fun e -> add e fn_name) effs
+         | _ -> ()
+       ) ms.typed_ast;
+       let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b)
+           (Hashtbl.fold (fun e fns acc ->
+              (e, Array (List.map (fun n -> String n) fns)) :: acc) tbl []) in
+       Cmd_success (Object [("effects", Object sorted);
+                             ("node", String ms.root_hash)],
+                    []))
+
+  | "callers" ->
+    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+    let fn_name  = match obj_get "name"   args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       (match Typechecker.collect_callers ms.typed_ast fn_name with
+        | Error msg ->
+          Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)
+        | Ok sites ->
+          let json_sites = List.map (fun (s : Typechecker.caller_site) ->
+              let node = Hashtbl.find_opt ms.decl_hashes s.cs_caller in
+              Object [
+                ("caller", String s.cs_caller);
+                ("line",   Int s.cs_line);
+                ("col",    Int s.cs_col);
+                ("node",   match node with None -> Null | Some h -> String h);
+              ]) sites in
+          Cmd_success (Object [("callers", Array json_sites)], [])))
+
+  | _ ->
+    Cmd_halt (Mcp_types.make_error "command/unknown"
+      (Printf.sprintf "Unknown query op '%s'" op))
+
+(* ─── Write tool ─────────────────────────────────────────────────────────── *)
+
+(* After storing a module, run all verify passes and collect diagnostics. *)
+let post_write_verify ms =
+  let diags = ref [] in
+  (* match exhaustiveness warnings *)
+  List.iter (fun (w : Typechecker.match_warning) ->
+    let msg = Printf.sprintf "Non-exhaustive match; missing: %s"
+        (String.concat ", " w.mw_missing) in
+    diags := !diags @ [Mcp_types.make_warning
+        ~node:ms.root_hash
+        ~location:(make_loc w.mw_line w.mw_col)
+        "match/non-exhaustive" msg]
+  ) (Typechecker.collect_match_warnings ms.typed_ast);
+  (* unused declarations *)
+  List.iter (fun (u : Typechecker.unused_item) ->
+    let node = Hashtbl.find_opt ms.decl_hashes u.ui_name in
+    let msg = Printf.sprintf "Unused %s '%s'" u.ui_kind u.ui_name in
+    diags := !diags @ [Mcp_types.make_warning
+        ?node
+        ~location:(make_loc u.ui_line u.ui_col)
+        "decl/unused" msg]
+  ) (Typechecker.collect_unused ms.typed_ast);
+  !diags
+
+let dispatch_write state cmd =
+  let op   = match obj_get "op"   cmd with String s -> s | _ -> "" in
+  let args = obj_get "args" cmd in
+  match op with
+  | "submit_module" ->
+    let source      = match obj_get "source"      args with String s -> s | _ -> "" in
+    let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
+    (try
+       let tokens    = Lexer.tokenize source in
+       let ast       = Parser.parse_program tokens in
+       let (type_env, effect_env) = Typechecker.check_program ast in
+       let enc       = Node_store.as_encoding_store state.node_store in
+       let root      = Node_encoding.encode_program enc ast in
+       let root_hash = bytes_to_hex root in
+       let enc2      = Node_store.as_encoding_store state.node_store in
+       let decl_hashes = Hashtbl.create 16 in
+       List.iter (fun decl ->
+         match decl_name decl with
+         | Some n ->
+           let h = Node_encoding.encode_decl enc2 decl in
+           Hashtbl.replace decl_hashes n (bytes_to_hex h)
+         | None -> ()
+       ) ast;
+       let ms = { typed_ast = ast; type_env; effect_env; root_hash; decl_hashes } in
+       Hashtbl.replace state.modules module_name ms;
+       let verify_diags = post_write_verify ms in
+       Cmd_success (Object [("hash", String root_hash)], verify_diags)
+     with Failure msg ->
+       Cmd_halt (Mcp_types.make_error "parse/error" msg))
+
+  | _ ->
+    Cmd_halt (Mcp_types.make_error "command/unknown"
+      (Printf.sprintf "Unknown write op '%s'" op))
+
+(* ─── Transform tool ─────────────────────────────────────────────────────── *)
+
+let dispatch_transform _state cmd =
+  let op = match obj_get "op" cmd with String s -> s | _ -> "" in
+  Cmd_halt (Mcp_types.make_error "command/unimplemented"
+    (Printf.sprintf "Transform op '%s' is not yet implemented" op))
+
+(* ─── Verify tool ────────────────────────────────────────────────────────── *)
+
+let dispatch_verify state cmd =
+  let op   = match obj_get "op"   cmd with String s -> s | _ -> "" in
+  let args = obj_get "args" cmd in
+  match op with
+  | "types" ->
+    let source = match obj_get "source" args with String s -> s | _ -> "" in
+    (try
+       let tokens = Lexer.tokenize source in
+       let ast    = Parser.parse_program tokens in
+       ignore (Typechecker.check_program ast);
+       Cmd_success (Object [], [])
+     with Failure msg ->
+       let diag = Mcp_types.make_error "type/error" msg in
+       Cmd_success (Object [], [diag]))
+
+  | "exhaustive" ->
+    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       let warnings = Typechecker.collect_match_warnings ms.typed_ast in
+       let diags = List.map (fun (w : Typechecker.match_warning) ->
+           let msg = Printf.sprintf "Non-exhaustive match; missing: %s"
+               (String.concat ", " w.mw_missing) in
+           Mcp_types.make_warning
+             ~node:ms.root_hash
+             ~location:(make_loc w.mw_line w.mw_col)
+             "match/non-exhaustive" msg
+         ) warnings in
+       Cmd_success (Object [], diags))
+
+  | "effects" ->
+    let mod_name   = match obj_get "module"      args with String s -> s | _ -> "" in
+    let entry_point = match obj_get "entry_point" args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       (try
+          let sites = Typechecker.collect_unhandled_effects ms.typed_ast entry_point in
+          let diags = List.map (fun (s : Typechecker.effect_site) ->
+              let node = Hashtbl.find_opt ms.decl_hashes s.es_function in
+              let msg  = Printf.sprintf "Unhandled effect '%s' in function '%s'"
+                  s.es_effect s.es_function in
+              Mcp_types.make_warning ?node
+                ~location:(make_loc s.es_line s.es_col)
+                "effect/unhandled" msg
+            ) sites in
+          Cmd_success (Object [], diags)
+        with Failure msg ->
+          Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)))
+
+  | "unused" ->
+    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       let items = Typechecker.collect_unused ms.typed_ast in
+       let diags = List.map (fun (u : Typechecker.unused_item) ->
+           let node = Hashtbl.find_opt ms.decl_hashes u.ui_name in
+           let msg  = Printf.sprintf "Unused %s '%s'" u.ui_kind u.ui_name in
+           Mcp_types.make_warning ?node
+             ~location:(make_loc u.ui_line u.ui_col)
+             "decl/unused" msg
+         ) items in
+       Cmd_success (Object [], diags))
+
+  | _ ->
+    Cmd_halt (Mcp_types.make_error "command/unknown"
+      (Printf.sprintf "Unknown verify op '%s'" op))
+
+(* ─── Tool schemas ───────────────────────────────────────────────────────── *)
+
+let command_schema ops =
+  Object [
+    ("type", String "array");
+    ("items", Object [
+       ("type", String "object");
+       ("properties", Object [
+          ("op",   Object [("type", String "string");
+                           ("enum", Array (List.map (fun s -> String s) ops))]);
+          ("args", Object [("type", String "object")]);
+        ]);
+       ("required", Array [String "op"; String "args"]);
+     ]);
+  ]
+
+let batch_input_schema ops =
+  Object [
+    ("type", String "object");
+    ("properties", Object [("commands", command_schema ops)]);
+    ("required", Array [String "commands"]);
+  ]
+
+let tool_query_schema =
+  Object [
+    ("name", String "query");
+    ("description", String
+       "Read the IR graph: function signatures, module interfaces, effect maps, \
+        and caller graphs.  Accepts a batch of commands executed in order.");
+    ("inputSchema", batch_input_schema ["signature"; "interface"; "effects"; "callers"]);
+  ]
+
+let tool_write_schema =
+  Object [
+    ("name", String "write");
+    ("description", String
+       "Submit working-form Axiom source; elaborate, typecheck, store, and \
+        automatically verify the resulting state.  Accepts a batch of commands.");
+    ("inputSchema", batch_input_schema ["submit_module"]);
+  ]
+
+let tool_transform_schema =
+  Object [
+    ("name", String "transform");
+    ("description", String
+       "Apply mechanical, deterministic refactors (rename, extract-function, \
+        mock-effects, add-effect-logging, inline-handler).  Automatically \
+        verifies the resulting state.  Accepts a batch of commands.");
+    ("inputSchema", batch_input_schema []);
+  ]
+
+let tool_verify_schema =
+  Object [
+    ("name", String "verify");
+    ("description", String
+       "On-demand invariant checks: types, exhaustive pattern matching, effect \
+        handling, and unused declarations.  Accepts a batch of commands.");
+    ("inputSchema", batch_input_schema ["types"; "exhaustive"; "effects"; "unused"]);
+  ]
+
+(* ─── Request handler ────────────────────────────────────────────────────── *)
+
+let wrap_batch_result br =
+  Object [
+    ("content", Array [
+       Object [("type", String "text");
+               ("text", String (json_to_string (json_of_batch_response br)))]])
+  ]
 
 let handle state msg =
-  let id     = obj_get "id" msg in
-  let meth   = match obj_get "method" msg with String s -> s | _ -> "" in
+  let id   = obj_get "id" msg in
+  let meth = match obj_get "method" msg with String s -> s | _ -> "" in
   Printf.eprintf "[mcp] method=%s\n%!" meth;
   match meth with
   | "initialize" ->
@@ -536,87 +665,45 @@ let handle state msg =
       ("serverInfo", Object [("name", String "axiom"); ("version", String "0.1.0")]);
       ("capabilities", Object [("tools", Object [])]);
     ]))
-  | "notifications/initialized" ->
-    ()
+
+  | "notifications/initialized" -> ()
+
   | "tools/list" ->
-    send (response id (Object [("tools", Array [tool_submit_module_schema; tool_verify_types_schema; tool_query_signature_schema; tool_query_interface_schema; tool_verify_exhaustive_schema; tool_verify_effects_schema; tool_verify_unused_schema; tool_query_effects_schema; tool_query_callers_schema])]))
+    send (response id (Object [
+      ("tools", Array [tool_query_schema; tool_write_schema;
+                       tool_transform_schema; tool_verify_schema])
+    ]))
+
   | "tools/call" ->
     let params    = obj_get "params" msg in
     let tool_name = match obj_get "name" params with String s -> s | _ -> "" in
     let args      = obj_get "arguments" params in
+    let cmds      = get_commands args in
     (match tool_name with
-     | "submit_module" ->
-       let result = handle_submit_module state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "verify_types" ->
-       let result = handle_verify_types args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "query_signature" ->
-       let result = handle_query_signature state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "query_interface" ->
-       let result = handle_query_interface state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "verify_exhaustive" ->
-       let result = handle_verify_exhaustive state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "verify_effects" ->
-       let result = handle_verify_effects state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "verify_unused" ->
-       let result = handle_verify_unused state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "query_effects" ->
-       let result = handle_query_effects state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
-     | "query_callers" ->
-       let result = handle_query_callers state args in
-       send (response id (Object [
-         ("content", Array [
-           Object [("type", String "text"); ("text", String (json_to_string result))]
-         ])
-       ]))
+     | "query" ->
+       send (response id (wrap_batch_result
+           (batch_execute (dispatch_query state) cmds)))
+     | "write" ->
+       send (response id (wrap_batch_result
+           (batch_execute (dispatch_write state) cmds)))
+     | "transform" ->
+       send (response id (wrap_batch_result
+           (batch_execute (dispatch_transform state) cmds)))
+     | "verify" ->
+       send (response id (wrap_batch_result
+           (batch_execute (dispatch_verify state) cmds)))
      | _ ->
        send (error_response id (-32601) ("Unknown tool: " ^ tool_name)))
+
   | _ ->
     (match id with
      | Null -> ()
-     | _ -> send (error_response id (-32601) ("Method not found: " ^ meth)))
+     | _    -> send (error_response id (-32601) ("Method not found: " ^ meth)))
+
+(* ─── Entry point ────────────────────────────────────────────────────────── *)
 
 let () =
-  let store_dir  =
+  let store_dir =
     let path = Filename.temp_file "axiom_mcp_" "_dir" in
     Sys.remove path;
     Unix.mkdir path 0o700;

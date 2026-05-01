@@ -38,7 +38,8 @@ let start_server () =
   in
   (write_line, read_line, close)
 
-(* Minimal JSON accessor helpers *)
+(* ─── Minimal JSON parser ────────────────────────────────────────────────── *)
+
 let json_field key json =
   match json with
   | `Assoc fields -> (match List.assoc_opt key fields with Some v -> v | None -> `Null)
@@ -130,28 +131,7 @@ let mini_parse s =
   in
   parse_value ()
 
-let parse_response line =
-  let json = mini_parse line in
-  let result = json_field "result" json in
-  let content = json_field "content" result in
-  (match content with
-   | `List (item :: _) ->
-     let text = json_field "text" item in
-     (match text with `String s -> mini_parse s | _ -> `Null)
-   | _ -> result)
-
-let initialize write_line read_line =
-  write_line {|{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}|};
-  ignore (read_line ());
-  write_line {|{"jsonrpc":"2.0","id":null,"method":"notifications/initialized","params":{}}|}
-
-let well_typed_source = {|fn double(x: Int) -> Int ! pure { add(x, x) }|}
-
-let ill_typed_source = {|fn go() -> Unit ! pure { perform Nope.boom() }|}
-
-(* ------------------------------------------------------------------ *)
-(* Tests                                                               *)
-(* ------------------------------------------------------------------ *)
+(* ─── Protocol helpers ───────────────────────────────────────────────────── *)
 
 let json_string_escape s =
   let buf = Buffer.create (String.length s + 2) in
@@ -164,252 +144,60 @@ let json_string_escape s =
     | c    -> Buffer.add_char buf c) s;
   Buffer.contents buf
 
-let verify_types_call id src =
+let initialize write_line read_line =
+  write_line {|{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}|};
+  ignore (read_line ());
+  write_line {|{"jsonrpc":"2.0","id":null,"method":"notifications/initialized","params":{}}|}
+
+(* Build a tools/call JSON-RPC request.
+   [commands_json] is a pre-serialised JSON array string. *)
+let tool_call id tool_name commands_json =
   Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"verify_types","arguments":{"source":"%s"}}}|}
-    id (json_string_escape src)
+    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"%s","arguments":{"commands":%s}}}|}
+    id tool_name commands_json
 
-let submit_module_call id src name =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"submit_module","arguments":{"source":"%s","module_name":"%s"}}}|}
-    id (json_string_escape src) (json_string_escape name)
+(* Build a single-command batch array. [args_json] is a pre-serialised object. *)
+let single_cmd op args_json =
+  Printf.sprintf {|[{"op":"%s","args":%s}]|} op args_json
 
-let query_signature_call id module_name function_name =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_signature","arguments":{"module_name":"%s","function_name":"%s"}}}|}
-    id (json_string_escape module_name) (json_string_escape function_name)
+(* Parse the batch_response JSON from a raw server line. *)
+let parse_batch_response line =
+  let json = mini_parse line in
+  let result = json_field "result" json in
+  let content = json_field "content" result in
+  match content with
+  | `List (item :: _) ->
+    let text = json_field "text" item in
+    (match text with `String s -> mini_parse s | _ -> `Null)
+  | _ -> result
 
-let query_interface_call id module_name =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_interface","arguments":{"module_name":"%s"}}}|}
-    id (json_string_escape module_name)
+(* First element of the "results" array, or `Null. *)
+let first_result batch =
+  match json_field "results" batch with
+  | `List (r :: _) -> r
+  | _              -> `Null
 
-let test_verify_types_well_typed () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (verify_types_call 2 well_typed_source);
-    let result = parse_response (read_line ()) in
-    let errors = json_field "errors" result in
-    Alcotest.(check bool) "errors is empty list" true
-      (match errors with `List [] -> true | _ -> false)
-  )
+(* "diagnostics" array, or []. *)
+let batch_diagnostics batch =
+  match json_field "diagnostics" batch with
+  | `List ds -> ds
+  | _        -> []
 
-let test_verify_types_type_error () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (verify_types_call 2 ill_typed_source);
-    let result = parse_response (read_line ()) in
-    let errors = json_field "errors" result in
-    Alcotest.(check bool) "errors is non-empty" true
-      (match errors with `List (_ :: _) -> true | _ -> false);
-    (match errors with
-     | `List (err :: _) ->
-       let msg = json_field "message" err in
-       Alcotest.(check bool) "error has message field" true
-         (match msg with `String s -> String.length s > 0 | _ -> false);
-       let line = json_field "line" err in
-       Alcotest.(check bool) "error has line field" true
-         (match line with `Int _ -> true | _ -> false);
-       let col = json_field "col" err in
-       Alcotest.(check bool) "error has col field" true
-         (match col with `Int _ -> true | _ -> false)
-     | _ -> ())
-  )
+(* True when the batch completed without halting. *)
+let batch_ok batch =
+  match json_field "stopped_at" batch with
+  | `Null -> true
+  | _     -> false
 
-let test_verify_types_does_not_update_state () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (verify_types_call 2 ill_typed_source);
-    ignore (read_line ());
-    write_line (submit_module_call 3 well_typed_source "test");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "submit_module still succeeds after verify_types" true
-      (match ok with `Bool true -> true | _ -> false)
-  )
+(* ─── Shared test sources ────────────────────────────────────────────────── *)
 
-let test_tools_list_includes_verify_types () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
-    let line = read_line () in
-    let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
-    let names = match tools with
-      | `List items ->
-        List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
-      | _ -> []
-    in
-    Alcotest.(check bool) "verify_types in tools/list" true
-      (List.mem "verify_types" names)
-  )
-
-let test_query_signature_success () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 well_typed_source "mymod");
-    ignore (read_line ());
-    write_line (query_signature_call 3 "mymod" "double");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is true" true
-      (match ok with `Bool true -> true | _ -> false);
-    let sig_ = json_field "signature" result in
-    Alcotest.(check bool) "signature is a non-empty string" true
-      (match sig_ with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let test_query_signature_module_not_found () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (query_signature_call 2 "nonexistent" "double");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error message is a non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let test_query_signature_function_not_found () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 well_typed_source "mymod");
-    ignore (read_line ());
-    write_line (query_signature_call 3 "mymod" "nonexistent_fn");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error message is a non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let test_query_signature_in_tools_list () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
-    let line = read_line () in
-    let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
-    let names = match tools with
-      | `List items ->
-        List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
-      | _ -> []
-    in
-    Alcotest.(check bool) "query_signature in tools/list" true
-      (List.mem "query_signature" names)
-  )
+let well_typed_source = {|fn double(x: Int) -> Int ! pure { add(x, x) }|}
+let ill_typed_source   = {|fn go() -> Unit ! pure { perform Nope.boom() }|}
 
 let mixed_visibility_source =
   {|pub fn add_one(x: Int) -> Int ! pure { add(x, 1) }
 fn internal_helper(x: Int) -> Int ! pure { x }
 pub type Color = | Red | Green | Blue|}
-
-let contains_substring haystack needle =
-  let hlen = String.length haystack and nlen = String.length needle in
-  if nlen = 0 then true
-  else if nlen > hlen then false
-  else
-    let found = ref false in
-    for i = 0 to hlen - nlen do
-      if not !found &&
-         String.sub haystack i nlen = needle then
-        found := true
-    done;
-    !found
-
-let test_query_interface_returns_only_pub () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 mixed_visibility_source "mymod");
-    ignore (read_line ());
-    write_line (query_interface_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let iface = json_field "interface" result in
-    let iface_str = match iface with `String s -> s | _ -> "" in
-    Alcotest.(check bool) "interface contains pub fn" true
-      (contains_substring iface_str "pub fn add_one");
-    Alcotest.(check bool) "interface contains pub type" true
-      (contains_substring iface_str "pub type Color");
-    Alcotest.(check bool) "interface excludes private fn" true
-      (not (contains_substring iface_str "internal_helper"))
-  )
-
-let test_query_interface_fn_has_no_body () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 mixed_visibility_source "mymod");
-    ignore (read_line ());
-    write_line (query_interface_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let iface = json_field "interface" result in
-    let iface_str = match iface with `String s -> s | _ -> "" in
-    Alcotest.(check bool) "interface is a non-empty string" true
-      (String.length iface_str > 0);
-    Alcotest.(check bool) "interface has no fn body braces" true
-      (not (String.contains iface_str '{'))
-  )
-
-let test_query_interface_module_not_found () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (query_interface_call 2 "nonexistent");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let test_query_interface_in_tools_list () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
-    let line = read_line () in
-    let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
-    let names = match tools with
-      | `List items ->
-        List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
-      | _ -> []
-    in
-    Alcotest.(check bool) "query_interface in tools/list" true
-      (List.mem "query_interface" names)
-  )
-
-let verify_exhaustive_call id module_name =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"verify_exhaustive","arguments":{"module_name":"%s"}}}|}
-    id (json_string_escape module_name)
 
 let exhaustive_source =
   {|type Color = | Red | Green | Blue
@@ -421,60 +209,6 @@ fn describe(c: Color) -> Int ! pure {
   }
 }|}
 
-let test_verify_exhaustive_in_tools_list () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
-    let line = read_line () in
-    let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
-    let names = match tools with
-      | `List items ->
-        List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
-      | _ -> []
-    in
-    Alcotest.(check bool) "verify_exhaustive in tools/list" true
-      (List.mem "verify_exhaustive" names)
-  )
-
-let test_verify_exhaustive_exhaustive_module () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 exhaustive_source "mymod");
-    ignore (read_line ());
-    write_line (verify_exhaustive_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let warnings = json_field "warnings" result in
-    Alcotest.(check bool) "warnings is empty list" true
-      (match warnings with `List [] -> true | _ -> false)
-  )
-
-let test_verify_exhaustive_module_not_found () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (verify_exhaustive_call 2 "nonexistent");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let verify_effects_call id module_name entry_point =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"verify_effects","arguments":{"module_name":"%s","entry_point":"%s"}}}|}
-    id (json_string_escape module_name) (json_string_escape entry_point)
-
-(* A module where main handles all effects performed by its callees. *)
 let effects_all_handled_source =
   {|effect Log { log: (String) -> Unit }
 fn helper() -> Unit ! {Log} { perform Log.log("hello") }
@@ -484,439 +218,588 @@ fn main() -> Unit ! pure {
   }
 }|}
 
-(* A module where main calls a function that performs an unhandled effect. *)
 let effects_unhandled_source =
   {|effect Log { log: (String) -> Unit }
 fn helper() -> Unit ! {Log} { perform Log.log("hello") }
 fn main() -> Unit ! {Log} { helper() }|}
 
-let test_verify_effects_in_tools_list () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
-    let line = read_line () in
-    let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
-    let names = match tools with
-      | `List items ->
-        List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
-      | _ -> []
-    in
-    Alcotest.(check bool) "verify_effects in tools/list" true
-      (List.mem "verify_effects" names)
-  )
-
-let test_verify_effects_all_handled () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 effects_all_handled_source "mymod");
-    ignore (read_line ());
-    write_line (verify_effects_call 3 "mymod" "main");
-    let result = parse_response (read_line ()) in
-    let unhandled = json_field "unhandled" result in
-    Alcotest.(check bool) "unhandled is empty list" true
-      (match unhandled with `List [] -> true | _ -> false)
-  )
-
-let test_verify_effects_unhandled () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 effects_unhandled_source "mymod");
-    ignore (read_line ());
-    write_line (verify_effects_call 3 "mymod" "main");
-    let result = parse_response (read_line ()) in
-    let unhandled = json_field "unhandled" result in
-    Alcotest.(check bool) "unhandled is non-empty" true
-      (match unhandled with `List (_ :: _) -> true | _ -> false);
-    (match unhandled with
-     | `List (entry :: _) ->
-       let eff = json_field "effect" entry in
-       Alcotest.(check bool) "effect name is a non-empty string" true
-         (match eff with `String s -> String.length s > 0 | _ -> false);
-       let site = json_field "site" entry in
-       let fn_field = json_field "function" site in
-       Alcotest.(check bool) "site has function field" true
-         (match fn_field with `String s -> String.length s > 0 | _ -> false);
-       let line = json_field "line" site in
-       Alcotest.(check bool) "site has line field" true
-         (match line with `Int _ -> true | _ -> false);
-       let col = json_field "col" site in
-       Alcotest.(check bool) "site has col field" true
-         (match col with `Int _ -> true | _ -> false)
-     | _ -> ())
-  )
-
-let test_verify_effects_module_not_found () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (verify_effects_call 2 "nonexistent" "main");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let test_verify_effects_entry_not_found () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 effects_all_handled_source "mymod");
-    ignore (read_line ());
-    write_line (verify_effects_call 3 "mymod" "nonexistent_fn");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let verify_unused_call id module_name =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"verify_unused","arguments":{"module_name":"%s"}}}|}
-    id (json_string_escape module_name)
-
-(* All non-pub declarations are referenced — expect empty unused list. *)
 let all_used_source =
   {|fn helper(x: Int) -> Int ! pure { x }
 fn main() -> Int ! pure { helper(1) }|}
 
-(* One unreferenced private function. *)
 let one_unused_source =
   {|fn used(x: Int) -> Int ! pure { x }
 fn unused_fn(x: Int) -> Int ! pure { x }
 fn main() -> Int ! pure { used(1) }|}
 
-(* Pub declaration — must NOT be flagged even though nothing calls it. *)
-let pub_unused_source =
-  {|pub fn exported(x: Int) -> Int ! pure { x }|}
+let pub_unused_source = {|pub fn exported(x: Int) -> Int ! pure { x }|}
 
-(* Mutual recursion: both sides referenced externally via main. *)
 let mutual_recursion_source =
   {|fn ping(x: Int) -> Int ! pure { pong(x) }
 fn pong(x: Int) -> Int ! pure { ping(x) }
 fn main() -> Int ! pure { ping(0) }|}
 
-(* Mutual recursion: neither side reachable — both unused. *)
 let mutual_both_unused_source =
   {|fn ping(x: Int) -> Int ! pure { pong(x) }
 fn pong(x: Int) -> Int ! pure { ping(x) }
 fn main() -> Int ! pure { 0 }|}
 
-let test_verify_unused_in_tools_list () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
-    let line = read_line () in
-    let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
-    let names = match tools with
-      | `List items ->
-        List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
-      | _ -> []
-    in
-    Alcotest.(check bool) "verify_unused in tools/list" true
-      (List.mem "verify_unused" names)
-  )
-
-let test_verify_unused_all_used () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 all_used_source "mymod");
-    ignore (read_line ());
-    write_line (verify_unused_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let unused = json_field "unused" result in
-    Alcotest.(check bool) "unused is empty list" true
-      (match unused with `List [] -> true | _ -> false)
-  )
-
-let test_verify_unused_one_unused () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 one_unused_source "mymod");
-    ignore (read_line ());
-    write_line (verify_unused_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let unused = json_field "unused" result in
-    Alcotest.(check bool) "unused is non-empty" true
-      (match unused with `List (_ :: _) -> true | _ -> false);
-    (match unused with
-     | `List (entry :: _) ->
-       let name = json_field "name" entry in
-       Alcotest.(check bool) "entry has name field" true
-         (match name with `String s -> String.length s > 0 | _ -> false);
-       let kind = json_field "kind" entry in
-       Alcotest.(check bool) "entry has kind field" true
-         (match kind with `String s -> String.length s > 0 | _ -> false);
-       let line = json_field "line" entry in
-       Alcotest.(check bool) "entry has line field" true
-         (match line with `Int _ -> true | _ -> false);
-       let col = json_field "col" entry in
-       Alcotest.(check bool) "entry has col field" true
-         (match col with `Int _ -> true | _ -> false)
-     | _ -> ())
-  )
-
-let test_verify_unused_pub_not_flagged () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 pub_unused_source "mymod");
-    ignore (read_line ());
-    write_line (verify_unused_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let unused = json_field "unused" result in
-    Alcotest.(check bool) "pub declaration not flagged" true
-      (match unused with `List [] -> true | _ -> false)
-  )
-
-let test_verify_unused_mutual_recursion_both_reachable () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 mutual_recursion_source "mymod");
-    ignore (read_line ());
-    write_line (verify_unused_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let unused = json_field "unused" result in
-    Alcotest.(check bool) "mutually recursive pair reachable from main — empty unused" true
-      (match unused with `List [] -> true | _ -> false)
-  )
-
-let test_verify_unused_mutual_recursion_both_unreachable () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (submit_module_call 2 mutual_both_unused_source "mymod");
-    ignore (read_line ());
-    write_line (verify_unused_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let unused = json_field "unused" result in
-    let count = match unused with `List xs -> List.length xs | _ -> -1 in
-    Alcotest.(check bool) "both sides of unreachable mutual pair are flagged" true
-      (count = 2)
-  )
-
-let test_verify_unused_module_not_found () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line (verify_unused_call 2 "nonexistent");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
-  )
-
-let query_effects_call id module_name =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_effects","arguments":{"module_name":"%s"}}}|}
-    id (json_string_escape module_name)
-
-(* Pure module — no effects at all. *)
 let pure_module_source =
   {|fn add_one(x: Int) -> Int ! pure { add(x, 1) }
 fn double(x: Int) -> Int ! pure { add(x, x) }|}
 
-(* Module with one effectful function. *)
 let single_effect_source =
   {|effect Log { log: (String) -> Unit }
 fn greet(msg: String) -> Unit ! {Log} { perform Log.log(msg) }
 fn pure_fn(x: Int) -> Int ! pure { x }|}
 
-(* Module where one function performs two effects, another performs one. *)
 let multi_effect_source =
   {|effect Log { log: (String) -> Unit }
 effect Throw { throw: (String) -> Unit }
 fn do_both(x: Int) -> Unit ! {Log, Throw} { perform Log.log("hi") }
 fn do_log(x: Int) -> Unit ! {Log} { perform Log.log("x") }|}
 
-let test_query_effects_in_tools_list () =
+let multi_caller_source =
+  {|fn helper(x: Int) -> Int ! pure { x }
+fn main1() -> Int ! pure { helper(1) }
+fn main2() -> Int ! pure { helper(2) }|}
+
+let uncalled_fn_source =
+  {|fn helper(x: Int) -> Int ! pure { x }
+fn main() -> Int ! pure { 0 }|}
+
+let contains_substring haystack needle =
+  let hlen = String.length haystack and nlen = String.length needle in
+  if nlen = 0 then true
+  else if nlen > hlen then false
+  else
+    let found = ref false in
+    for i = 0 to hlen - nlen do
+      if not !found && String.sub haystack i nlen = needle then found := true
+    done;
+    !found
+
+(* ─── tools/list ─────────────────────────────────────────────────────────── *)
+
+let test_tools_list_has_four_tools () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
     let line = read_line () in
     let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
+    let tools = json_field "tools" (json_field "result" json) in
     let names = match tools with
       | `List items ->
         List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
+          match json_field "name" item with `String s -> Some s | _ -> None) items
       | _ -> []
     in
-    Alcotest.(check bool) "query_effects in tools/list" true
-      (List.mem "query_effects" names)
+    Alcotest.(check int) "exactly four tools" 4 (List.length names);
+    List.iter (fun t ->
+      Alcotest.(check bool) (t ^ " in tools/list") true (List.mem t names)
+    ) ["query"; "write"; "transform"; "verify"]
   )
+
+(* ─── verify / types ─────────────────────────────────────────────────────── *)
+
+let test_verify_types_well_typed () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "types"
+         (Printf.sprintf {|{"source":"%s"}|} (json_string_escape well_typed_source))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok"  true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics" true (batch_diagnostics batch = [])
+  )
+
+let test_verify_types_ill_typed () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "types"
+         (Printf.sprintf {|{"source":"%s"}|} (json_string_escape ill_typed_source))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok (verify never halts on type errors)" true (batch_ok batch);
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "diagnostics non-empty" true (diags <> []);
+    (match diags with
+     | d :: _ ->
+       Alcotest.(check bool) "severity is error" true
+         (json_field "severity" d = `String "error");
+       Alcotest.(check bool) "code present" true
+         (match json_field "code" d with `String s -> String.length s > 0 | _ -> false);
+       Alcotest.(check bool) "message present" true
+         (match json_field "message" d with `String s -> String.length s > 0 | _ -> false)
+     | [] -> ())
+  )
+
+let test_verify_types_does_not_update_state () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    (* verify ill-typed source — must not store anything *)
+    write_line (tool_call 2 "verify"
+      (single_cmd "types"
+         (Printf.sprintf {|{"source":"%s"}|} (json_string_escape ill_typed_source))));
+    ignore (read_line ());
+    (* write well-typed source — must still succeed *)
+    write_line (tool_call 3 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"test"}|}
+            (json_string_escape well_typed_source))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "write succeeds" true (batch_ok batch)
+  )
+
+(* ─── write / submit_module ─────────────────────────────────────────────── *)
+
+let test_write_submit_returns_hash () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let hash = json_field "hash" (first_result batch) in
+    Alcotest.(check bool) "hash is a non-empty string" true
+      (match hash with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_write_parse_error_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         {|{"source":"@@@invalid@@@","module_name":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch));
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "error diagnostic present" true (diags <> []);
+    (match diags with
+     | d :: _ ->
+       Alcotest.(check bool) "severity is error" true
+         (json_field "severity" d = `String "error")
+     | [] -> ())
+  )
+
+(* ─── query / signature ─────────────────────────────────────────────────── *)
+
+let test_query_signature_success () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "signature" {|{"module":"mymod","name":"double"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let sig_ = json_field "signature" (first_result batch) in
+    Alcotest.(check bool) "signature is non-empty string" true
+      (match sig_ with `String s -> String.length s > 0 | _ -> false);
+    let node = json_field "node" (first_result batch) in
+    Alcotest.(check bool) "node hash present" true
+      (match node with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_signature_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "query"
+      (single_cmd "signature" {|{"module":"nonexistent","name":"double"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch));
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "error diagnostic present" true (diags <> [])
+  )
+
+let test_query_signature_function_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "signature" {|{"module":"mymod","name":"nonexistent_fn"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch));
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "error diagnostic present" true (diags <> [])
+  )
+
+(* ─── query / interface ─────────────────────────────────────────────────── *)
+
+let test_query_interface_returns_only_pub () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape mixed_visibility_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "interface" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let iface = match json_field "interface" (first_result batch) with
+      | `String s -> s | _ -> "" in
+    Alcotest.(check bool) "contains pub fn"      true (contains_substring iface "pub fn add_one");
+    Alcotest.(check bool) "contains pub type"    true (contains_substring iface "pub type Color");
+    Alcotest.(check bool) "excludes private fn"  true (not (contains_substring iface "internal_helper"))
+  )
+
+let test_query_interface_fn_has_no_body () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape mixed_visibility_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "interface" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let iface = match json_field "interface" (first_result batch) with
+      | `String s -> s | _ -> "" in
+    Alcotest.(check bool) "interface non-empty"     true (String.length iface > 0);
+    Alcotest.(check bool) "no body braces"          true (not (String.contains iface '{'))
+  )
+
+let test_query_interface_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "query"
+      (single_cmd "interface" {|{"module":"nonexistent"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── verify / exhaustive ────────────────────────────────────────────────── *)
+
+let test_verify_exhaustive_no_warnings () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape exhaustive_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "exhaustive" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics" true (batch_diagnostics batch = [])
+  )
+
+let test_verify_exhaustive_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "exhaustive" {|{"module":"nonexistent"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── verify / effects ───────────────────────────────────────────────────── *)
+
+let test_verify_effects_all_handled () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_all_handled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "effects" {|{"module":"mymod","entry_point":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics" true (batch_diagnostics batch = [])
+  )
+
+let test_verify_effects_unhandled () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_unhandled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "effects" {|{"module":"mymod","entry_point":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "diagnostics non-empty" true (diags <> []);
+    (match diags with
+     | d :: _ ->
+       Alcotest.(check bool) "severity is warning" true
+         (json_field "severity" d = `String "warning");
+       Alcotest.(check bool) "code is effect/unhandled" true
+         (json_field "code" d = `String "effect/unhandled");
+       Alcotest.(check bool) "location present" true
+         (match json_field "location" d with `Assoc _ -> true | _ -> false)
+     | [] -> ())
+  )
+
+let test_verify_effects_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "effects" {|{"module":"nonexistent","entry_point":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+let test_verify_effects_entry_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_all_handled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "effects" {|{"module":"mymod","entry_point":"nonexistent_fn"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── verify / unused ────────────────────────────────────────────────────── *)
+
+let test_verify_unused_all_used () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape all_used_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "unused" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics" true (batch_diagnostics batch = [])
+  )
+
+let test_verify_unused_one_unused () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape one_unused_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "unused" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "diagnostics non-empty" true (diags <> []);
+    (match diags with
+     | d :: _ ->
+       Alcotest.(check bool) "severity is warning" true
+         (json_field "severity" d = `String "warning");
+       Alcotest.(check bool) "code is decl/unused" true
+         (json_field "code" d = `String "decl/unused");
+       Alcotest.(check bool) "message non-empty" true
+         (match json_field "message" d with `String s -> String.length s > 0 | _ -> false);
+       Alcotest.(check bool) "location present" true
+         (match json_field "location" d with `Assoc _ -> true | _ -> false)
+     | [] -> ())
+  )
+
+let test_verify_unused_pub_not_flagged () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape pub_unused_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "unused" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "no diagnostics for pub decl" true (batch_diagnostics batch = [])
+  )
+
+let test_verify_unused_mutual_recursion_both_reachable () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape mutual_recursion_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "unused" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "no diagnostics — pair reachable from main" true
+      (batch_diagnostics batch = [])
+  )
+
+let test_verify_unused_mutual_recursion_both_unreachable () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape mutual_both_unused_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "unused" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "two diagnostics — both sides flagged" true
+      (List.length (batch_diagnostics batch) = 2)
+  )
+
+let test_verify_unused_module_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "unused" {|{"module":"nonexistent"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── query / effects ────────────────────────────────────────────────────── *)
 
 let test_query_effects_module_not_found () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (query_effects_call 2 "nonexistent");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
+    write_line (tool_call 2 "query"
+      (single_cmd "effects" {|{"module":"nonexistent"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
   )
 
 let test_query_effects_pure_module () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (submit_module_call 2 pure_module_source "mymod");
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape pure_module_source))));
     ignore (read_line ());
-    write_line (query_effects_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let effects = json_field "effects" result in
+    write_line (tool_call 3 "query"
+      (single_cmd "effects" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let effs = json_field "effects" (first_result batch) in
     Alcotest.(check bool) "effects is empty object" true
-      (match effects with `Assoc [] -> true | _ -> false)
+      (match effs with `Assoc [] -> true | _ -> false)
   )
 
 let test_query_effects_single_effect () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (submit_module_call 2 single_effect_source "mymod");
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape single_effect_source))));
     ignore (read_line ());
-    write_line (query_effects_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let effects = json_field "effects" result in
-    let log_fns = match effects with
-      | `Assoc fields -> (match List.assoc_opt "Log" fields with Some v -> v | None -> `Null)
+    write_line (tool_call 3 "query"
+      (single_cmd "effects" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let effs = json_field "effects" (first_result batch) in
+    let log_fns = match effs with
+      | `Assoc fs -> (match List.assoc_opt "Log" fs with Some v -> v | None -> `Null)
       | _ -> `Null
     in
-    Alcotest.(check bool) "Log effect maps to greet" true
-      (match log_fns with
-       | `List fns -> List.exists (fun f -> f = `String "greet") fns
-       | _ -> false);
-    Alcotest.(check bool) "pure_fn not in Log's list" true
-      (match log_fns with
-       | `List fns -> not (List.exists (fun f -> f = `String "pure_fn") fns)
-       | _ -> false)
+    Alcotest.(check bool) "Log maps to greet" true
+      (match log_fns with `List fns -> List.mem (`String "greet") fns | _ -> false);
+    Alcotest.(check bool) "pure_fn not in Log" true
+      (match log_fns with `List fns -> not (List.mem (`String "pure_fn") fns) | _ -> false)
   )
 
 let test_query_effects_multi_effect () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (submit_module_call 2 multi_effect_source "mymod");
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape multi_effect_source))));
     ignore (read_line ());
-    write_line (query_effects_call 3 "mymod");
-    let result = parse_response (read_line ()) in
-    let effects = json_field "effects" result in
-    let get_fns eff_name = match effects with
-      | `Assoc fields -> (match List.assoc_opt eff_name fields with Some v -> v | None -> `Null)
+    write_line (tool_call 3 "query"
+      (single_cmd "effects" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let effs = json_field "effects" (first_result batch) in
+    let get e = match effs with
+      | `Assoc fs -> (match List.assoc_opt e fs with Some v -> v | None -> `Null)
       | _ -> `Null
     in
-    let log_fns = get_fns "Log" in
-    let throw_fns = get_fns "Throw" in
-    Alcotest.(check bool) "do_both appears under Log" true
-      (match log_fns with
-       | `List fns -> List.exists (fun f -> f = `String "do_both") fns
-       | _ -> false);
-    Alcotest.(check bool) "do_log appears under Log" true
-      (match log_fns with
-       | `List fns -> List.exists (fun f -> f = `String "do_log") fns
-       | _ -> false);
-    Alcotest.(check bool) "do_both appears under Throw" true
-      (match throw_fns with
-       | `List fns -> List.exists (fun f -> f = `String "do_both") fns
-       | _ -> false);
-    Alcotest.(check bool) "do_log does not appear under Throw" true
-      (match throw_fns with
-       | `List fns -> not (List.exists (fun f -> f = `String "do_log") fns)
-       | _ -> false)
+    let log_fns   = get "Log" in
+    let throw_fns = get "Throw" in
+    Alcotest.(check bool) "do_both under Log"    true
+      (match log_fns   with `List fs -> List.mem (`String "do_both") fs | _ -> false);
+    Alcotest.(check bool) "do_log under Log"     true
+      (match log_fns   with `List fs -> List.mem (`String "do_log")  fs | _ -> false);
+    Alcotest.(check bool) "do_both under Throw"  true
+      (match throw_fns with `List fs -> List.mem (`String "do_both") fs | _ -> false);
+    Alcotest.(check bool) "do_log not under Throw" true
+      (match throw_fns with `List fs -> not (List.mem (`String "do_log") fs) | _ -> false)
   )
 
-let query_callers_call id module_name function_name =
-  Printf.sprintf
-    {|{"jsonrpc":"2.0","id":%d,"method":"tools/call","params":{"name":"query_callers","arguments":{"module_name":"%s","function_name":"%s"}}}|}
-    id (json_string_escape module_name) (json_string_escape function_name)
-
-(* helper is called from both main1 and main2 *)
-let multi_caller_source =
-  {|fn helper(x: Int) -> Int ! pure { x }
-fn main1() -> Int ! pure { helper(1) }
-fn main2() -> Int ! pure { helper(2) }|}
-
-(* helper is defined but never called *)
-let uncalled_fn_source =
-  {|fn helper(x: Int) -> Int ! pure { x }
-fn main() -> Int ! pure { 0 }|}
-
-let test_query_callers_in_tools_list () =
-  let (write_line, read_line, close) = start_server () in
-  Fun.protect ~finally:close (fun () ->
-    initialize write_line read_line;
-    write_line {|{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}|};
-    let line = read_line () in
-    let json = mini_parse line in
-    let result = json_field "result" json in
-    let tools = json_field "tools" result in
-    let names = match tools with
-      | `List items ->
-        List.filter_map (fun item ->
-          match json_field "name" item with
-          | `String s -> Some s
-          | _ -> None) items
-      | _ -> []
-    in
-    Alcotest.(check bool) "query_callers in tools/list" true
-      (List.mem "query_callers" names)
-  )
+(* ─── query / callers ────────────────────────────────────────────────────── *)
 
 let test_query_callers_multiple_callers () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (submit_module_call 2 multi_caller_source "mymod");
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape multi_caller_source))));
     ignore (read_line ());
-    write_line (query_callers_call 3 "mymod" "helper");
-    let result = parse_response (read_line ()) in
-    let callers = json_field "callers" result in
-    Alcotest.(check bool) "callers list has two entries" true
+    write_line (tool_call 3 "query"
+      (single_cmd "callers" {|{"module":"mymod","name":"helper"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let callers = json_field "callers" (first_result batch) in
+    Alcotest.(check bool) "two callers" true
       (match callers with `List xs -> List.length xs = 2 | _ -> false);
     (match callers with
      | `List (entry :: _) ->
-       let caller = json_field "caller" entry in
-       Alcotest.(check bool) "entry has non-empty caller field" true
-         (match caller with `String s -> String.length s > 0 | _ -> false);
-       let line = json_field "line" entry in
-       Alcotest.(check bool) "entry has line field" true
-         (match line with `Int _ -> true | _ -> false);
-       let col = json_field "col" entry in
-       Alcotest.(check bool) "entry has col field" true
-         (match col with `Int _ -> true | _ -> false)
+       Alcotest.(check bool) "caller field non-empty" true
+         (match json_field "caller" entry with `String s -> String.length s > 0 | _ -> false);
+       Alcotest.(check bool) "line field present" true
+         (match json_field "line" entry with `Int _ -> true | _ -> false);
+       Alcotest.(check bool) "col field present" true
+         (match json_field "col" entry with `Int _ -> true | _ -> false)
      | _ -> ())
   )
 
@@ -924,12 +807,17 @@ let test_query_callers_uncalled_function () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (submit_module_call 2 uncalled_fn_source "mymod");
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape uncalled_fn_source))));
     ignore (read_line ());
-    write_line (query_callers_call 3 "mymod" "helper");
-    let result = parse_response (read_line ()) in
-    let callers = json_field "callers" result in
-    Alcotest.(check bool) "callers is empty list for uncalled function" true
+    write_line (tool_call 3 "query"
+      (single_cmd "callers" {|{"module":"mymod","name":"helper"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let callers = json_field "callers" (first_result batch) in
+    Alcotest.(check bool) "empty callers list" true
       (match callers with `List [] -> true | _ -> false)
   )
 
@@ -937,87 +825,175 @@ let test_query_callers_module_not_found () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (query_callers_call 2 "nonexistent" "helper");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
+    write_line (tool_call 2 "query"
+      (single_cmd "callers" {|{"module":"nonexistent","name":"helper"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
   )
 
 let test_query_callers_function_not_defined () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
-    write_line (submit_module_call 2 multi_caller_source "mymod");
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape multi_caller_source))));
     ignore (read_line ());
-    write_line (query_callers_call 3 "mymod" "nonexistent_fn");
-    let result = parse_response (read_line ()) in
-    let ok = json_field "ok" result in
-    Alcotest.(check bool) "ok is false" true
-      (match ok with `Bool false -> true | _ -> false);
-    let err = json_field "error" result in
-    Alcotest.(check bool) "error is non-empty string" true
-      (match err with `String s -> String.length s > 0 | _ -> false)
+    write_line (tool_call 3 "query"
+      (single_cmd "callers" {|{"module":"mymod","name":"nonexistent_fn"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
   )
 
+(* ─── batch semantics: multi-command and early halt ─────────────────────── *)
+
+let test_batch_multi_command_all_succeed () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    (* Two query commands in one batch *)
+    let cmds = Printf.sprintf
+        {|[{"op":"signature","args":{"module":"mymod","name":"double"}},{"op":"interface","args":{"module":"mymod"}}]|}
+    in
+    write_line (tool_call 3 "query" cmds);
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let results = match json_field "results" batch with `List rs -> rs | _ -> [] in
+    Alcotest.(check int) "two results" 2 (List.length results)
+  )
+
+let test_batch_halts_at_first_unrecoverable () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    (* First command fails (module not found), second would succeed *)
+    let cmds = Printf.sprintf
+        {|[{"op":"signature","args":{"module":"no_such","name":"double"}},{"op":"signature","args":{"module":"mymod","name":"double"}}]|}
+    in
+    write_line (tool_call 3 "query" cmds);
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch));
+    Alcotest.(check bool) "stopped_at is 0" true
+      (json_field "stopped_at" batch = `Int 0);
+    let results = match json_field "results" batch with `List rs -> rs | _ -> [] in
+    Alcotest.(check int) "zero results before halt" 0 (List.length results)
+  )
+
+(* ─── diagnostic node hash population ───────────────────────────────────── *)
+
+let test_verify_effects_diagnostic_has_node () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_unhandled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "effects" {|{"module":"mymod","entry_point":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    (match batch_diagnostics batch with
+     | d :: _ ->
+       Alcotest.(check bool) "diagnostic has node hash" true
+         (match json_field "node" d with `String s -> String.length s > 0 | _ -> false)
+     | [] ->
+       Alcotest.fail "expected at least one diagnostic")
+  )
+
+let test_verify_unused_diagnostic_has_node () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape one_unused_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "unused" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    (match batch_diagnostics batch with
+     | d :: _ ->
+       Alcotest.(check bool) "diagnostic has node hash" true
+         (match json_field "node" d with `String s -> String.length s > 0 | _ -> false)
+     | [] ->
+       Alcotest.fail "expected at least one diagnostic")
+  )
+
+(* ─── Test runner ────────────────────────────────────────────────────────── *)
+
 let () =
-  ignore well_typed_source;
-  ignore ill_typed_source;
   Alcotest.run "mcp_server" [
-    ("verify_types", [
-      Alcotest.test_case "well-typed program returns empty errors"    `Quick test_verify_types_well_typed;
-      Alcotest.test_case "ill-typed program returns non-empty errors" `Quick test_verify_types_type_error;
-      Alcotest.test_case "does not update server state"               `Quick test_verify_types_does_not_update_state;
-      Alcotest.test_case "appears in tools/list"                      `Quick test_tools_list_includes_verify_types;
+    ("tools/list", [
+      Alcotest.test_case "exposes exactly four tools" `Quick test_tools_list_has_four_tools;
     ]);
-    ("query_signature", [
-      Alcotest.test_case "returns signature for known function"              `Quick test_query_signature_success;
-      Alcotest.test_case "returns error when module not found"               `Quick test_query_signature_module_not_found;
-      Alcotest.test_case "returns error when function not found in module"   `Quick test_query_signature_function_not_found;
-      Alcotest.test_case "appears in tools/list"                             `Quick test_query_signature_in_tools_list;
+    ("verify/types", [
+      Alcotest.test_case "well-typed source → no diagnostics"    `Quick test_verify_types_well_typed;
+      Alcotest.test_case "ill-typed source → error diagnostics"  `Quick test_verify_types_ill_typed;
+      Alcotest.test_case "does not update server state"          `Quick test_verify_types_does_not_update_state;
     ]);
-    ("query_interface", [
-      Alcotest.test_case "returns only pub declarations"                     `Quick test_query_interface_returns_only_pub;
-      Alcotest.test_case "function signatures have no body"                  `Quick test_query_interface_fn_has_no_body;
-      Alcotest.test_case "returns error when module not found"               `Quick test_query_interface_module_not_found;
-      Alcotest.test_case "appears in tools/list"                             `Quick test_query_interface_in_tools_list;
+    ("write/submit_module", [
+      Alcotest.test_case "returns BLAKE3 hash on success"        `Quick test_write_submit_returns_hash;
+      Alcotest.test_case "parse error halts batch"               `Quick test_write_parse_error_halts;
     ]);
-    ("verify_exhaustive", [
-      Alcotest.test_case "appears in tools/list"                             `Quick test_verify_exhaustive_in_tools_list;
-      Alcotest.test_case "returns empty warnings for exhaustive module"      `Quick test_verify_exhaustive_exhaustive_module;
-      Alcotest.test_case "returns error when module not found"               `Quick test_verify_exhaustive_module_not_found;
+    ("query/signature", [
+      Alcotest.test_case "returns signature and node hash"       `Quick test_query_signature_success;
+      Alcotest.test_case "module not found halts batch"          `Quick test_query_signature_module_not_found;
+      Alcotest.test_case "function not found halts batch"        `Quick test_query_signature_function_not_found;
     ]);
-    ("verify_effects", [
-      Alcotest.test_case "appears in tools/list"                             `Quick test_verify_effects_in_tools_list;
-      Alcotest.test_case "returns empty unhandled when all effects handled"  `Quick test_verify_effects_all_handled;
-      Alcotest.test_case "returns unhandled entries when effects escape"     `Quick test_verify_effects_unhandled;
-      Alcotest.test_case "returns error when module not found"               `Quick test_verify_effects_module_not_found;
-      Alcotest.test_case "returns error when entry point not found"          `Quick test_verify_effects_entry_not_found;
+    ("query/interface", [
+      Alcotest.test_case "returns only pub declarations"         `Quick test_query_interface_returns_only_pub;
+      Alcotest.test_case "function signatures have no body"      `Quick test_query_interface_fn_has_no_body;
+      Alcotest.test_case "module not found halts batch"          `Quick test_query_interface_module_not_found;
     ]);
-    ("verify_unused", [
-      Alcotest.test_case "appears in tools/list"                                         `Quick test_verify_unused_in_tools_list;
-      Alcotest.test_case "returns empty list when all declarations are used"             `Quick test_verify_unused_all_used;
-      Alcotest.test_case "returns entry for unreferenced function"                       `Quick test_verify_unused_one_unused;
-      Alcotest.test_case "does not flag pub declarations"                                `Quick test_verify_unused_pub_not_flagged;
-      Alcotest.test_case "mutual recursion reachable from main — no unused"             `Quick test_verify_unused_mutual_recursion_both_reachable;
-      Alcotest.test_case "mutual recursion unreachable from roots — both flagged"       `Quick test_verify_unused_mutual_recursion_both_unreachable;
-      Alcotest.test_case "returns error when module not found"                           `Quick test_verify_unused_module_not_found;
+    ("verify/exhaustive", [
+      Alcotest.test_case "exhaustive match → no diagnostics"     `Quick test_verify_exhaustive_no_warnings;
+      Alcotest.test_case "module not found halts batch"          `Quick test_verify_exhaustive_module_not_found;
     ]);
-    ("query_effects", [
-      Alcotest.test_case "appears in tools/list"                                         `Quick test_query_effects_in_tools_list;
-      Alcotest.test_case "returns error when module not found"                           `Quick test_query_effects_module_not_found;
-      Alcotest.test_case "returns empty effects map for pure module"                     `Quick test_query_effects_pure_module;
-      Alcotest.test_case "maps single effect to performing function"                     `Quick test_query_effects_single_effect;
-      Alcotest.test_case "function with multiple effects appears under each"             `Quick test_query_effects_multi_effect;
+    ("verify/effects", [
+      Alcotest.test_case "all handled → no diagnostics"          `Quick test_verify_effects_all_handled;
+      Alcotest.test_case "unhandled effects → warning diags"     `Quick test_verify_effects_unhandled;
+      Alcotest.test_case "module not found halts batch"          `Quick test_verify_effects_module_not_found;
+      Alcotest.test_case "entry point not found halts batch"     `Quick test_verify_effects_entry_not_found;
     ]);
-    ("query_callers", [
-      Alcotest.test_case "appears in tools/list"                                         `Quick test_query_callers_in_tools_list;
-      Alcotest.test_case "returns all call sites when function is called multiple times" `Quick test_query_callers_multiple_callers;
-      Alcotest.test_case "returns empty list for defined but uncalled function"          `Quick test_query_callers_uncalled_function;
-      Alcotest.test_case "returns error when module not found"                           `Quick test_query_callers_module_not_found;
-      Alcotest.test_case "returns error when function not defined in module"             `Quick test_query_callers_function_not_defined;
+    ("verify/unused", [
+      Alcotest.test_case "all used → no diagnostics"             `Quick test_verify_unused_all_used;
+      Alcotest.test_case "unused fn → warning diagnostic"        `Quick test_verify_unused_one_unused;
+      Alcotest.test_case "pub decl not flagged"                  `Quick test_verify_unused_pub_not_flagged;
+      Alcotest.test_case "mutual recursion reachable — clean"    `Quick test_verify_unused_mutual_recursion_both_reachable;
+      Alcotest.test_case "mutual recursion unreachable — flagged" `Quick test_verify_unused_mutual_recursion_both_unreachable;
+      Alcotest.test_case "module not found halts batch"          `Quick test_verify_unused_module_not_found;
+    ]);
+    ("query/effects", [
+      Alcotest.test_case "module not found halts batch"          `Quick test_query_effects_module_not_found;
+      Alcotest.test_case "pure module → empty effects map"       `Quick test_query_effects_pure_module;
+      Alcotest.test_case "single effect → correct mapping"       `Quick test_query_effects_single_effect;
+      Alcotest.test_case "multi-effect fn appears under each"    `Quick test_query_effects_multi_effect;
+    ]);
+    ("query/callers", [
+      Alcotest.test_case "multiple callers returned"             `Quick test_query_callers_multiple_callers;
+      Alcotest.test_case "uncalled fn → empty list"              `Quick test_query_callers_uncalled_function;
+      Alcotest.test_case "module not found halts batch"          `Quick test_query_callers_module_not_found;
+      Alcotest.test_case "fn not defined halts batch"            `Quick test_query_callers_function_not_defined;
+    ]);
+    ("batch/semantics", [
+      Alcotest.test_case "multi-command batch all succeed"       `Quick test_batch_multi_command_all_succeed;
+      Alcotest.test_case "halts at first unrecoverable error"    `Quick test_batch_halts_at_first_unrecoverable;
+    ]);
+    ("diagnostic/node", [
+      Alcotest.test_case "effect diagnostic carries node hash"   `Quick test_verify_effects_diagnostic_has_node;
+      Alcotest.test_case "unused diagnostic carries node hash"   `Quick test_verify_unused_diagnostic_has_node;
     ]);
   ]

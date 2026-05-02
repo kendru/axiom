@@ -1491,6 +1491,7 @@ type match_warning = {
   mw_line    : int;
   mw_col     : int;
   mw_missing : string list;
+  mw_fn_name : string option;  (* containing function, for hash lookup *)
 }
 
 (** Walk [prog] and return one [match_warning] per non-exhaustive match
@@ -1500,10 +1501,11 @@ type match_warning = {
 let collect_match_warnings (prog : program) : match_warning list =
   type_ctor_env := stdlib_type_ctor_env @ build_type_ctor_env prog;
   let warnings = ref [] in
-  let add_warning missing =
-    warnings := { mw_line = 0; mw_col = 0; mw_missing = missing } :: !warnings
+  let add_warning fn_name missing =
+    warnings := { mw_line = 0; mw_col = 0; mw_missing = missing;
+                  mw_fn_name = fn_name } :: !warnings
   in
-  let check_match_pats arms =
+  let check_match_pats fn_name arms =
     let flat =
       List.concat_map flatten_or_pat (List.map (fun a -> a.pattern) arms)
     in
@@ -1526,57 +1528,57 @@ let collect_match_warnings (prog : program) : match_warning list =
           let missing =
             List.filter (fun c -> not (List.mem c ctor_names)) all_ctors
           in
-          if missing <> [] then add_warning missing
+          if missing <> [] then add_warning fn_name missing
       end else if has_true || has_false then begin
         let missing =
           (if has_true  then [] else ["true"]) @
           (if has_false then [] else ["false"])
         in
-        if missing <> [] then add_warning missing
+        if missing <> [] then add_warning fn_name missing
       end
     end
   in
-  let rec walk_expr e =
+  let rec walk_expr fn_name e =
     match e.desc with
     | Match { scrutinee; arms } ->
-      walk_expr scrutinee;
-      List.iter (fun arm -> walk_expr arm.arm_body) arms;
-      check_match_pats arms
+      walk_expr fn_name scrutinee;
+      List.iter (fun arm -> walk_expr fn_name arm.arm_body) arms;
+      check_match_pats fn_name arms
     | Let { value; body; _ } ->
-      walk_expr value; walk_expr body
+      walk_expr fn_name value; walk_expr fn_name body
     | App (f, args) ->
-      walk_expr f; List.iter walk_expr args
+      walk_expr fn_name f; List.iter (walk_expr fn_name) args
     | Fn { fn_body; _ } ->
-      walk_expr fn_body
+      walk_expr fn_name fn_body
     | If { cond; then_; else_ } ->
-      walk_expr cond; walk_expr then_; walk_expr else_
+      walk_expr fn_name cond; walk_expr fn_name then_; walk_expr fn_name else_
     | Do stmts ->
       List.iter (function
-        | StmtLet { value; _ } -> walk_expr value
-        | StmtExpr e -> walk_expr e) stmts
+        | StmtLet { value; _ } -> walk_expr fn_name value
+        | StmtExpr e -> walk_expr fn_name e) stmts
     | Letrec (bindings, body) ->
-      List.iter (fun b -> walk_expr b.letrec_body) bindings;
-      walk_expr body
+      List.iter (fun b -> walk_expr fn_name b.letrec_body) bindings;
+      walk_expr fn_name body
     | Record fields ->
-      List.iter (fun (_, e) -> walk_expr e) fields
+      List.iter (fun (_, e) -> walk_expr fn_name e) fields
     | RecordUpdate (base, fields) ->
-      walk_expr base; List.iter (fun (_, e) -> walk_expr e) fields
+      walk_expr fn_name base; List.iter (fun (_, e) -> walk_expr fn_name e) fields
     | Project (e, _) ->
-      walk_expr e
+      walk_expr fn_name e
     | Perform { args; _ } ->
-      List.iter walk_expr args
+      List.iter (walk_expr fn_name) args
     | Handle { handled; handlers } ->
-      walk_expr handled;
+      walk_expr fn_name handled;
       List.iter (fun h ->
-          List.iter (fun op -> walk_expr op.op_handler_body) h.op_handlers;
-          Option.iter (fun r -> walk_expr r.return_body) h.return_handler)
+          List.iter (fun op -> walk_expr fn_name op.op_handler_body) h.op_handlers;
+          Option.iter (fun r -> walk_expr fn_name r.return_body) h.return_handler)
         handlers
     | Var _ | IntLit _ | FloatLit _ | StringLit _
     | BoolLit _ | UnitLit -> ()
   in
   let rec walk_decl d =
     match d.decl_desc with
-    | DeclFn { decl_body; _ } -> walk_expr decl_body
+    | DeclFn { fn_name; decl_body; _ } -> walk_expr (Some fn_name) decl_body
     | DeclModule { body; _ } -> List.iter walk_decl body
     | DeclType _ | DeclEffect _ | DeclRequire _ | DeclImport _ -> ()
   in
@@ -1825,9 +1827,10 @@ let collect_unused (prog : program) : unused_item list =
 (* ------------------------------------------------------------------ *)
 
 type caller_site = {
-  cs_caller : string;
-  cs_line   : int;
-  cs_col    : int;
+  cs_caller    : string;
+  cs_line      : int;
+  cs_col       : int;
+  cs_call_expr : Ast.expr;  (* the App expression at the call site *)
 }
 
 (** [collect_callers prog function_name] returns one [caller_site] for each
@@ -1849,7 +1852,8 @@ let collect_callers (prog : program) (function_name : string)
       match e.desc with
       | App ({ desc = Var callee; _ }, args) ->
         if callee = function_name then
-          sites := { cs_caller = current_fn; cs_line = 0; cs_col = 0 } :: !sites;
+          sites := { cs_caller = current_fn; cs_line = 0; cs_col = 0;
+                     cs_call_expr = e } :: !sites;
         List.iter (walk_expr current_fn) args
       | App (f, args) ->
         walk_expr current_fn f;

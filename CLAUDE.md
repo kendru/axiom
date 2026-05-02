@@ -56,6 +56,14 @@ The CLI (`bin/main.ml`) wires these stages together with the `axiom build` subco
 
 `examples/` contains 10 `.axm` programs (01_basics through 10_json) that demonstrate the working-form syntax and serve as integration tests for the pipeline. `examples/README.md` documents the code conventions used in those files.
 
+## Pull Requests
+
+When creating a pull request that implements a GitHub issue, always reference the issue in the PR body so it closes on merge:
+
+```
+Closes #<issue-number>
+```
+
 ## Implementation Documentation
 
 Detailed documentation for each major subsystem lives in `docs/implementation/`:

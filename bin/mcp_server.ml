@@ -169,6 +169,22 @@ let bytes_to_hex b =
   done;
   Buffer.contents buf
 
+(* ─── Filesystem helpers ─────────────────────────────────────────────────── *)
+
+(** Create [path] and any missing parent directories, like [mkdir -p]. *)
+let mkdir_p path =
+  let parts = String.split_on_char '/' path in
+  ignore (List.fold_left (fun acc part ->
+    let p =
+      if acc = "" then part
+      else if part = "" then acc
+      else acc ^ "/" ^ part
+    in
+    if p <> "" && not (Sys.file_exists p) then
+      (try Unix.mkdir p 0o700 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
+    p
+  ) "" parts)
+
 (* ─── Server state ───────────────────────────────────────────────────────── *)
 
 (* Per-module state stored after a successful write/submit_module command. *)
@@ -183,8 +199,47 @@ type module_state = {
 type state = {
   mutable initialized : bool;
   modules             : (string, module_state) Hashtbl.t;
+  (* source cache: module_name → source (for persistence across restarts) *)
+  sources             : (string, string) Hashtbl.t;
   node_store          : Node_store.t;
+  store_dir           : string;
 }
+
+(* ─── Module registry (persistence) ─────────────────────────────────────── *)
+
+let modules_registry_path dir = Filename.concat dir "modules.json"
+
+(** Atomically write the module source registry to disk. *)
+let save_module_registry dir sources =
+  let fields = Hashtbl.fold (fun name src acc ->
+    (name, String src) :: acc) sources [] in
+  let json = Object [("modules", Object fields)] in
+  let path = modules_registry_path dir in
+  let tmp  = path ^ ".tmp" in
+  let oc   = open_out tmp in
+  (try output_string oc (json_to_string json); close_out oc
+   with e -> close_out_noerr oc; (try Sys.remove tmp with _ -> ()); raise e);
+  Sys.rename tmp path
+
+(** Load module sources from the registry file.  Returns [(name, source)] pairs. *)
+let load_module_registry dir =
+  let path = modules_registry_path dir in
+  if not (Sys.file_exists path) then []
+  else begin
+    let ic = open_in path in
+    let n  = in_channel_length ic in
+    let s  = Bytes.create n in
+    really_input ic s 0 n;
+    close_in ic;
+    match parse_json (Bytes.to_string s) with
+    | Object fields ->
+      (match List.assoc_opt "modules" fields with
+       | Some (Object mods) ->
+         List.filter_map (fun (name, v) ->
+           match v with String src -> Some (name, src) | _ -> None) mods
+       | _ -> [])
+    | _ -> []
+  end
 
 (* ─── Diagnostic → JSON ──────────────────────────────────────────────────── *)
 
@@ -272,7 +327,7 @@ let get_commands args =
   | Array cmds -> cmds
   | _          -> []
 
-(* ─── Type pretty-printing helpers (carried over from old implementation) ── *)
+(* ─── Type pretty-printing helpers ──────────────────────────────────────── *)
 
 let rec ty_deref = function
   | Typechecker.TyMeta { Typechecker.inst = Some t; _ } -> ty_deref t
@@ -337,7 +392,9 @@ let make_loc ?module_name line col =
 (* ─── Anchor resolver ────────────────────────────────────────────────────── *)
 
 (* Accepts either {"hash":"<hex>"} (direct) or {"module":"...","name":"..."}
-   (symbolic) and resolves to (module_name, decl_name, module_state). *)
+   (symbolic) and resolves to (module_name, decl_name, module_state).
+   When module is omitted but name is given, searches all submitted modules:
+   a unique match resolves directly; multiple matches return an error listing them. *)
 let resolve_anchor state args =
   match obj_get "hash" args with
   | String h when String.length h > 0 ->
@@ -360,11 +417,28 @@ let resolve_anchor state args =
   | _ ->
     let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
     let fn_name  = match obj_get "name"   args with String s -> s | _ -> "" in
-    (match Hashtbl.find_opt state.modules mod_name with
-     | None ->
-       Error (Mcp_types.make_error "anchor/not-found"
-         (Printf.sprintf "Module '%s' not found" mod_name))
-     | Some ms -> Ok (mod_name, fn_name, ms))
+    if mod_name = "" then begin
+      (* Search all submitted modules for the name. *)
+      let matches = Hashtbl.fold (fun mname ms acc ->
+        if List.assoc_opt fn_name ms.type_env <> None
+        then (mname, fn_name, ms) :: acc
+        else acc
+      ) state.modules [] in
+      match matches with
+      | [(mn, fn, ms)] -> Ok (mn, fn, ms)
+      | [] ->
+        Error (Mcp_types.make_error "anchor/not-found"
+          (Printf.sprintf "Declaration '%s' not found in any submitted module" fn_name))
+      | many ->
+        let mods = String.concat ", " (List.map (fun (mn, _, _) -> mn) many) in
+        Error (Mcp_types.make_error "anchor/ambiguous"
+          (Printf.sprintf "Multiple modules define '%s': %s — add a 'module' field to disambiguate" fn_name mods))
+    end else
+      match Hashtbl.find_opt state.modules mod_name with
+      | None ->
+        Error (Mcp_types.make_error "anchor/not-found"
+          (Printf.sprintf "Module '%s' not found" mod_name))
+      | Some ms -> Ok (mod_name, fn_name, ms)
 
 (* ─── Decl-name extraction (for hash look-up) ────────────────────────────── *)
 
@@ -375,6 +449,25 @@ let decl_name decl =
   | Ast.DeclEffect { effect_name; _ } -> Some effect_name
   | Ast.DeclModule { module_name; _ } -> Some module_name
   | _                                  -> None
+
+(* ─── Combined project program (all submitted modules concatenated) ───────── *)
+
+(** Build a combined AST from every submitted module, for cross-module analysis. *)
+let combined_program state =
+  Hashtbl.fold (fun _ ms acc -> acc @ ms.typed_ast) state.modules []
+
+(** Find which module (if any) defines a given function name. *)
+let module_of_fn state fn_name =
+  Hashtbl.fold (fun mod_name ms acc ->
+    match acc with
+    | Some _ -> acc
+    | None ->
+      let found = List.exists (fun d ->
+        match d.Ast.decl_desc with
+        | Ast.DeclFn { fn_name = n; _ } -> n = fn_name
+        | _ -> false) ms.typed_ast in
+      if found then Some mod_name else None
+  ) state.modules None
 
 (* ─── Query tool ─────────────────────────────────────────────────────────── *)
 
@@ -443,30 +536,52 @@ let dispatch_query state cmd =
                     []))
 
   | "callers" ->
+    (* Cross-module callers: find all call sites to (module, name) across every
+       submitted module.  If module is omitted, the defining module is located
+       first.  Each result carries a "module" field identifying the call site's
+       owning module. *)
     let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
     let fn_name  = match obj_get "name"   args with String s -> s | _ -> "" in
-    (match Hashtbl.find_opt state.modules mod_name with
-     | None ->
-       Cmd_halt (Mcp_types.make_error "anchor/not-found"
-         (Printf.sprintf "Module '%s' not found" mod_name))
-     | Some ms ->
-       (match Typechecker.collect_callers ms.typed_ast fn_name with
-        | Error msg ->
-          Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)
-        | Ok sites ->
-          let enc = Node_store.as_encoding_store state.node_store in
-          let json_sites = List.map (fun (s : Typechecker.caller_site) ->
-              let caller_node = Hashtbl.find_opt ms.decl_hashes s.cs_caller in
-              let call_site_node =
-                bytes_to_hex (Node_encoding.encode_expr enc s.cs_call_expr)
-              in
-              Object [
-                ("caller_node",
-                 match caller_node with None -> Null | Some h -> String h);
-                ("call_site_node", String call_site_node);
-                ("location", Object [("line", Int s.cs_line); ("col", Int s.cs_col)]);
-              ]) sites in
-          Cmd_success (Object [("callers", Array json_sites)], [])))
+    (* Verify the function is defined in the specified (or any) module. *)
+    let defining_mod =
+      if mod_name <> "" then
+        (match Hashtbl.find_opt state.modules mod_name with
+         | None ->
+           Error (Printf.sprintf "Module '%s' not found" mod_name)
+         | Some ms ->
+           let exists = List.exists (fun d ->
+             match d.Ast.decl_desc with
+             | Ast.DeclFn { fn_name = n; _ } -> n = fn_name
+             | _ -> false) ms.typed_ast in
+           if exists then Ok mod_name
+           else Error (Printf.sprintf "Function '%s' not defined in module '%s'" fn_name mod_name))
+      else
+        match module_of_fn state fn_name with
+        | Some mn -> Ok mn
+        | None    -> Error (Printf.sprintf "Function '%s' not found in any submitted module" fn_name)
+    in
+    (match defining_mod with
+     | Error msg ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)
+     | Ok _ ->
+       let enc = Node_store.as_encoding_store state.node_store in
+       (* Search every submitted module for call sites. *)
+       let json_sites = Hashtbl.fold (fun caller_mod ms acc ->
+           let sites = Typechecker.collect_callers_in ms.typed_ast fn_name in
+           let module_sites = List.map (fun (s : Typechecker.caller_site) ->
+               let caller_node = Hashtbl.find_opt ms.decl_hashes s.cs_caller in
+               let call_site_node =
+                 bytes_to_hex (Node_encoding.encode_expr enc s.cs_call_expr)
+               in
+               Object [
+                 ("module",        String caller_mod);
+                 ("caller_node",   match caller_node with None -> Null | Some h -> String h);
+                 ("call_site_node", String call_site_node);
+                 ("location",      Object [("line", Int s.cs_line); ("col", Int s.cs_col)]);
+               ]) sites in
+           acc @ module_sites
+         ) state.modules [] in
+       Cmd_success (Object [("callers", Array json_sites)], []))
 
   | _ ->
     Cmd_halt (Mcp_types.make_error "command/unknown"
@@ -527,6 +642,9 @@ let dispatch_write state cmd =
        ) ast;
        let ms = { typed_ast = ast; type_env; effect_env; root_hash; decl_hashes } in
        Hashtbl.replace state.modules module_name ms;
+       (* Persist source so the module survives a server restart. *)
+       Hashtbl.replace state.sources module_name source;
+       save_module_registry state.store_dir state.sources;
        let verify_diags = post_write_verify ms in
        let nodes_list = Hashtbl.fold (fun name hash acc ->
            (name, String hash) :: acc) decl_hashes [] in
@@ -590,26 +708,52 @@ let dispatch_verify state cmd =
        Cmd_success (Object [], diags))
 
   | "effects" ->
-    let mod_name   = match obj_get "module"      args with String s -> s | _ -> "" in
+    (* Cross-module effect tracing: build a combined function map from all
+       submitted modules and walk from the given entry point, following calls
+       across module boundaries.  The entry_point function must exist somewhere
+       in the project; module is optional and used only to locate it. *)
+    let mod_name    = match obj_get "module"      args with String s -> s | _ -> "" in
     let entry_point = match obj_get "entry_point" args with String s -> s | _ -> "" in
-    (match Hashtbl.find_opt state.modules mod_name with
-     | None ->
-       Cmd_halt (Mcp_types.make_error "anchor/not-found"
-         (Printf.sprintf "Module '%s' not found" mod_name))
-     | Some ms ->
-       (try
-          let sites = Typechecker.collect_unhandled_effects ms.typed_ast entry_point in
-          let diags = List.map (fun (s : Typechecker.effect_site) ->
-              let node = Hashtbl.find_opt ms.decl_hashes s.es_function in
-              let msg  = Printf.sprintf "Unhandled effect '%s' in function '%s'"
-                  s.es_effect s.es_function in
-              Mcp_types.make_warning ?node
-                ~location:(make_loc s.es_line s.es_col)
-                "effect/unhandled" msg
-            ) sites in
-          Cmd_success (Object [], diags)
-        with Failure msg ->
-          Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)))
+    (* Build combined program for cross-module walking. *)
+    let prog =
+      if mod_name <> "" then
+        (* If a module is specified, start with that module's decls; append all
+           others so cross-module calls can be followed. *)
+        let others = Hashtbl.fold (fun mn ms acc ->
+          if mn = mod_name then acc else acc @ ms.typed_ast) state.modules [] in
+        (match Hashtbl.find_opt state.modules mod_name with
+         | None -> []
+         | Some ms -> ms.typed_ast @ others)
+      else
+        combined_program state
+    in
+    if prog = [] then
+      Cmd_halt (Mcp_types.make_error "anchor/not-found"
+        (if mod_name <> "" then Printf.sprintf "Module '%s' not found" mod_name
+         else "No modules submitted"))
+    else
+      (try
+         let sites = Typechecker.collect_unhandled_effects prog entry_point in
+         (* Annotate each effect site with which module the function belongs to. *)
+         let diags = List.map (fun (s : Typechecker.effect_site) ->
+             let owner_mod = module_of_fn state s.es_function in
+             let node = match owner_mod with
+               | None -> None
+               | Some mn ->
+                 (match Hashtbl.find_opt state.modules mn with
+                  | None -> None
+                  | Some ms -> Hashtbl.find_opt ms.decl_hashes s.es_function)
+             in
+             let msg  = Printf.sprintf "Unhandled effect '%s' in function '%s'"
+                 s.es_effect s.es_function in
+             let loc_mod = owner_mod in
+             Mcp_types.make_warning ?node
+               ~location:(make_loc ?module_name:loc_mod s.es_line s.es_col)
+               "effect/unhandled" msg
+           ) sites in
+         Cmd_success (Object [], diags)
+       with Failure msg ->
+         Cmd_halt (Mcp_types.make_error "anchor/not-found" msg))
 
   | "unused" ->
     let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
@@ -751,14 +895,51 @@ let handle state msg =
 (* ─── Entry point ────────────────────────────────────────────────────────── *)
 
 let () =
+  (* Determine a stable image directory.  Checked in order:
+       1. AXIOM_IMAGE_DIR environment variable
+       2. ~/.axiom/image
+       3. ./.axiom/image  *)
   let store_dir =
-    let path = Filename.temp_file "axiom_mcp_" "_dir" in
-    Sys.remove path;
-    Unix.mkdir path 0o700;
-    path
+    match Sys.getenv_opt "AXIOM_IMAGE_DIR" with
+    | Some d -> d
+    | None ->
+      let base =
+        match Sys.getenv_opt "HOME" with
+        | Some h -> Filename.concat h ".axiom"
+        | None   -> ".axiom"
+      in
+      Filename.concat base "image"
   in
+  mkdir_p store_dir;
   let node_store = Node_store.open_store store_dir in
-  let state      = { initialized = false; modules = Hashtbl.create 16; node_store } in
+  let sources    = Hashtbl.create 16 in
+  let modules    = Hashtbl.create 16 in
+  (* Re-hydrate modules from the registry saved during the last run. *)
+  let registry = load_module_registry store_dir in
+  List.iter (fun (name, src) ->
+    Hashtbl.replace sources name src;
+    (try
+       let tokens    = Lexer.tokenize src in
+       let ast       = Parser.parse_program tokens in
+       let (type_env, effect_env) = Typechecker.check_program ast in
+       let enc       = Node_store.as_encoding_store node_store in
+       let root      = Node_encoding.encode_program enc ast in
+       let root_hash = bytes_to_hex root in
+       let enc2      = Node_store.as_encoding_store node_store in
+       let decl_hashes = Hashtbl.create 16 in
+       List.iter (fun decl ->
+         match decl_name decl with
+         | Some n ->
+           let h = Node_encoding.encode_decl enc2 decl in
+           Hashtbl.replace decl_hashes n (bytes_to_hex h)
+         | None -> ()
+       ) ast;
+       let ms = { typed_ast = ast; type_env; effect_env; root_hash; decl_hashes } in
+       Hashtbl.replace modules name ms
+     with Failure msg ->
+       Printf.eprintf "[mcp] warning: could not rehydrate module '%s': %s\n%!" name msg)
+  ) registry;
+  let state = { initialized = false; modules; sources; node_store; store_dir } in
   (try
      while true do
        let line = String.trim (input_line stdin) in

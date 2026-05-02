@@ -357,7 +357,7 @@ let test_verify_types_does_not_update_state () =
 
 (* ─── write / submit_module ─────────────────────────────────────────────── *)
 
-let test_write_submit_returns_hash () =
+let test_write_submit_returns_root_and_nodes () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
@@ -367,9 +367,39 @@ let test_write_submit_returns_hash () =
             (json_string_escape well_typed_source))));
     let batch = parse_batch_response (read_line ()) in
     Alcotest.(check bool) "batch ok" true (batch_ok batch);
-    let hash = json_field "hash" (first_result batch) in
-    Alcotest.(check bool) "hash is a non-empty string" true
-      (match hash with `String s -> String.length s > 0 | _ -> false)
+    let r = first_result batch in
+    let root = json_field "root" r in
+    Alcotest.(check bool) "root is a non-empty string" true
+      (match root with `String s -> String.length s > 0 | _ -> false);
+    let nodes = json_field "nodes" r in
+    Alcotest.(check bool) "nodes is an object" true
+      (match nodes with `Assoc _ -> true | _ -> false);
+    Alcotest.(check bool) "nodes contains double" true
+      (match nodes with
+       | `Assoc fs ->
+         (match List.assoc_opt "double" fs with
+          | Some (`String s) -> String.length s > 0
+          | _ -> false)
+       | _ -> false)
+  )
+
+let test_write_submit_nodes_map_all_decls () =
+  let source = {|fn foo(x: Int) -> Int ! pure { x }
+fn bar(x: Int) -> Int ! pure { x }|} in
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape source))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let nodes = json_field "nodes" (first_result batch) in
+    Alcotest.(check bool) "foo in nodes" true
+      (match nodes with `Assoc fs -> List.mem_assoc "foo" fs | _ -> false);
+    Alcotest.(check bool) "bar in nodes" true
+      (match nodes with `Assoc fs -> List.mem_assoc "bar" fs | _ -> false)
   )
 
 let test_write_parse_error_halts () =
@@ -411,6 +441,32 @@ let test_query_signature_success () =
     let node = json_field "node" (first_result batch) in
     Alcotest.(check bool) "node hash present" true
       (match node with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_signature_by_hash () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    let submit_batch = parse_batch_response (read_line ()) in
+    let double_hash = match json_field "nodes" (first_result submit_batch) with
+      | `Assoc fs ->
+        (match List.assoc_opt "double" fs with
+         | Some (`String h) -> h | _ -> "")
+      | _ -> ""
+    in
+    Alcotest.(check bool) "got double hash" true (String.length double_hash > 0);
+    write_line (tool_call 3 "query"
+      (single_cmd "signature"
+         (Printf.sprintf {|{"hash":"%s"}|} double_hash)));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let sig_ = json_field "signature" (first_result batch) in
+    Alcotest.(check bool) "signature non-empty" true
+      (match sig_ with `String s -> String.length s > 0 | _ -> false)
   )
 
 let test_query_signature_module_not_found () =
@@ -493,6 +549,26 @@ let test_query_interface_module_not_found () =
   )
 
 (* ─── verify / exhaustive ────────────────────────────────────────────────── *)
+
+let test_verify_exhaustive_node_is_fn_hash () =
+  (* The typechecker raises on non-exhaustive patterns, so stored modules are
+     always exhaustive.  verify/exhaustive on a stored module should be clean,
+     and confirm that the server correctly threads fn-name to match_warning. *)
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape exhaustive_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "exhaustive" {|{"module":"mymod"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics on exhaustive module" true
+      (batch_diagnostics batch = [])
+  )
 
 let test_verify_exhaustive_no_warnings () =
   let (write_line, read_line, close) = start_server () in
@@ -794,13 +870,44 @@ let test_query_callers_multiple_callers () =
       (match callers with `List xs -> List.length xs = 2 | _ -> false);
     (match callers with
      | `List (entry :: _) ->
-       Alcotest.(check bool) "caller field non-empty" true
-         (match json_field "caller" entry with `String s -> String.length s > 0 | _ -> false);
-       Alcotest.(check bool) "line field present" true
-         (match json_field "line" entry with `Int _ -> true | _ -> false);
-       Alcotest.(check bool) "col field present" true
-         (match json_field "col" entry with `Int _ -> true | _ -> false)
+       Alcotest.(check bool) "caller_node field non-empty" true
+         (match json_field "caller_node" entry with
+          | `String s -> String.length s > 0 | _ -> false);
+       Alcotest.(check bool) "call_site_node field non-empty" true
+         (match json_field "call_site_node" entry with
+          | `String s -> String.length s > 0 | _ -> false);
+       Alcotest.(check bool) "location object present" true
+         (match json_field "location" entry with `Assoc _ -> true | _ -> false)
      | _ -> ())
+  )
+
+let test_query_callers_site_nodes_distinct () =
+  (* main1 and main2 call helper with different args — call site hashes differ *)
+  let source = {|fn helper(x: Int) -> Int ! pure { x }
+fn main1() -> Int ! pure { helper(1) }
+fn main2() -> Int ! pure { helper(2) }|} in
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "callers" {|{"module":"mymod","name":"helper"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let callers = json_field "callers" (first_result batch) in
+    let hashes = match callers with
+      | `List xs ->
+        List.filter_map (fun e ->
+          match json_field "call_site_node" e with
+          | `String s -> Some s | _ -> None) xs
+      | _ -> []
+    in
+    Alcotest.(check int) "two call sites" 2 (List.length hashes);
+    Alcotest.(check bool) "call site hashes are distinct" true
+      (match hashes with [a; b] -> a <> b | _ -> false)
   )
 
 let test_query_callers_uncalled_function () =
@@ -945,11 +1052,13 @@ let () =
       Alcotest.test_case "does not update server state"          `Quick test_verify_types_does_not_update_state;
     ]);
     ("write/submit_module", [
-      Alcotest.test_case "returns BLAKE3 hash on success"        `Quick test_write_submit_returns_hash;
+      Alcotest.test_case "returns root hash and nodes map"       `Quick test_write_submit_returns_root_and_nodes;
+      Alcotest.test_case "nodes map contains all declarations"   `Quick test_write_submit_nodes_map_all_decls;
       Alcotest.test_case "parse error halts batch"               `Quick test_write_parse_error_halts;
     ]);
     ("query/signature", [
       Alcotest.test_case "returns signature and node hash"       `Quick test_query_signature_success;
+      Alcotest.test_case "hash anchor resolves to signature"     `Quick test_query_signature_by_hash;
       Alcotest.test_case "module not found halts batch"          `Quick test_query_signature_module_not_found;
       Alcotest.test_case "function not found halts batch"        `Quick test_query_signature_function_not_found;
     ]);
@@ -960,6 +1069,7 @@ let () =
     ]);
     ("verify/exhaustive", [
       Alcotest.test_case "exhaustive match → no diagnostics"     `Quick test_verify_exhaustive_no_warnings;
+      Alcotest.test_case "fn-scoped node threading compiles OK"  `Quick test_verify_exhaustive_node_is_fn_hash;
       Alcotest.test_case "module not found halts batch"          `Quick test_verify_exhaustive_module_not_found;
     ]);
     ("verify/effects", [
@@ -984,6 +1094,7 @@ let () =
     ]);
     ("query/callers", [
       Alcotest.test_case "multiple callers returned"             `Quick test_query_callers_multiple_callers;
+      Alcotest.test_case "call site hashes are distinct"         `Quick test_query_callers_site_nodes_distinct;
       Alcotest.test_case "uncalled fn → empty list"              `Quick test_query_callers_uncalled_function;
       Alcotest.test_case "module not found halts batch"          `Quick test_query_callers_module_not_found;
       Alcotest.test_case "fn not defined halts batch"            `Quick test_query_callers_function_not_defined;

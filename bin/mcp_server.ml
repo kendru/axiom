@@ -334,6 +334,38 @@ let render_interface_decl decl =
 let make_loc ?module_name line col =
   Mcp_types.{ loc_module = module_name; loc_line = line; loc_col = col }
 
+(* ─── Anchor resolver ────────────────────────────────────────────────────── *)
+
+(* Accepts either {"hash":"<hex>"} (direct) or {"module":"...","name":"..."}
+   (symbolic) and resolves to (module_name, decl_name, module_state). *)
+let resolve_anchor state args =
+  match obj_get "hash" args with
+  | String h when String.length h > 0 ->
+    let found = Hashtbl.fold (fun mod_name ms acc ->
+        match acc with
+        | Some _ -> acc
+        | None ->
+          match Hashtbl.fold (fun name hash a ->
+              if a = None && hash = h then Some name else a
+            ) ms.decl_hashes None
+          with
+          | Some name -> Some (mod_name, name, ms)
+          | None -> None
+      ) state.modules None in
+    (match found with
+     | Some r -> Ok r
+     | None ->
+       Error (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "No declaration found with hash '%s'" h)))
+  | _ ->
+    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+    let fn_name  = match obj_get "name"   args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Error (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms -> Ok (mod_name, fn_name, ms))
+
 (* ─── Decl-name extraction (for hash look-up) ────────────────────────────── *)
 
 let decl_name decl =
@@ -351,17 +383,13 @@ let dispatch_query state cmd =
   let args = obj_get "args" cmd in
   match op with
   | "signature" ->
-    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
-    let fn_name  = match obj_get "name"   args with String s -> s | _ -> "" in
-    (match Hashtbl.find_opt state.modules mod_name with
-     | None ->
-       Cmd_halt (Mcp_types.make_error "anchor/not-found"
-         (Printf.sprintf "Module '%s' not found" mod_name))
-     | Some ms ->
+    (match resolve_anchor state args with
+     | Error d -> Cmd_halt d
+     | Ok (_mod_name, fn_name, ms) ->
        match List.assoc_opt fn_name ms.type_env with
        | None ->
          Cmd_halt (Mcp_types.make_error "anchor/not-found"
-           (Printf.sprintf "Function '%s' not found in module '%s'" fn_name mod_name))
+           (Printf.sprintf "Function '%s' not found" fn_name))
        | Some scheme ->
          let sig_str = Format.asprintf "%a" Typechecker.pp_ty scheme.Typechecker.body in
          let node = Hashtbl.find_opt ms.decl_hashes fn_name in
@@ -426,13 +454,17 @@ let dispatch_query state cmd =
         | Error msg ->
           Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)
         | Ok sites ->
+          let enc = Node_store.as_encoding_store state.node_store in
           let json_sites = List.map (fun (s : Typechecker.caller_site) ->
-              let node = Hashtbl.find_opt ms.decl_hashes s.cs_caller in
+              let caller_node = Hashtbl.find_opt ms.decl_hashes s.cs_caller in
+              let call_site_node =
+                bytes_to_hex (Node_encoding.encode_expr enc s.cs_call_expr)
+              in
               Object [
-                ("caller", String s.cs_caller);
-                ("line",   Int s.cs_line);
-                ("col",    Int s.cs_col);
-                ("node",   match node with None -> Null | Some h -> String h);
+                ("caller_node",
+                 match caller_node with None -> Null | Some h -> String h);
+                ("call_site_node", String call_site_node);
+                ("location", Object [("line", Int s.cs_line); ("col", Int s.cs_col)]);
               ]) sites in
           Cmd_success (Object [("callers", Array json_sites)], [])))
 
@@ -449,8 +481,13 @@ let post_write_verify ms =
   List.iter (fun (w : Typechecker.match_warning) ->
     let msg = Printf.sprintf "Non-exhaustive match; missing: %s"
         (String.concat ", " w.mw_missing) in
+    let node = match w.mw_fn_name with
+      | Some fn -> (match Hashtbl.find_opt ms.decl_hashes fn with
+          | Some h -> h | None -> ms.root_hash)
+      | None -> ms.root_hash
+    in
     diags := !diags @ [Mcp_types.make_warning
-        ~node:ms.root_hash
+        ~node
         ~location:(make_loc w.mw_line w.mw_col)
         "match/non-exhaustive" msg]
   ) (Typechecker.collect_match_warnings ms.typed_ast);
@@ -491,7 +528,13 @@ let dispatch_write state cmd =
        let ms = { typed_ast = ast; type_env; effect_env; root_hash; decl_hashes } in
        Hashtbl.replace state.modules module_name ms;
        let verify_diags = post_write_verify ms in
-       Cmd_success (Object [("hash", String root_hash)], verify_diags)
+       let nodes_list = Hashtbl.fold (fun name hash acc ->
+           (name, String hash) :: acc) decl_hashes [] in
+       let nodes_sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) nodes_list in
+       Cmd_success (Object [
+           ("root",  String root_hash);
+           ("nodes", Object nodes_sorted);
+         ], verify_diags)
      with Failure msg ->
        Cmd_halt (Mcp_types.make_error "parse/error" msg))
 
@@ -534,8 +577,13 @@ let dispatch_verify state cmd =
        let diags = List.map (fun (w : Typechecker.match_warning) ->
            let msg = Printf.sprintf "Non-exhaustive match; missing: %s"
                (String.concat ", " w.mw_missing) in
+           let node = match w.mw_fn_name with
+             | Some fn -> (match Hashtbl.find_opt ms.decl_hashes fn with
+                 | Some h -> h | None -> ms.root_hash)
+             | None -> ms.root_hash
+           in
            Mcp_types.make_warning
-             ~node:ms.root_hash
+             ~node
              ~location:(make_loc w.mw_line w.mw_col)
              "match/non-exhaustive" msg
          ) warnings in

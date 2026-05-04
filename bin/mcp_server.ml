@@ -469,6 +469,691 @@ let module_of_fn state fn_name =
       if found then Some mod_name else None
   ) state.modules None
 
+(* ─── Graph traversal helpers ────────────────────────────────────────────── *)
+
+(* Collect all direct call sites (App (Var callee, args)) within an expression,
+   returning (callee, full_app_expr, args) triples. *)
+let rec collect_calls_in acc expr =
+  match expr.Ast.desc with
+  | Ast.App ({ Ast.desc = Ast.Var callee; _ }, args) ->
+    acc := (callee, expr, args) :: !acc;
+    List.iter (collect_calls_in acc) args
+  | Ast.App (f, args) ->
+    collect_calls_in acc f;
+    List.iter (collect_calls_in acc) args
+  | Ast.Let { Ast.value; Ast.body; _ } ->
+    collect_calls_in acc value;
+    collect_calls_in acc body
+  | Ast.Fn { Ast.fn_body; _ } -> collect_calls_in acc fn_body
+  | Ast.If { Ast.cond; Ast.then_; Ast.else_ } ->
+    collect_calls_in acc cond;
+    collect_calls_in acc then_;
+    collect_calls_in acc else_
+  | Ast.Do stmts ->
+    List.iter (function
+      | Ast.StmtLet { value; _ } -> collect_calls_in acc value
+      | Ast.StmtExpr e -> collect_calls_in acc e) stmts
+  | Ast.Match { Ast.scrutinee; Ast.arms } ->
+    collect_calls_in acc scrutinee;
+    List.iter (fun arm -> collect_calls_in acc arm.Ast.arm_body) arms
+  | Ast.Letrec (bindings, body) ->
+    List.iter (fun b -> collect_calls_in acc b.Ast.letrec_body) bindings;
+    collect_calls_in acc body
+  | Ast.Record fields ->
+    List.iter (fun (_, e) -> collect_calls_in acc e) fields
+  | Ast.RecordUpdate (base, fields) ->
+    collect_calls_in acc base;
+    List.iter (fun (_, e) -> collect_calls_in acc e) fields
+  | Ast.Project (e, _) -> collect_calls_in acc e
+  | Ast.Perform { Ast.args; _ } ->
+    List.iter (collect_calls_in acc) args
+  | Ast.Handle { Ast.handled; Ast.handlers } ->
+    collect_calls_in acc handled;
+    List.iter (fun h ->
+      List.iter (fun op -> collect_calls_in acc op.Ast.op_handler_body)
+        h.Ast.op_handlers;
+      Option.iter (fun r -> collect_calls_in acc r.Ast.return_body)
+        h.Ast.return_handler) handlers
+  | Ast.Var _ | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _
+  | Ast.BoolLit _ | Ast.UnitLit -> ()
+
+(* Collect let-bindings visible in an expression into acc: (var_name, value). *)
+let rec collect_let_bindings acc expr =
+  match expr.Ast.desc with
+  | Ast.Let { Ast.pat = { Ast.pat_desc = Ast.PVar x; _ }; Ast.value; Ast.body } ->
+    acc := (x, value) :: !acc;
+    collect_let_bindings acc value;
+    collect_let_bindings acc body
+  | Ast.Let { Ast.value; Ast.body; _ } ->
+    collect_let_bindings acc value;
+    collect_let_bindings acc body
+  | Ast.Letrec (bindings, body) ->
+    List.iter (fun b -> collect_let_bindings acc b.Ast.letrec_body) bindings;
+    collect_let_bindings acc body
+  | Ast.Fn { Ast.fn_body; _ } -> collect_let_bindings acc fn_body
+  | Ast.If { Ast.cond; Ast.then_; Ast.else_ } ->
+    collect_let_bindings acc cond;
+    collect_let_bindings acc then_;
+    collect_let_bindings acc else_
+  | Ast.Do stmts ->
+    List.iter (function
+      | Ast.StmtLet { pat = { pat_desc = Ast.PVar x; _ }; value } ->
+        acc := (x, value) :: !acc;
+        collect_let_bindings acc value
+      | Ast.StmtLet { value; _ } -> collect_let_bindings acc value
+      | Ast.StmtExpr e -> collect_let_bindings acc e) stmts
+  | Ast.Match { Ast.scrutinee; Ast.arms } ->
+    collect_let_bindings acc scrutinee;
+    List.iter (fun arm -> collect_let_bindings acc arm.Ast.arm_body) arms
+  | Ast.App (f, args) ->
+    collect_let_bindings acc f;
+    List.iter (collect_let_bindings acc) args
+  | Ast.Record fields ->
+    List.iter (fun (_, e) -> collect_let_bindings acc e) fields
+  | Ast.RecordUpdate (base, fields) ->
+    collect_let_bindings acc base;
+    List.iter (fun (_, e) -> collect_let_bindings acc e) fields
+  | Ast.Project (e, _) -> collect_let_bindings acc e
+  | Ast.Perform { Ast.args; _ } ->
+    List.iter (collect_let_bindings acc) args
+  | Ast.Handle { Ast.handled; Ast.handlers } ->
+    collect_let_bindings acc handled;
+    List.iter (fun h ->
+      List.iter (fun op -> collect_let_bindings acc op.Ast.op_handler_body)
+        h.Ast.op_handlers;
+      Option.iter (fun r -> collect_let_bindings acc r.Ast.return_body)
+        h.Ast.return_handler) handlers
+  | Ast.Var _ | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _
+  | Ast.BoolLit _ | Ast.UnitLit -> ()
+
+(* Walk expr collecting all perform sites: (effect_name, fn_name). *)
+let collect_all_performs_in_body prog fn_name =
+  let fn_map : (string, Ast.expr) Hashtbl.t = Hashtbl.create 16 in
+  List.iter (fun d ->
+    match d.Ast.decl_desc with
+    | Ast.DeclFn { fn_name = n; decl_body; _ } ->
+      Hashtbl.replace fn_map n decl_body
+    | _ -> ()) prog;
+  let all    = ref [] in
+  let seen   = Hashtbl.create 8 in
+  let in_flt = Hashtbl.create 4 in
+  let rec walk_fn fn =
+    if not (Hashtbl.mem in_flt fn) then begin
+      Hashtbl.replace in_flt fn ();
+      (match Hashtbl.find_opt fn_map fn with
+       | None -> ()
+       | Some body -> walk_expr fn body);
+      Hashtbl.remove in_flt fn
+    end
+  and walk_expr fn e =
+    match e.Ast.desc with
+    | Ast.Perform { Ast.effect_name; _ } ->
+      let key = (fn, effect_name) in
+      if not (Hashtbl.mem seen key) then begin
+        Hashtbl.replace seen key ();
+        all := (effect_name, fn) :: !all
+      end
+    | Ast.App ({ Ast.desc = Ast.Var callee; _ }, args) ->
+      List.iter (walk_expr fn) args; walk_fn callee
+    | Ast.App (f, args) ->
+      walk_expr fn f; List.iter (walk_expr fn) args
+    | Ast.Let { Ast.value; Ast.body; _ } ->
+      walk_expr fn value; walk_expr fn body
+    | Ast.Fn { Ast.fn_body; _ } -> walk_expr fn fn_body
+    | Ast.If { Ast.cond; Ast.then_; Ast.else_ } ->
+      walk_expr fn cond; walk_expr fn then_; walk_expr fn else_
+    | Ast.Do stmts ->
+      List.iter (function
+        | Ast.StmtLet { value; _ } -> walk_expr fn value
+        | Ast.StmtExpr e -> walk_expr fn e) stmts
+    | Ast.Match { Ast.scrutinee; Ast.arms } ->
+      walk_expr fn scrutinee;
+      List.iter (fun arm -> walk_expr fn arm.Ast.arm_body) arms
+    | Ast.Letrec (bindings, body) ->
+      List.iter (fun b -> walk_expr fn b.Ast.letrec_body) bindings;
+      walk_expr fn body
+    | Ast.Record fields -> List.iter (fun (_, e) -> walk_expr fn e) fields
+    | Ast.RecordUpdate (base, fields) ->
+      walk_expr fn base;
+      List.iter (fun (_, e) -> walk_expr fn e) fields
+    | Ast.Project (e, _) -> walk_expr fn e
+    | Ast.Handle { Ast.handled; Ast.handlers } ->
+      walk_expr fn handled;
+      List.iter (fun h ->
+        List.iter (fun op -> walk_expr fn op.Ast.op_handler_body) h.Ast.op_handlers;
+        Option.iter (fun r -> walk_expr fn r.Ast.return_body) h.Ast.return_handler)
+        handlers
+    | Ast.Var _ | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _
+    | Ast.BoolLit _ | Ast.UnitLit -> ()
+  in
+  walk_fn fn_name;
+  List.rev !all
+
+(* Walk prog looking for references to a type or effect name in each decl. *)
+(* Returns (mod_name, decl_name, kind) triples. kind ∈ "defines"|"uses"|"performs"|"handles" *)
+let find_dependents_of state name =
+  let results = ref [] in
+  Hashtbl.iter (fun mod_name ms ->
+    List.iter (fun d ->
+      match d.Ast.decl_desc with
+      | Ast.DeclType { type_name; _ } when type_name = name ->
+        results := (mod_name, type_name, "defines") :: !results
+      | Ast.DeclEffect { effect_name; _ } when effect_name = name ->
+        results := (mod_name, effect_name, "defines") :: !results
+      | Ast.DeclFn { fn_name; params; return_type; effects;
+                     decl_body; _ } ->
+        (* Check if name appears in type annotations *)
+        let rec ty_refs t =
+          match t with
+          | Ast.TyName s -> s = name
+          | Ast.TyApp (s, args) -> s = name || List.exists ty_refs args
+          | Ast.TyTuple ts -> List.exists ty_refs ts
+          | Ast.TyFun (ps, r, _) -> List.exists ty_refs ps || ty_refs r
+        in
+        let eff_refs = function
+          | None | Some Ast.Pure -> false
+          | Some (Ast.Effects (ts, _)) -> List.exists ty_refs ts
+        in
+        let used_in_sig =
+          List.exists (fun p -> ty_refs p.Ast.param_type) params ||
+          (match return_type with Some t -> ty_refs t | None -> false) ||
+          eff_refs effects
+        in
+        (* Check body for Perform and Handle *)
+        let rec body_refs_perform e =
+          match e.Ast.desc with
+          | Ast.Perform { Ast.effect_name = en; _ } -> en = name
+          | Ast.App (f, args) ->
+            body_refs_perform f || List.exists body_refs_perform args
+          | Ast.Let { Ast.value; Ast.body; _ } ->
+            body_refs_perform value || body_refs_perform body
+          | Ast.Fn { Ast.fn_body; _ } -> body_refs_perform fn_body
+          | Ast.If { Ast.cond; Ast.then_; Ast.else_ } ->
+            body_refs_perform cond || body_refs_perform then_ ||
+            body_refs_perform else_
+          | Ast.Do stmts ->
+            List.exists (function
+              | Ast.StmtLet { value; _ } -> body_refs_perform value
+              | Ast.StmtExpr e -> body_refs_perform e) stmts
+          | Ast.Match { Ast.scrutinee; Ast.arms } ->
+            body_refs_perform scrutinee ||
+            List.exists (fun arm -> body_refs_perform arm.Ast.arm_body) arms
+          | Ast.Letrec (bindings, body) ->
+            List.exists (fun b -> body_refs_perform b.Ast.letrec_body) bindings ||
+            body_refs_perform body
+          | Ast.Record fields -> List.exists (fun (_, e) -> body_refs_perform e) fields
+          | Ast.RecordUpdate (base, fields) ->
+            body_refs_perform base ||
+            List.exists (fun (_, e) -> body_refs_perform e) fields
+          | Ast.Project (e, _) -> body_refs_perform e
+          | Ast.Handle { Ast.handled; _ } -> body_refs_perform handled
+          | Ast.Var _ | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _
+          | Ast.BoolLit _ | Ast.UnitLit -> false
+        in
+        let rec body_refs_handle e =
+          match e.Ast.desc with
+          | Ast.Handle { Ast.handled; Ast.handlers } ->
+            body_refs_handle handled ||
+            List.exists (fun h -> h.Ast.effect_handler = name) handlers ||
+            List.exists (fun h ->
+              List.exists (fun op -> body_refs_handle op.Ast.op_handler_body)
+                h.Ast.op_handlers) handlers
+          | Ast.App (f, args) ->
+            body_refs_handle f || List.exists body_refs_handle args
+          | Ast.Let { Ast.value; Ast.body; _ } ->
+            body_refs_handle value || body_refs_handle body
+          | Ast.Fn { Ast.fn_body; _ } -> body_refs_handle fn_body
+          | Ast.If { Ast.cond; Ast.then_; Ast.else_ } ->
+            body_refs_handle cond || body_refs_handle then_ ||
+            body_refs_handle else_
+          | Ast.Do stmts ->
+            List.exists (function
+              | Ast.StmtLet { value; _ } -> body_refs_handle value
+              | Ast.StmtExpr e -> body_refs_handle e) stmts
+          | Ast.Match { Ast.scrutinee; Ast.arms } ->
+            body_refs_handle scrutinee ||
+            List.exists (fun arm -> body_refs_handle arm.Ast.arm_body) arms
+          | Ast.Letrec (bindings, body) ->
+            List.exists (fun b -> body_refs_handle b.Ast.letrec_body) bindings ||
+            body_refs_handle body
+          | Ast.Record fields -> List.exists (fun (_, e) -> body_refs_handle e) fields
+          | Ast.RecordUpdate (base, fields) ->
+            body_refs_handle base ||
+            List.exists (fun (_, e) -> body_refs_handle e) fields
+          | Ast.Project (e, _) -> body_refs_handle e
+          | Ast.Perform { Ast.args; _ } -> List.exists body_refs_handle args
+          | Ast.Var _ | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _
+          | Ast.BoolLit _ | Ast.UnitLit -> false
+        in
+        let performs = body_refs_perform decl_body in
+        let handles  = body_refs_handle  decl_body in
+        if used_in_sig then
+          results := (mod_name, fn_name, "uses") :: !results;
+        if performs && not used_in_sig then
+          results := (mod_name, fn_name, "performs") :: !results;
+        if handles then
+          results := (mod_name, fn_name, "handles") :: !results
+      | _ -> ()
+    ) ms.typed_ast
+  ) state.modules;
+  List.rev !results
+
+(* ─── Graph traversal node types ─────────────────────────────────────────── *)
+
+type gnode =
+  | GnFn   of { gmod : string; gname : string; ghash : string }
+  | GnParam of { gpfn : string; gpidx : int; gpname : string; gpty : string }
+  | GnCall  of { gcaller : string; gcallee : string; gchash : string;
+                 gcargs : Ast.expr list }
+  | GnExpr  of { gefn : string; gehash : string; geexpr : Ast.expr;
+                 gecall_site : string option }
+
+let json_of_gnode state node =
+  match node with
+  | GnFn { gmod; gname; ghash } ->
+    let sig_ =
+      match Hashtbl.find_opt state.modules gmod with
+      | None -> ""
+      | Some ms ->
+        (match List.assoc_opt gname ms.type_env with
+         | None -> ""
+         | Some sc -> Format.asprintf "%a" Typechecker.pp_ty sc.Typechecker.body)
+    in
+    Object [("kind", String "function"); ("id", String ghash);
+            ("module", String gmod); ("name", String gname);
+            ("signature", String sig_)]
+  | GnParam { gpfn; gpidx = _; gpname; gpty } ->
+    Object [("kind", String "param");
+            ("id", String (gpfn ^ ":param:" ^ gpname));
+            ("function", String gpfn); ("name", String gpname);
+            ("type", String gpty)]
+  | GnCall { gcaller; gcallee; gchash; _ } ->
+    Object [("kind", String "call_site"); ("id", String gchash);
+            ("function", String gcaller); ("callee", String gcallee)]
+  | GnExpr { gefn; gehash; geexpr; gecall_site } ->
+    let expr_str = Printer.print_expr geexpr in
+    let fields = [("kind", String "expr"); ("id", String gehash);
+                  ("function", String gefn); ("description", String expr_str)] in
+    let fields = match gecall_site with
+      | None    -> fields
+      | Some cs -> ("call_site", String cs) :: fields
+    in
+    Object fields
+
+(* Look up a function's param list from the combined program. *)
+let fn_params_of prog fn_name =
+  List.find_opt (fun d ->
+    match d.Ast.decl_desc with
+    | Ast.DeclFn { fn_name = n; _ } -> n = fn_name
+    | _ -> false) prog
+  |> Option.map (fun d ->
+      match d.Ast.decl_desc with
+      | Ast.DeclFn { params; _ } -> params
+      | _ -> [])
+  |> Option.value ~default:[]
+
+(* Look up a function's body from the combined program. *)
+let fn_body_of prog fn_name =
+  List.find_opt (fun d ->
+    match d.Ast.decl_desc with
+    | Ast.DeclFn { fn_name = n; _ } -> n = fn_name
+    | _ -> false) prog
+  |> Option.map (fun d ->
+      match d.Ast.decl_desc with
+      | Ast.DeclFn { decl_body; _ } -> Some decl_body
+      | _ -> None)
+  |> Option.join
+
+(* Apply a filter JSON object to a gnode; returns true iff node passes. *)
+let gnode_passes_filter filter node =
+  match filter with
+  | Null | Object [] -> true
+  | Object fields ->
+    List.for_all (fun (k, v) ->
+      match k, v, node with
+      | "name",  String s, GnParam { gpname; _ }  -> gpname = s
+      | "name",  String s, GnFn   { gname;  _ }   -> gname  = s
+      | "param", String s, GnExpr _               ->
+        (* filter {param: "loc"} on argument nodes is handled at collection time *)
+        ignore s; true
+      | _ -> true
+    ) fields
+  | _ -> true
+
+(* Traverse one edge from one node; returns a list of result gnodes.
+   [param_filter]: when Some name, only return the argument at that param position. *)
+let traverse_one_edge state prog enc edge direction filter node =
+  match edge, direction with
+
+  | "HAS_PARAM", "out" ->
+    (match node with
+     | GnFn { gname; _ } ->
+       fn_params_of prog gname
+       |> List.mapi (fun i p ->
+           GnParam { gpfn  = gname; gpidx = i;
+                     gpname = p.Ast.param_name;
+                     gpty  = Printer.print_type_expr p.Ast.param_type })
+       |> List.filter (gnode_passes_filter filter)
+     | _ -> [])
+
+  | "HAS_PARAM", "in" ->
+    (* Return the containing function for a param *)
+    (match node with
+     | GnParam { gpfn; _ } ->
+       (match module_of_fn state gpfn with
+        | None -> []
+        | Some gmod ->
+          let ghash = match Hashtbl.find_opt state.modules gmod with
+            | None -> "" | Some ms ->
+              Option.value ~default:"" (Hashtbl.find_opt ms.decl_hashes gpfn)
+          in
+          [GnFn { gmod; gname = gpfn; ghash }])
+     | _ -> [])
+
+  | "CALLS", "out" ->
+    (* Call sites within the anchor function *)
+    (match node with
+     | GnFn { gname = caller; _ } ->
+       (match fn_body_of prog caller with
+        | None -> []
+        | Some body ->
+          let calls = ref [] in
+          collect_calls_in calls body;
+          List.filter_map (fun (callee, call_expr, args) ->
+            let gchash = bytes_to_hex (Node_encoding.encode_expr enc call_expr) in
+            let n = GnCall { gcaller = caller; gcallee = callee;
+                             gchash; gcargs = args } in
+            if gnode_passes_filter filter n then Some n else None
+          ) (List.rev !calls))
+     | _ -> [])
+
+  | "CALLS", "in" ->
+    (* Call sites that call the anchor function, across all modules *)
+    (match node with
+     | GnFn { gname = callee; _ } ->
+       Hashtbl.fold (fun _mod_name ms acc ->
+         let sites = Typechecker.collect_callers_in ms.typed_ast callee in
+         List.filter_map (fun (s : Typechecker.caller_site) ->
+           let gchash =
+             bytes_to_hex (Node_encoding.encode_expr enc s.cs_call_expr) in
+           let args = match s.cs_call_expr.Ast.desc with
+             | Ast.App (_, a) -> a | _ -> []
+           in
+           let n = GnCall { gcaller = s.cs_caller; gcallee = callee;
+                            gchash; gcargs = args } in
+           if gnode_passes_filter filter n then Some n else None
+         ) sites @ acc
+       ) state.modules []
+     | _ -> [])
+
+  | "HAS_ARGUMENT", "out" ->
+    (* Arguments of a call site; filter {param: "name"} selects by position *)
+    (match node with
+     | GnCall { gcaller; gcallee; gchash; gcargs } ->
+       let param_filter =
+         match filter with
+         | Object fields ->
+           (match List.assoc_opt "param" fields with
+            | Some (String s) -> Some s | _ -> None)
+         | _ -> None
+       in
+       let callee_params = fn_params_of prog gcallee in
+       List.mapi (fun i arg ->
+         let keep = match param_filter with
+           | None -> true
+           | Some pname ->
+             (match List.nth_opt callee_params i with
+              | Some p -> p.Ast.param_name = pname
+              | None   -> false)
+         in
+         if keep then
+           let gehash = bytes_to_hex (Node_encoding.encode_expr enc arg) in
+           Some (GnExpr { gefn = gcaller; gehash; geexpr = arg;
+                          gecall_site = Some gchash })
+         else None
+       ) gcargs |> List.filter_map Fun.id
+     | _ -> [])
+
+  | "HAS_TYPE", "out" ->
+    (* Type annotation of a node *)
+    (match node with
+     | GnParam { gpfn; gpname; gpty; _ } ->
+       let hash = gpfn ^ ":param:" ^ gpname ^ ":type" in
+       [GnExpr { gefn = gpfn; gehash = hash;
+                 geexpr = Ast.expr Ast.UnitLit;
+                 gecall_site = Some gpty }]
+     | GnFn { gmod; gname; _ } ->
+       let sig_ =
+         match Hashtbl.find_opt state.modules gmod with
+         | None -> ""
+         | Some ms ->
+           (match List.assoc_opt gname ms.type_env with
+            | None -> ""
+            | Some sc -> Format.asprintf "%a" Typechecker.pp_ty sc.Typechecker.body)
+       in
+       [GnExpr { gefn = gname; gehash = gname ^ ":type";
+                 geexpr = Ast.expr Ast.UnitLit;
+                 gecall_site = Some sig_ }]
+     | _ -> [])
+
+  | "PERFORMS", "out" ->
+    (* Perform sites within a function (direct, not transitive) *)
+    (match node with
+     | GnFn { gname; _ } ->
+       let performs = ref [] in
+       let rec walk e =
+         match e.Ast.desc with
+         | Ast.Perform { Ast.effect_name; _ } ->
+           performs := effect_name :: !performs
+         | Ast.App (f, args) -> walk f; List.iter walk args
+         | Ast.Let { Ast.value; Ast.body; _ } -> walk value; walk body
+         | Ast.Fn { Ast.fn_body; _ } -> walk fn_body
+         | Ast.If { Ast.cond; Ast.then_; Ast.else_ } ->
+           walk cond; walk then_; walk else_
+         | Ast.Do stmts ->
+           List.iter (function
+             | Ast.StmtLet { value; _ } -> walk value
+             | Ast.StmtExpr e -> walk e) stmts
+         | Ast.Match { Ast.scrutinee; Ast.arms } ->
+           walk scrutinee; List.iter (fun a -> walk a.Ast.arm_body) arms
+         | Ast.Letrec (bindings, body) ->
+           List.iter (fun b -> walk b.Ast.letrec_body) bindings; walk body
+         | Ast.Record fields -> List.iter (fun (_, e) -> walk e) fields
+         | Ast.RecordUpdate (base, fields) ->
+           walk base; List.iter (fun (_, e) -> walk e) fields
+         | Ast.Project (e, _) -> walk e
+         | Ast.Handle { Ast.handled; Ast.handlers } ->
+           walk handled;
+           List.iter (fun h ->
+             List.iter (fun op -> walk op.Ast.op_handler_body) h.Ast.op_handlers;
+             Option.iter (fun r -> walk r.Ast.return_body) h.Ast.return_handler)
+             handlers
+         | Ast.Var _ | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _
+         | Ast.BoolLit _ | Ast.UnitLit -> ()
+       in
+       (match fn_body_of prog gname with None -> () | Some b -> walk b);
+       List.rev_map (fun eff_name ->
+         let ghash = gname ^ ":performs:" ^ eff_name in
+         GnExpr { gefn = gname; gehash = ghash;
+                  geexpr = Ast.expr Ast.UnitLit;
+                  gecall_site = Some eff_name }
+       ) !performs
+     | _ -> [])
+
+  | "HANDLES", "out" ->
+    (* Effect names handled (via Handle) within a function (direct) *)
+    (match node with
+     | GnFn { gname; _ } ->
+       let handles = ref [] in
+       let rec walk e =
+         match e.Ast.desc with
+         | Ast.Handle { Ast.handled; Ast.handlers } ->
+           List.iter (fun h -> handles := h.Ast.effect_handler :: !handles) handlers;
+           walk handled;
+           List.iter (fun h ->
+             List.iter (fun op -> walk op.Ast.op_handler_body) h.Ast.op_handlers;
+             Option.iter (fun r -> walk r.Ast.return_body) h.Ast.return_handler)
+             handlers
+         | Ast.App (f, args) -> walk f; List.iter walk args
+         | Ast.Let { Ast.value; Ast.body; _ } -> walk value; walk body
+         | Ast.Fn { Ast.fn_body; _ } -> walk fn_body
+         | Ast.If { Ast.cond; Ast.then_; Ast.else_ } ->
+           walk cond; walk then_; walk else_
+         | Ast.Do stmts ->
+           List.iter (function
+             | Ast.StmtLet { value; _ } -> walk value
+             | Ast.StmtExpr e -> walk e) stmts
+         | Ast.Match { Ast.scrutinee; Ast.arms } ->
+           walk scrutinee; List.iter (fun a -> walk a.Ast.arm_body) arms
+         | Ast.Letrec (bindings, body) ->
+           List.iter (fun b -> walk b.Ast.letrec_body) bindings; walk body
+         | Ast.Record fields -> List.iter (fun (_, e) -> walk e) fields
+         | Ast.RecordUpdate (base, fields) ->
+           walk base; List.iter (fun (_, e) -> walk e) fields
+         | Ast.Project (e, _) -> walk e
+         | Ast.Perform { Ast.args; _ } -> List.iter walk args
+         | Ast.Var _ | Ast.IntLit _ | Ast.FloatLit _ | Ast.StringLit _
+         | Ast.BoolLit _ | Ast.UnitLit -> ()
+       in
+       (match fn_body_of prog gname with None -> () | Some b -> walk b);
+       List.rev_map (fun eff_name ->
+         let ghash = gname ^ ":handles:" ^ eff_name in
+         GnExpr { gefn = gname; gehash = ghash;
+                  geexpr = Ast.expr Ast.UnitLit;
+                  gecall_site = Some eff_name }
+       ) !handles
+     | _ -> [])
+
+  | "REFERENCES", "out" ->
+    (* Types and effects referenced by a function's signature *)
+    (match node with
+     | GnFn { gmod; gname; _ } ->
+       let decl_opt = match Hashtbl.find_opt state.modules gmod with
+         | None -> None
+         | Some ms ->
+           List.find_opt (fun d ->
+             match d.Ast.decl_desc with
+             | Ast.DeclFn { fn_name = n; _ } -> n = gname
+             | _ -> false) ms.typed_ast
+       in
+       (match decl_opt with
+        | None -> []
+        | Some d ->
+          (match d.Ast.decl_desc with
+           | Ast.DeclFn { params; return_type; effects; _ } ->
+             let refs = ref [] in
+             let rec ty_ref t =
+               match t with
+               | Ast.TyName s -> refs := s :: !refs
+               | Ast.TyApp (s, args) -> refs := s :: !refs; List.iter ty_ref args
+               | Ast.TyTuple ts -> List.iter ty_ref ts
+               | Ast.TyFun (ps, r, _) -> List.iter ty_ref ps; ty_ref r
+             in
+             List.iter (fun p -> ty_ref p.Ast.param_type) params;
+             Option.iter ty_ref return_type;
+             (match effects with
+              | Some (Ast.Effects (ts, _)) -> List.iter ty_ref ts
+              | _ -> ());
+             List.filter_map (fun r_name ->
+               let h = gname ^ ":ref:" ^ r_name in
+               Some (GnExpr { gefn = gname; gehash = h;
+                              geexpr = Ast.expr Ast.UnitLit;
+                              gecall_site = Some r_name })
+             ) (List.rev !refs)
+           | _ -> []))
+     | _ -> [])
+
+  | "DATA_FLOW", "in" ->
+    (* Trace backwards from an expression: Var → let-binding or parameter.
+       v1: let-binding + parameter chains only. *)
+    let data_flow_from gefn geexpr =
+      match geexpr.Ast.desc with
+      | Ast.Var var_name ->
+        let params = fn_params_of prog gefn in
+        let is_param = List.exists (fun p -> p.Ast.param_name = var_name) params in
+        if is_param then
+          [GnParam { gpfn   = gefn; gpidx = 0;
+                     gpname = var_name;
+                     gpty   = (match List.find_opt (fun p ->
+                         p.Ast.param_name = var_name) params with
+                       | Some p -> Printer.print_type_expr p.Ast.param_type
+                       | None   -> "?") }]
+        else begin
+          let bindings = ref [] in
+          (match fn_body_of prog gefn with
+           | None -> ()
+           | Some body -> collect_let_bindings bindings body);
+          match List.assoc_opt var_name !bindings with
+          | None -> []
+          | Some value ->
+            let gehash = bytes_to_hex (Node_encoding.encode_expr enc value) in
+            [GnExpr { gefn; gehash; geexpr = value; gecall_site = None }]
+        end
+      | _ ->
+        let gehash = bytes_to_hex (Node_encoding.encode_expr enc geexpr) in
+        [GnExpr { gefn; gehash; geexpr; gecall_site = None }]
+    in
+    (match node with
+     | GnExpr { gefn; geexpr; _ } -> data_flow_from gefn geexpr
+     | _ -> [])
+
+  | _ -> []
+
+(* Execute one traversal step (including recursive follow) against a list of
+   starting nodes, accumulating results into [collections]. *)
+let rec execute_traverse state prog enc (collections : (string, json list) Hashtbl.t)
+    step nodes =
+  let edge      = match obj_get "edge"      step with String s -> s | _ -> "" in
+  let direction = match obj_get "direction" step with String s -> s | _ -> "out" in
+  let filter    = obj_get "filter" step in
+  let collect   = match obj_get "collect"   step with String s -> s | _ -> "_" in
+  let depth     = match obj_get "depth"     step with String s -> s | _ -> "single" in
+  let follow    = obj_get "follow" step in
+  let next = ref [] in
+  let seen_hashes : (string, unit) Hashtbl.t = Hashtbl.create 8 in
+  let add_node n =
+    let id = match n with
+      | GnFn   { ghash;  _ } -> ghash
+      | GnParam { gpfn; gpname; _ } -> gpfn ^ ":param:" ^ gpname
+      | GnCall  { gchash; _ } -> gchash
+      | GnExpr  { gehash; _ } -> gehash
+    in
+    if not (Hashtbl.mem seen_hashes id) then begin
+      Hashtbl.replace seen_hashes id ();
+      next := n :: !next
+    end
+  in
+  let traverse_from n =
+    List.iter add_node (traverse_one_edge state prog enc edge direction filter n)
+  in
+  List.iter traverse_from nodes;
+  (* Transitive: keep traversing until no new nodes found *)
+  if depth = "transitive" then begin
+    let frontier = ref !next in
+    let keep_going = ref true in
+    while !keep_going do
+      let before = List.length !next in
+      List.iter traverse_from !frontier;
+      let after = List.length !next in
+      if after = before then keep_going := false
+      else
+        frontier := List.filteri (fun i _ -> i < after - before)
+                      (List.rev !next |> List.rev)
+    done
+  end;
+  (* Collect result JSON *)
+  let json_nodes = List.filter_map (fun n ->
+      match json_of_gnode state n with
+      | Object _ as j -> Some j
+      | _ -> None
+    ) (List.rev !next) in
+  let existing = Option.value ~default:[] (Hashtbl.find_opt collections collect) in
+  Hashtbl.replace collections collect (existing @ json_nodes);
+  (* Apply follow to the collected nodes *)
+  match follow with
+  | Null | Object [] -> ()
+  | follow_step -> execute_traverse state prog enc collections follow_step (List.rev !next)
+
 (* ─── Query tool ─────────────────────────────────────────────────────────── *)
 
 let dispatch_query state cmd =
@@ -582,6 +1267,169 @@ let dispatch_query state cmd =
            acc @ module_sites
          ) state.modules [] in
        Cmd_success (Object [("callers", Array json_sites)], []))
+
+  | "effect_flow" ->
+    (* Trace all effects performed transitively from an entry function,
+       annotating each with whether it is ultimately handled. *)
+    (match resolve_anchor state args with
+     | Error d -> Cmd_halt d
+     | Ok (_mod_name, fn_name, ms) ->
+       let prog = combined_program state in
+       (try
+          let unhandled = Typechecker.collect_unhandled_effects prog fn_name in
+          let unhandled_set =
+            List.map (fun (s : Typechecker.effect_site) ->
+              (s.es_effect, s.es_function)) unhandled
+          in
+          let all_performs = collect_all_performs_in_body prog fn_name in
+          let fn_node = Hashtbl.find_opt ms.decl_hashes fn_name in
+          let json_performs = List.map (fun (eff, fn) ->
+              let is_unhandled = List.mem (eff, fn) unhandled_set in
+              let owner_ms_opt = match module_of_fn state fn with
+                | None -> None | Some mn -> Hashtbl.find_opt state.modules mn
+              in
+              let fn_hash = match owner_ms_opt with
+                | None -> Null
+                | Some ms2 ->
+                  (match Hashtbl.find_opt ms2.decl_hashes fn with
+                   | None -> Null | Some h -> String h)
+              in
+              Object [("effect",  String eff);
+                      ("function", String fn);
+                      ("handled", Bool (not is_unhandled));
+                      ("node",    fn_hash)]
+            ) all_performs
+          in
+          Cmd_success (Object [
+            ("entry",    String fn_name);
+            ("node",     match fn_node with None -> Null | Some h -> String h);
+            ("performs", Array json_performs)], [])
+        with Failure msg ->
+          Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)))
+
+  | "unhandled" ->
+    (* Project-wide unhandled effects from a specified entry point.
+       Returns structured data (as opposed to verify/effects which uses diagnostics). *)
+    let anchor_json = obj_get "anchor" args in
+    let (entry_point, prog) =
+      match obj_get "name" anchor_json with
+      | String ep ->
+        (ep, combined_program state)
+      | _ ->
+        (* Try direct fields on args *)
+        let ep = match obj_get "name" args with
+          | String s -> s
+          | _ -> ""
+        in
+        (ep, combined_program state)
+    in
+    if entry_point = "" then
+      Cmd_halt (Mcp_types.make_error "anchor/not-found"
+        "unhandled requires an anchor with a function name")
+    else
+      (try
+         let sites = Typechecker.collect_unhandled_effects prog entry_point in
+         let json_sites = List.map (fun (s : Typechecker.effect_site) ->
+             let owner_mod = module_of_fn state s.es_function in
+             let fn_hash = match owner_mod with
+               | None -> Null
+               | Some mn ->
+                 (match Hashtbl.find_opt state.modules mn with
+                  | None -> Null
+                  | Some ms ->
+                    (match Hashtbl.find_opt ms.decl_hashes s.es_function with
+                     | None -> Null | Some h -> String h))
+             in
+             Object [
+               ("effect",   String s.es_effect);
+               ("function", String s.es_function);
+               ("module",   match owner_mod with None -> Null | Some m -> String m);
+               ("node",     fn_hash);
+             ]
+           ) sites in
+         Cmd_success (Object [
+           ("entry",  String entry_point);
+           ("sites",  Array json_sites)], [])
+       with Failure msg ->
+         Cmd_halt (Mcp_types.make_error "anchor/not-found" msg))
+
+  | "dependents" ->
+    (* List all declarations across submitted modules that reference a named
+       type or effect.  "name" is the only required arg. *)
+    let name = match obj_get "name" args with String s -> s | _ -> "" in
+    if name = "" then
+      Cmd_halt (Mcp_types.make_error "anchor/not-found"
+        "dependents requires a 'name' argument")
+    else begin
+      let deps = find_dependents_of state name in
+      let json_deps = List.map (fun (mod_name, decl_n, kind) ->
+          let hash = match Hashtbl.find_opt state.modules mod_name with
+            | None -> Null
+            | Some ms ->
+              (match Hashtbl.find_opt ms.decl_hashes decl_n with
+               | None -> Null | Some h -> String h)
+          in
+          Object [("module",      String mod_name);
+                  ("declaration", String decl_n);
+                  ("kind",        String kind);
+                  ("node",        hash)]
+        ) deps in
+      Cmd_success (Object [("name", String name); ("dependents", Array json_deps)], [])
+    end
+
+  | "pattern_coverage" ->
+    (* Check exhaustiveness of match expressions in the specified function. *)
+    (match resolve_anchor state args with
+     | Error d -> Cmd_halt d
+     | Ok (_mod_name, fn_name, ms) ->
+       let warnings = Typechecker.collect_match_warnings ms.typed_ast in
+       let fn_warnings =
+         List.filter (fun (w : Typechecker.match_warning) ->
+           w.mw_fn_name = Some fn_name) warnings
+       in
+       let fn_node = Hashtbl.find_opt ms.decl_hashes fn_name in
+       (* Produce one entry per match: exhaustive or not. *)
+       let non_exhaustive = List.map (fun (w : Typechecker.match_warning) ->
+           Object [("exhaustive", Bool false);
+                   ("missing",    Array (List.map (fun s -> String s) w.mw_missing));
+                   ("node",       match fn_node with None -> Null | Some h -> String h)]
+         ) fn_warnings in
+       (* If no warnings, report a single exhaustive result. *)
+       let matches =
+         if fn_warnings = [] then
+           [Object [("exhaustive", Bool true); ("missing", Array []);
+                    ("node", match fn_node with None -> Null | Some h -> String h)]]
+         else non_exhaustive
+       in
+       Cmd_success (Object [
+         ("function", String fn_name);
+         ("node",     match fn_node with None -> Null | Some h -> String h);
+         ("matches",  Array matches)], []))
+
+  | "graph" ->
+    (* Structured graph traversal anchored on a function.
+       args: { anchor: {...}, traverse: [{edge, direction, filter?, collect, depth?,
+               terminal_when?, follow?}] }
+       Returns named collections of graph nodes. *)
+    let anchor_json  = obj_get "anchor"   args in
+    let traverse_arr = match obj_get "traverse" args with
+      | Array steps -> steps | _ -> []
+    in
+    (match resolve_anchor state anchor_json with
+     | Error d -> Cmd_halt d
+     | Ok (gmod, gname, ms) ->
+       let ghash = Option.value ~default:"" (Hashtbl.find_opt ms.decl_hashes gname) in
+       let start  = [GnFn { gmod; gname; ghash }] in
+       let prog   = combined_program state in
+       let enc    = Node_store.as_encoding_store state.node_store in
+       let cols : (string, json list) Hashtbl.t = Hashtbl.create 8 in
+       List.iter (fun step ->
+         execute_traverse state prog enc cols step start
+       ) traverse_arr;
+       let result_fields = Hashtbl.fold (fun k v acc ->
+           (k, Array v) :: acc) cols []
+       in
+       Cmd_success (Object result_fields, []))
 
   | _ ->
     Cmd_halt (Mcp_types.make_error "command/unknown"
@@ -804,8 +1652,11 @@ let tool_query_schema =
     ("name", String "query");
     ("description", String
        "Read the IR graph: function signatures, module interfaces, effect maps, \
-        and caller graphs.  Accepts a batch of commands executed in order.");
-    ("inputSchema", batch_input_schema ["signature"; "interface"; "effects"; "callers"]);
+        caller graphs, effect flow, dependents, pattern coverage, and structured \
+        graph traversal.  Accepts a batch of commands executed in order.");
+    ("inputSchema", batch_input_schema
+       ["signature"; "interface"; "effects"; "callers";
+        "effect_flow"; "unhandled"; "dependents"; "pattern_coverage"; "graph"]);
   ]
 
 let tool_write_schema =

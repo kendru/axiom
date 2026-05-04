@@ -16,9 +16,19 @@ let mcp_exe =
 
 (* Launch the MCP server and return (write_line, read_line, close) *)
 let start_server () =
+  (* Give each server instance an isolated image directory so tests don't
+     interfere with each other or with the user's ~/.axiom/image store. *)
+  let store_dir =
+    let path = Filename.temp_file "axiom_mcp_test_" "_dir" in
+    Sys.remove path;
+    Unix.mkdir path 0o700;
+    path
+  in
+  let env = Array.append (Unix.environment ())
+    [| Printf.sprintf "AXIOM_IMAGE_DIR=%s" store_dir |] in
   let (child_in_r, child_in_w)   = Unix.pipe () in
   let (child_out_r, child_out_w) = Unix.pipe () in
-  let pid = Unix.create_process mcp_exe [| mcp_exe |]
+  let pid = Unix.create_process_env mcp_exe [| mcp_exe |] env
     child_in_r child_out_w Unix.stderr
   in
   Unix.close child_in_r;
@@ -34,7 +44,14 @@ let start_server () =
     close_out_noerr oc;
     close_in_noerr ic;
     (try Unix.kill pid Sys.sigterm with _ -> ());
-    ignore (Unix.waitpid [] pid)
+    ignore (Unix.waitpid [] pid);
+    (* Remove the temporary store directory. *)
+    (try
+       let files = Sys.readdir store_dir in
+       Array.iter (fun f ->
+         try Sys.remove (Filename.concat store_dir f) with _ -> ()) files;
+       Unix.rmdir store_dir
+     with _ -> ())
   in
   (write_line, read_line, close)
 

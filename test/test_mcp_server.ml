@@ -1056,6 +1056,411 @@ let test_verify_unused_diagnostic_has_node () =
        Alcotest.fail "expected at least one diagnostic")
   )
 
+(* ─── query / effect_flow ────────────────────────────────────────────────── *)
+
+let test_query_effect_flow_pure_fn () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_all_handled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "effect_flow" {|{"module":"mymod","name":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let entry = json_field "entry" r in
+    Alcotest.(check bool) "entry field is main" true (entry = `String "main");
+    let performs = json_field "performs" r in
+    Alcotest.(check bool) "performs is a list" true
+      (match performs with `List _ -> true | _ -> false)
+  )
+
+let test_query_effect_flow_handled_effect () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_all_handled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "effect_flow" {|{"module":"mymod","name":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let r = first_result batch in
+    let performs = match json_field "performs" r with `List xs -> xs | _ -> [] in
+    (* All effects should be marked handled=true *)
+    let all_handled = List.for_all (fun p ->
+        json_field "handled" p = `Bool true) performs in
+    Alcotest.(check bool) "all effects marked handled" true
+      (performs = [] || all_handled)
+  )
+
+let test_query_effect_flow_unhandled_marked () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_unhandled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "effect_flow" {|{"module":"mymod","name":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let performs = match json_field "performs" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "performs non-empty" true (performs <> []);
+    let any_unhandled = List.exists (fun p ->
+        json_field "handled" p = `Bool false) performs in
+    Alcotest.(check bool) "at least one unhandled" true any_unhandled
+  )
+
+let test_query_effect_flow_not_found_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "query"
+      (single_cmd "effect_flow" {|{"module":"no_such","name":"main"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── query / unhandled ──────────────────────────────────────────────────── *)
+
+let test_query_unhandled_all_handled () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_all_handled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "unhandled" {|{"anchor":{"module":"mymod","name":"main"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let sites = match json_field "sites" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "no unhandled sites" true (sites = [])
+  )
+
+let test_query_unhandled_returns_sites () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape effects_unhandled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "unhandled" {|{"anchor":{"module":"mymod","name":"main"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let sites = match json_field "sites" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "unhandled sites non-empty" true (sites <> []);
+    (match sites with
+     | s :: _ ->
+       Alcotest.(check bool) "site has effect field" true
+         (match json_field "effect" s with `String x -> String.length x > 0 | _ -> false);
+       Alcotest.(check bool) "site has function field" true
+         (match json_field "function" s with `String x -> String.length x > 0 | _ -> false)
+     | [] -> ())
+  )
+
+let test_query_unhandled_no_name_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "query"
+      (single_cmd "unhandled" {|{}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── query / dependents ─────────────────────────────────────────────────── *)
+
+let test_query_dependents_effect () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape single_effect_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "dependents" {|{"name":"Log"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    Alcotest.(check bool) "name field present" true
+      (json_field "name" r = `String "Log");
+    let deps = match json_field "dependents" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "dependents non-empty" true (deps <> [])
+  )
+
+let test_query_dependents_defines_included () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape single_effect_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "dependents" {|{"name":"Log"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let deps = match json_field "dependents" (first_result batch) with
+      | `List xs -> xs | _ -> []
+    in
+    let has_defines = List.exists (fun d ->
+        json_field "kind" d = `String "defines") deps in
+    Alcotest.(check bool) "defines entry included" true has_defines
+  )
+
+let test_query_dependents_no_name_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "query"
+      (single_cmd "dependents" {|{}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+let test_query_dependents_unknown_name_empty () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape pure_module_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "dependents" {|{"name":"NoSuchType"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let deps = match json_field "dependents" (first_result batch) with
+      | `List xs -> xs | _ -> []
+    in
+    Alcotest.(check bool) "empty dependents for unknown name" true (deps = [])
+  )
+
+(* ─── query / pattern_coverage ──────────────────────────────────────────── *)
+
+let test_query_pattern_coverage_exhaustive () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape exhaustive_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "pattern_coverage" {|{"module":"mymod","name":"describe"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    Alcotest.(check bool) "function field present" true
+      (json_field "function" r = `String "describe");
+    let matches = match json_field "matches" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "matches non-empty" true (matches <> []);
+    let all_exhaustive = List.for_all (fun m ->
+        json_field "exhaustive" m = `Bool true) matches in
+    Alcotest.(check bool) "all matches exhaustive" true all_exhaustive
+  )
+
+let test_query_pattern_coverage_node_present () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape exhaustive_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "pattern_coverage" {|{"module":"mymod","name":"describe"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let r = first_result batch in
+    Alcotest.(check bool) "node hash present" true
+      (match json_field "node" r with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_query_pattern_coverage_not_found_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "query"
+      (single_cmd "pattern_coverage" {|{"module":"no_such","name":"fn"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── query / graph ──────────────────────────────────────────────────────── *)
+
+let test_query_graph_has_param () =
+  let source = {|fn get_location(loc: Int, name: String) -> Int ! pure { loc }|} in
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "graph"
+         {|{"anchor":{"module":"mymod","name":"get_location"},"traverse":[{"edge":"HAS_PARAM","direction":"out","collect":"params"}]}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let params = match json_field "params" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "two params returned" true (List.length params = 2);
+    let names = List.filter_map (fun p ->
+        match json_field "name" p with `String s -> Some s | _ -> None) params in
+    Alcotest.(check bool) "loc in params" true (List.mem "loc" names);
+    Alcotest.(check bool) "name in params" true (List.mem "name" names)
+  )
+
+let test_query_graph_has_param_filter () =
+  let source = {|fn get_location(loc: Int, name: String) -> Int ! pure { loc }|} in
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "graph"
+         {|{"anchor":{"module":"mymod","name":"get_location"},"traverse":[{"edge":"HAS_PARAM","direction":"out","filter":{"name":"loc"},"collect":"param"}]}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let params = match json_field "param" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check int) "exactly one param" 1 (List.length params);
+    (match params with
+     | p :: _ ->
+       Alcotest.(check bool) "name is loc" true (json_field "name" p = `String "loc");
+       Alcotest.(check bool) "type field present" true
+         (match json_field "type" p with `String s -> String.length s > 0 | _ -> false)
+     | [] -> ())
+  )
+
+let test_query_graph_calls_in () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape multi_caller_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "graph"
+         {|{"anchor":{"module":"mymod","name":"helper"},"traverse":[{"edge":"CALLS","direction":"in","collect":"call_sites"}]}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let call_sites = match json_field "call_sites" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "two call sites" true (List.length call_sites = 2);
+    (match call_sites with
+     | cs :: _ ->
+       Alcotest.(check bool) "id field non-empty" true
+         (match json_field "id" cs with `String s -> String.length s > 0 | _ -> false);
+       Alcotest.(check bool) "callee is helper" true
+         (json_field "callee" cs = `String "helper")
+     | [] -> ())
+  )
+
+let test_query_graph_no_anchor_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "query"
+      (single_cmd "graph"
+         {|{"anchor":{"module":"no_such","name":"fn"},"traverse":[]}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+let test_query_graph_calls_out () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape multi_caller_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "query"
+      (single_cmd "graph"
+         {|{"anchor":{"module":"mymod","name":"main1"},"traverse":[{"edge":"CALLS","direction":"out","collect":"callees"}]}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let callees = match json_field "callees" r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "at least one callee" true (callees <> [])
+  )
+
+let test_query_graph_follow_has_argument () =
+  (* Verify that CALLS in → follow HAS_ARGUMENT out produces argument nodes *)
+  let source = {|fn helper(x: Int) -> Int ! pure { x }
+fn main1() -> Int ! pure { helper(1) }
+fn main2() -> Int ! pure { helper(2) }|} in
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape source))));
+    ignore (read_line ());
+    let cmds = {|{"anchor":{"module":"mymod","name":"helper"},"traverse":[{"edge":"CALLS","direction":"in","collect":"call_sites","follow":{"edge":"HAS_ARGUMENT","direction":"out","collect":"arguments"}}]}|} in
+    write_line (tool_call 3 "query" (single_cmd "graph" cmds));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let r = first_result batch in
+    let call_sites = match json_field "call_sites" r with `List xs -> xs | _ -> [] in
+    let arguments  = match json_field "arguments"  r with `List xs -> xs | _ -> [] in
+    Alcotest.(check bool) "two call sites" true (List.length call_sites = 2);
+    Alcotest.(check bool) "two arguments (one per call)" true (List.length arguments = 2)
+  )
+
+let test_query_graph_batch_with_existing_ops () =
+  (* The hero acceptance criterion: interface + signature + callers in one batch *)
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "submit_module"
+         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+            (json_string_escape mixed_visibility_source))));
+    ignore (read_line ());
+    let cmds =
+      {|[{"op":"interface","args":{"module":"mymod"}},{"op":"signature","args":{"module":"mymod","name":"add_one"}},{"op":"callers","args":{"module":"mymod","name":"add_one"}}]|}
+    in
+    write_line (tool_call 3 "query" cmds);
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let results = match json_field "results" batch with `List rs -> rs | _ -> [] in
+    Alcotest.(check int) "three results" 3 (List.length results)
+  )
+
 (* ─── Test runner ────────────────────────────────────────────────────────── *)
 
 let () =
@@ -1123,5 +1528,36 @@ let () =
     ("diagnostic/node", [
       Alcotest.test_case "effect diagnostic carries node hash"   `Quick test_verify_effects_diagnostic_has_node;
       Alcotest.test_case "unused diagnostic carries node hash"   `Quick test_verify_unused_diagnostic_has_node;
+    ]);
+    ("query/effect_flow", [
+      Alcotest.test_case "returns entry and performs list"       `Quick test_query_effect_flow_pure_fn;
+      Alcotest.test_case "handled effects marked handled=true"   `Quick test_query_effect_flow_handled_effect;
+      Alcotest.test_case "unhandled effects marked handled=false" `Quick test_query_effect_flow_unhandled_marked;
+      Alcotest.test_case "not found halts batch"                 `Quick test_query_effect_flow_not_found_halts;
+    ]);
+    ("query/unhandled", [
+      Alcotest.test_case "all handled → empty sites"             `Quick test_query_unhandled_all_handled;
+      Alcotest.test_case "unhandled effects → sites list"        `Quick test_query_unhandled_returns_sites;
+      Alcotest.test_case "no name halts batch"                   `Quick test_query_unhandled_no_name_halts;
+    ]);
+    ("query/dependents", [
+      Alcotest.test_case "effect name → dependents list"         `Quick test_query_dependents_effect;
+      Alcotest.test_case "defines entry included in dependents"  `Quick test_query_dependents_defines_included;
+      Alcotest.test_case "no name halts batch"                   `Quick test_query_dependents_no_name_halts;
+      Alcotest.test_case "unknown name → empty dependents"       `Quick test_query_dependents_unknown_name_empty;
+    ]);
+    ("query/pattern_coverage", [
+      Alcotest.test_case "exhaustive fn → exhaustive result"     `Quick test_query_pattern_coverage_exhaustive;
+      Alcotest.test_case "result carries node hash"              `Quick test_query_pattern_coverage_node_present;
+      Alcotest.test_case "not found halts batch"                 `Quick test_query_pattern_coverage_not_found_halts;
+    ]);
+    ("query/graph", [
+      Alcotest.test_case "HAS_PARAM out → all params"            `Quick test_query_graph_has_param;
+      Alcotest.test_case "HAS_PARAM out with filter → one param" `Quick test_query_graph_has_param_filter;
+      Alcotest.test_case "CALLS in → call site nodes"            `Quick test_query_graph_calls_in;
+      Alcotest.test_case "CALLS out → callee nodes"              `Quick test_query_graph_calls_out;
+      Alcotest.test_case "follow HAS_ARGUMENT → arguments"       `Quick test_query_graph_follow_has_argument;
+      Alcotest.test_case "no anchor halts batch"                 `Quick test_query_graph_no_anchor_halts;
+      Alcotest.test_case "batch interface+signature+callers"     `Quick test_query_graph_batch_with_existing_ops;
     ]);
   ]

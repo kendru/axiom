@@ -1437,72 +1437,177 @@ let dispatch_query state cmd =
 
 (* ─── Write tool ─────────────────────────────────────────────────────────── *)
 
-(* After storing a module, run all verify passes and collect diagnostics. *)
-let post_write_verify ms =
+(* Encode an AST to root hash + per-decl hashes. *)
+let encode_ast state ast =
+  let enc  = Node_store.as_encoding_store state.node_store in
+  let root = Node_encoding.encode_program enc ast in
+  let root_hash = bytes_to_hex root in
+  let enc2 = Node_store.as_encoding_store state.node_store in
+  let decl_hashes = Hashtbl.create 16 in
+  List.iter (fun decl ->
+    match decl_name decl with
+    | Some n -> Hashtbl.replace decl_hashes n
+                  (bytes_to_hex (Node_encoding.encode_decl enc2 decl))
+    | None   -> ()) ast;
+  (root_hash, decl_hashes)
+
+(* Build the {root, nodes} result object from encoded hashes. *)
+let make_write_result root_hash decl_hashes =
+  let nodes_list   = Hashtbl.fold (fun n h acc -> (n, String h) :: acc) decl_hashes [] in
+  let nodes_sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) nodes_list in
+  Object [("root", String root_hash); ("nodes", Object nodes_sorted)]
+
+(* Store a module, persisting the source. *)
+let store_module state name source ms =
+  Hashtbl.replace state.modules name ms;
+  Hashtbl.replace state.sources name source;
+  save_module_registry state.store_dir state.sources
+
+(* Run the post-batch verification checks on all modules in state.
+   Handles "exhaustive" and "unused"; "types" is implicit (checked per-command);
+   "effects" is skipped without an entry point. *)
+let run_post_batch_verify state verify_checks =
   let diags = ref [] in
-  (* match exhaustiveness warnings *)
-  List.iter (fun (w : Typechecker.match_warning) ->
-    let msg = Printf.sprintf "Non-exhaustive match; missing: %s"
-        (String.concat ", " w.mw_missing) in
-    let node = match w.mw_fn_name with
-      | Some fn -> (match Hashtbl.find_opt ms.decl_hashes fn with
-          | Some h -> h | None -> ms.root_hash)
-      | None -> ms.root_hash
-    in
-    diags := !diags @ [Mcp_types.make_warning
-        ~node
-        ~location:(make_loc w.mw_line w.mw_col)
-        "match/non-exhaustive" msg]
-  ) (Typechecker.collect_match_warnings ms.typed_ast);
-  (* unused declarations *)
-  List.iter (fun (u : Typechecker.unused_item) ->
-    let node = Hashtbl.find_opt ms.decl_hashes u.ui_name in
-    let msg = Printf.sprintf "Unused %s '%s'" u.ui_kind u.ui_name in
-    diags := !diags @ [Mcp_types.make_warning
-        ?node
-        ~location:(make_loc u.ui_line u.ui_col)
-        "decl/unused" msg]
-  ) (Typechecker.collect_unused ms.typed_ast);
+  Hashtbl.iter (fun _name ms ->
+    if List.mem "exhaustive" verify_checks then
+      List.iter (fun (w : Typechecker.match_warning) ->
+        let msg  = Printf.sprintf "Non-exhaustive match; missing: %s"
+                     (String.concat ", " w.mw_missing) in
+        let node = match w.mw_fn_name with
+          | Some fn -> (match Hashtbl.find_opt ms.decl_hashes fn with
+              | Some h -> h | None -> ms.root_hash)
+          | None -> ms.root_hash
+        in
+        diags := !diags @ [Mcp_types.make_warning ~node
+                             ~location:(make_loc w.mw_line w.mw_col)
+                             "match/non-exhaustive" msg]
+      ) (Typechecker.collect_match_warnings ms.typed_ast);
+    if List.mem "unused" verify_checks then
+      List.iter (fun (u : Typechecker.unused_item) ->
+        let node = Hashtbl.find_opt ms.decl_hashes u.ui_name in
+        let msg  = Printf.sprintf "Unused %s '%s'" u.ui_kind u.ui_name in
+        diags := !diags @ [Mcp_types.make_warning ?node
+                             ~location:(make_loc u.ui_line u.ui_col)
+                             "decl/unused" msg]
+      ) (Typechecker.collect_unused ms.typed_ast)
+  ) state.modules;
   !diags
 
 let dispatch_write state cmd =
   let op   = match obj_get "op"   cmd with String s -> s | _ -> "" in
   let args = obj_get "args" cmd in
   match op with
-  | "submit_module" ->
-    let source      = match obj_get "source"      args with String s -> s | _ -> "" in
-    let module_name = match obj_get "module_name" args with String s -> s | _ -> "" in
-    (try
-       let tokens    = Lexer.tokenize source in
-       let ast       = Parser.parse_program tokens in
-       let (type_env, effect_env) = Typechecker.check_program ast in
-       let enc       = Node_store.as_encoding_store state.node_store in
-       let root      = Node_encoding.encode_program enc ast in
-       let root_hash = bytes_to_hex root in
-       let enc2      = Node_store.as_encoding_store state.node_store in
-       let decl_hashes = Hashtbl.create 16 in
-       List.iter (fun decl ->
-         match decl_name decl with
-         | Some n ->
-           let h = Node_encoding.encode_decl enc2 decl in
-           Hashtbl.replace decl_hashes n (bytes_to_hex h)
-         | None -> ()
-       ) ast;
-       let ms = { typed_ast = ast; type_env; effect_env; root_hash; decl_hashes } in
-       Hashtbl.replace state.modules module_name ms;
-       (* Persist source so the module survives a server restart. *)
-       Hashtbl.replace state.sources module_name source;
-       save_module_registry state.store_dir state.sources;
-       let verify_diags = post_write_verify ms in
-       let nodes_list = Hashtbl.fold (fun name hash acc ->
-           (name, String hash) :: acc) decl_hashes [] in
-       let nodes_sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) nodes_list in
-       Cmd_success (Object [
-           ("root",  String root_hash);
-           ("nodes", Object nodes_sorted);
-         ], verify_diags)
-     with Failure msg ->
-       Cmd_halt (Mcp_types.make_error "parse/error" msg))
+
+  (* ── module: parse + elaborate + store a full working-form module ──────── *)
+  | "module" ->
+    let name   = match obj_get "name"   args with String s -> s | _ -> "" in
+    let source = match obj_get "source" args with String s -> s | _ -> "" in
+    if name = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "module op requires a non-empty 'name' field")
+    else
+    let parse_result =
+      try let tokens = Lexer.tokenize source in
+          Ok (Parser.parse_program tokens)
+      with Failure msg -> Error msg
+    in
+    (match parse_result with
+     | Error msg -> Cmd_halt (Mcp_types.make_error "parse/error" msg)
+     | Ok ast ->
+       let (root_hash, decl_hashes) = encode_ast state ast in
+       let result = make_write_result root_hash decl_hashes in
+       let type_result =
+         try Ok (Typechecker.check_program ast) with Failure msg -> Error msg
+       in
+       (match type_result with
+        | Error msg ->
+          let ms = { typed_ast = ast; type_env = []; effect_env = [];
+                     root_hash; decl_hashes } in
+          store_module state name source ms;
+          Cmd_success (result, [Mcp_types.make_error "type/error" msg])
+        | Ok (type_env, effect_env) ->
+          let ms = { typed_ast = ast; type_env; effect_env; root_hash; decl_hashes } in
+          store_module state name source ms;
+          Cmd_success (result, [])))
+
+  (* ── function: add / replace a single declaration in an existing module ── *)
+  | "function" ->
+    let module_name = match obj_get "module" args with String s -> s | _ -> "" in
+    let source      = match obj_get "source" args with String s -> s | _ -> "" in
+    (match Hashtbl.find_opt state.modules module_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" module_name))
+     | Some ms ->
+       let parse_result =
+         try let tokens = Lexer.tokenize source in
+             Ok (Parser.parse_program tokens)
+         with Failure msg -> Error msg
+       in
+       (match parse_result with
+        | Error msg -> Cmd_halt (Mcp_types.make_error "parse/error" msg)
+        | Ok new_decls ->
+          let new_names  = List.filter_map decl_name new_decls in
+          let kept       = List.filter (fun d ->
+            match decl_name d with
+            | Some n -> not (List.mem n new_names)
+            | None   -> true) ms.typed_ast in
+          let combined   = kept @ new_decls in
+          let (root_hash, decl_hashes) = encode_ast state combined in
+          let result     = make_write_result root_hash decl_hashes in
+          let type_result =
+            try Ok (Typechecker.check_program combined) with Failure msg -> Error msg
+          in
+          let new_source = Printer.print_program combined in
+          (match type_result with
+           | Error msg ->
+             let updated = { typed_ast = combined; root_hash; decl_hashes;
+                             type_env = []; effect_env = [] } in
+             store_module state module_name new_source updated;
+             Cmd_success (result, [Mcp_types.make_error "type/error" msg])
+           | Ok (type_env, effect_env) ->
+             let updated = { typed_ast = combined; type_env; effect_env;
+                             root_hash; decl_hashes } in
+             store_module state module_name new_source updated;
+             Cmd_success (result, []))))
+
+  (* ── replace: substitute the declaration identified by anchor ─────────── *)
+  | "replace" ->
+    let anchor_json = obj_get "anchor" args in
+    let source      = match obj_get "source" args with String s -> s | _ -> "" in
+    (match resolve_anchor state anchor_json with
+     | Error d -> Cmd_halt d
+     | Ok (module_name, decl_n, ms) ->
+       let parse_result =
+         try let tokens = Lexer.tokenize source in
+             Ok (Parser.parse_program tokens)
+         with Failure msg -> Error msg
+       in
+       (match parse_result with
+        | Error msg -> Cmd_halt (Mcp_types.make_error "parse/error" msg)
+        | Ok new_decls ->
+          let without_old = List.filter (fun d ->
+            match decl_name d with
+            | Some n -> n <> decl_n
+            | None   -> true) ms.typed_ast in
+          let new_ast  = without_old @ new_decls in
+          let (root_hash, decl_hashes) = encode_ast state new_ast in
+          let result   = make_write_result root_hash decl_hashes in
+          let type_result =
+            try Ok (Typechecker.check_program new_ast) with Failure msg -> Error msg
+          in
+          let new_source = Printer.print_program new_ast in
+          (match type_result with
+           | Error msg ->
+             let updated = { typed_ast = new_ast; root_hash; decl_hashes;
+                             type_env = []; effect_env = [] } in
+             store_module state module_name new_source updated;
+             Cmd_success (result, [Mcp_types.make_error "type/error" msg])
+           | Ok (type_env, effect_env) ->
+             let updated = { typed_ast = new_ast; type_env; effect_env;
+                             root_hash; decl_hashes } in
+             store_module state module_name new_source updated;
+             Cmd_success (result, []))))
 
   | _ ->
     Cmd_halt (Mcp_types.make_error "command/unknown"
@@ -1663,9 +1768,12 @@ let tool_write_schema =
   Object [
     ("name", String "write");
     ("description", String
-       "Submit working-form Axiom source; elaborate, typecheck, store, and \
-        automatically verify the resulting state.  Accepts a batch of commands.");
-    ("inputSchema", batch_input_schema ["submit_module"]);
+       "Author working-form Axiom source; elaborate, typecheck, store, and \
+        automatically verify the resulting project state.  Accepts a batch of \
+        commands followed by an optional 'verify' array \
+        (default: [\"types\",\"effects\",\"exhaustive\"]).  \
+        Parse errors halt the batch; type/effect diagnostics are recoverable.");
+    ("inputSchema", batch_input_schema ["module"; "function"; "replace"]);
   ]
 
 let tool_transform_schema =
@@ -1727,8 +1835,14 @@ let handle state msg =
        send (response id (wrap_batch_result
            (batch_execute (dispatch_query state) cmds)))
      | "write" ->
-       send (response id (wrap_batch_result
-           (batch_execute (dispatch_write state) cmds)))
+       let verify_checks = match obj_get "verify" args with
+         | Array vs -> List.filter_map (function String s -> Some s | _ -> None) vs
+         | _        -> ["types"; "effects"; "exhaustive"]
+       in
+       let br        = batch_execute (dispatch_write state) cmds in
+       let post_diags = run_post_batch_verify state verify_checks in
+       let br'       = { br with br_diagnostics = br.br_diagnostics @ post_diags } in
+       send (response id (wrap_batch_result br'))
      | "transform" ->
        send (response id (wrap_batch_result
            (batch_execute (dispatch_transform state) cmds)))

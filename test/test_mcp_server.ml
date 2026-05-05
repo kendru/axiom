@@ -365,22 +365,22 @@ let test_verify_types_does_not_update_state () =
     ignore (read_line ());
     (* write well-typed source — must still succeed *)
     write_line (tool_call 3 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"test"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"test"}|}
             (json_string_escape well_typed_source))));
     let batch = parse_batch_response (read_line ()) in
     Alcotest.(check bool) "write succeeds" true (batch_ok batch)
   )
 
-(* ─── write / submit_module ─────────────────────────────────────────────── *)
+(* ─── write / module ────────────────────────────────────────────────────── *)
 
 let test_write_submit_returns_root_and_nodes () =
   let (write_line, read_line, close) = start_server () in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape well_typed_source))));
     let batch = parse_batch_response (read_line ()) in
     Alcotest.(check bool) "batch ok" true (batch_ok batch);
@@ -407,8 +407,8 @@ fn bar(x: Int) -> Int ! pure { x }|} in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape source))));
     let batch = parse_batch_response (read_line ()) in
     Alcotest.(check bool) "batch ok" true (batch_ok batch);
@@ -424,8 +424,8 @@ let test_write_parse_error_halts () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         {|{"source":"@@@invalid@@@","module_name":"mymod"}|}));
+      (single_cmd "module"
+         {|{"source":"@@@invalid@@@","name":"mymod"}|}));
     let batch = parse_batch_response (read_line ()) in
     Alcotest.(check bool) "batch halted" true (not (batch_ok batch));
     let diags = batch_diagnostics batch in
@@ -444,8 +444,8 @@ let test_query_signature_success () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape well_typed_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -465,8 +465,8 @@ let test_query_signature_by_hash () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape well_typed_source))));
     let submit_batch = parse_batch_response (read_line ()) in
     let double_hash = match json_field "nodes" (first_result submit_batch) with
@@ -503,8 +503,8 @@ let test_query_signature_function_not_found () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape well_typed_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -522,8 +522,8 @@ let test_query_interface_returns_only_pub () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape mixed_visibility_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -542,8 +542,8 @@ let test_query_interface_fn_has_no_body () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape mixed_visibility_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -575,8 +575,8 @@ let test_verify_exhaustive_node_is_fn_hash () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape exhaustive_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -592,8 +592,8 @@ let test_verify_exhaustive_no_warnings () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape exhaustive_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -620,8 +620,8 @@ let test_verify_effects_all_handled () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_all_handled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -636,8 +636,8 @@ let test_verify_effects_unhandled () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_unhandled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -672,8 +672,8 @@ let test_verify_effects_entry_not_found () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_all_handled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -689,8 +689,8 @@ let test_verify_unused_all_used () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape all_used_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -705,8 +705,8 @@ let test_verify_unused_one_unused () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape one_unused_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -733,8 +733,8 @@ let test_verify_unused_pub_not_flagged () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape pub_unused_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -748,8 +748,8 @@ let test_verify_unused_mutual_recursion_both_reachable () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape mutual_recursion_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -764,8 +764,8 @@ let test_verify_unused_mutual_recursion_both_unreachable () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape mutual_both_unused_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -802,8 +802,8 @@ let test_query_effects_pure_module () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape pure_module_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -820,8 +820,8 @@ let test_query_effects_single_effect () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape single_effect_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -843,8 +843,8 @@ let test_query_effects_multi_effect () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape multi_effect_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -874,8 +874,8 @@ let test_query_callers_multiple_callers () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape multi_caller_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -907,8 +907,8 @@ fn main2() -> Int ! pure { helper(2) }|} in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -932,8 +932,8 @@ let test_query_callers_uncalled_function () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape uncalled_fn_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -960,8 +960,8 @@ let test_query_callers_function_not_defined () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape multi_caller_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -977,8 +977,8 @@ let test_batch_multi_command_all_succeed () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape well_typed_source))));
     ignore (read_line ());
     (* Two query commands in one batch *)
@@ -997,8 +997,8 @@ let test_batch_halts_at_first_unrecoverable () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape well_typed_source))));
     ignore (read_line ());
     (* First command fails (module not found), second would succeed *)
@@ -1021,8 +1021,8 @@ let test_verify_effects_diagnostic_has_node () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_unhandled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -1041,8 +1041,8 @@ let test_verify_unused_diagnostic_has_node () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape one_unused_source))));
     ignore (read_line ());
     write_line (tool_call 3 "verify"
@@ -1063,8 +1063,8 @@ let test_query_effect_flow_pure_fn () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_all_handled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1084,8 +1084,8 @@ let test_query_effect_flow_handled_effect () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_all_handled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1105,8 +1105,8 @@ let test_query_effect_flow_unhandled_marked () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_unhandled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1138,8 +1138,8 @@ let test_query_unhandled_all_handled () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_all_handled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1156,8 +1156,8 @@ let test_query_unhandled_returns_sites () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape effects_unhandled_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1193,8 +1193,8 @@ let test_query_dependents_effect () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape single_effect_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1213,8 +1213,8 @@ let test_query_dependents_defines_included () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape single_effect_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1243,8 +1243,8 @@ let test_query_dependents_unknown_name_empty () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape pure_module_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1264,8 +1264,8 @@ let test_query_pattern_coverage_exhaustive () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape exhaustive_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1287,8 +1287,8 @@ let test_query_pattern_coverage_node_present () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape exhaustive_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1317,8 +1317,8 @@ let test_query_graph_has_param () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1341,8 +1341,8 @@ let test_query_graph_has_param_filter () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1366,8 +1366,8 @@ let test_query_graph_calls_in () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape multi_caller_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1403,8 +1403,8 @@ let test_query_graph_calls_out () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape multi_caller_source))));
     ignore (read_line ());
     write_line (tool_call 3 "query"
@@ -1426,8 +1426,8 @@ fn main2() -> Int ! pure { helper(2) }|} in
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape source))));
     ignore (read_line ());
     let cmds = {|{"anchor":{"module":"mymod","name":"helper"},"traverse":[{"edge":"CALLS","direction":"in","collect":"call_sites","follow":{"edge":"HAS_ARGUMENT","direction":"out","collect":"arguments"}}]}|} in
@@ -1447,8 +1447,8 @@ let test_query_graph_batch_with_existing_ops () =
   Fun.protect ~finally:close (fun () ->
     initialize write_line read_line;
     write_line (tool_call 2 "write"
-      (single_cmd "submit_module"
-         (Printf.sprintf {|{"source":"%s","module_name":"mymod"}|}
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
             (json_string_escape mixed_visibility_source))));
     ignore (read_line ());
     let cmds =
@@ -1459,6 +1459,220 @@ let test_query_graph_batch_with_existing_ops () =
     Alcotest.(check bool) "batch ok" true (batch_ok batch);
     let results = match json_field "results" batch with `List rs -> rs | _ -> [] in
     Alcotest.(check int) "three results" 3 (List.length results)
+  )
+
+(* ─── write / module: type errors are recoverable ───────────────────────── *)
+
+let test_write_module_type_error_recoverable () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape ill_typed_source))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch NOT halted (recoverable)" true (batch_ok batch);
+    let r = first_result batch in
+    Alcotest.(check bool) "root hash present" true
+      (match json_field "root" r with `String s -> String.length s > 0 | _ -> false);
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "type error diagnostic present" true (diags <> []);
+    (match diags with
+     | d :: _ ->
+       Alcotest.(check bool) "severity is error" true
+         (json_field "severity" d = `String "error");
+       Alcotest.(check bool) "code starts with type/" true
+         (match json_field "code" d with
+          | `String s -> contains_substring s "type/" | _ -> false)
+     | [] -> ())
+  )
+
+let test_write_module_type_error_then_good_module () =
+  (* A type error in a module op must not halt the batch;
+     a subsequent module op in the same batch must still execute. *)
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    let cmds = Printf.sprintf
+      {|[{"op":"module","args":{"source":"%s","name":"bad"}},{"op":"module","args":{"source":"%s","name":"good"}}]|}
+      (json_string_escape ill_typed_source)
+      (json_string_escape well_typed_source)
+    in
+    write_line (tool_call 2 "write" cmds);
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok (type error is recoverable)" true (batch_ok batch);
+    let results = match json_field "results" batch with `List rs -> rs | _ -> [] in
+    Alcotest.(check int) "two results — both commands ran" 2 (List.length results)
+  )
+
+(* ─── write / function ───────────────────────────────────────────────────── *)
+
+let test_write_function_adds_decl () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    let new_fn = {|fn triple(x: Int) -> Int ! pure { add(x, add(x, x)) }|} in
+    write_line (tool_call 3 "write"
+      (single_cmd "function"
+         (Printf.sprintf {|{"module":"mymod","source":"%s"}|}
+            (json_string_escape new_fn))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let nodes = json_field "nodes" (first_result batch) in
+    Alcotest.(check bool) "original fn still present" true
+      (match nodes with `Assoc fs -> List.mem_assoc "double" fs | _ -> false);
+    Alcotest.(check bool) "new fn present" true
+      (match nodes with `Assoc fs -> List.mem_assoc "triple" fs | _ -> false)
+  )
+
+let test_write_function_replaces_existing_decl () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    let updated_fn = {|fn double(x: Int) -> Int ! pure { add(x, x) }|} in
+    write_line (tool_call 3 "write"
+      (single_cmd "function"
+         (Printf.sprintf {|{"module":"mymod","source":"%s"}|}
+            (json_string_escape updated_fn))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let nodes = json_field "nodes" (first_result batch) in
+    Alcotest.(check bool) "double still in nodes" true
+      (match nodes with `Assoc fs -> List.mem_assoc "double" fs | _ -> false)
+  )
+
+let test_write_function_module_not_found_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "function"
+         {|{"module":"nonexistent","source":"fn f(x: Int) -> Int ! pure { x }"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+let test_write_function_parse_error_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "write"
+      (single_cmd "function" {|{"module":"mymod","source":"@@@bad@@@"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted on parse error" true (not (batch_ok batch))
+  )
+
+(* ─── write / replace ────────────────────────────────────────────────────── *)
+
+let test_write_replace_by_name () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    let new_body = {|fn double(x: Int) -> Int ! pure { add(x, x) }|} in
+    write_line (tool_call 3 "write"
+      (single_cmd "replace"
+         (Printf.sprintf {|{"anchor":{"module":"mymod","name":"double"},"source":"%s"}|}
+            (json_string_escape new_body))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let nodes = json_field "nodes" (first_result batch) in
+    Alcotest.(check bool) "double still in nodes" true
+      (match nodes with `Assoc fs -> List.mem_assoc "double" fs | _ -> false)
+  )
+
+let test_write_replace_by_hash () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    let init_batch = parse_batch_response (read_line ()) in
+    let double_hash = match json_field "nodes" (first_result init_batch) with
+      | `Assoc fs ->
+        (match List.assoc_opt "double" fs with Some (`String h) -> h | _ -> "")
+      | _ -> ""
+    in
+    Alcotest.(check bool) "got double hash" true (String.length double_hash > 0);
+    let new_body = {|fn double(x: Int) -> Int ! pure { add(x, x) }|} in
+    write_line (tool_call 3 "write"
+      (single_cmd "replace"
+         (Printf.sprintf {|{"anchor":{"hash":"%s"},"source":"%s"}|}
+            double_hash (json_string_escape new_body))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok after hash-anchored replace" true (batch_ok batch)
+  )
+
+let test_write_replace_anchor_not_found_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "replace"
+         {|{"anchor":{"module":"no_such","name":"fn"},"source":"fn fn() -> Unit ! pure { () }"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted" true (not (batch_ok batch))
+  )
+
+(* ─── write: post-batch verify ───────────────────────────────────────────── *)
+
+let test_write_post_verify_unused_default () =
+  (* The default verify array includes "exhaustive" but NOT "unused", so
+     an unused function in the module should NOT appear in diagnostics
+     unless "unused" is explicitly requested. *)
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape one_unused_source))));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let diags = batch_diagnostics batch in
+    let has_unused = List.exists (fun d ->
+      json_field "code" d = `String "decl/unused") diags in
+    Alcotest.(check bool) "no unused diagnostic with default verify" false has_unused
+  )
+
+let test_write_post_verify_unused_explicit () =
+  (* When verify includes "unused", unused declarations are flagged. *)
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    let req = Printf.sprintf
+      {|{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write","arguments":{"commands":[{"op":"module","args":{"source":"%s","name":"mymod"}}],"verify":["unused"]}}}|}
+      (json_string_escape one_unused_source)
+    in
+    write_line req;
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let diags = batch_diagnostics batch in
+    let has_unused = List.exists (fun d ->
+      json_field "code" d = `String "decl/unused") diags in
+    Alcotest.(check bool) "unused diagnostic present" true has_unused
   )
 
 (* ─── Test runner ────────────────────────────────────────────────────────── *)
@@ -1473,10 +1687,27 @@ let () =
       Alcotest.test_case "ill-typed source → error diagnostics"  `Quick test_verify_types_ill_typed;
       Alcotest.test_case "does not update server state"          `Quick test_verify_types_does_not_update_state;
     ]);
-    ("write/submit_module", [
+    ("write/module", [
       Alcotest.test_case "returns root hash and nodes map"       `Quick test_write_submit_returns_root_and_nodes;
       Alcotest.test_case "nodes map contains all declarations"   `Quick test_write_submit_nodes_map_all_decls;
       Alcotest.test_case "parse error halts batch"               `Quick test_write_parse_error_halts;
+      Alcotest.test_case "type error is recoverable diagnostic"  `Quick test_write_module_type_error_recoverable;
+      Alcotest.test_case "type error allows next command"        `Quick test_write_module_type_error_then_good_module;
+    ]);
+    ("write/function", [
+      Alcotest.test_case "adds new decl to existing module"      `Quick test_write_function_adds_decl;
+      Alcotest.test_case "replaces existing decl of same name"   `Quick test_write_function_replaces_existing_decl;
+      Alcotest.test_case "module not found halts batch"          `Quick test_write_function_module_not_found_halts;
+      Alcotest.test_case "parse error halts batch"               `Quick test_write_function_parse_error_halts;
+    ]);
+    ("write/replace", [
+      Alcotest.test_case "replace by symbolic anchor"            `Quick test_write_replace_by_name;
+      Alcotest.test_case "replace by hash anchor"                `Quick test_write_replace_by_hash;
+      Alcotest.test_case "anchor not found halts batch"          `Quick test_write_replace_anchor_not_found_halts;
+    ]);
+    ("write/post-verify", [
+      Alcotest.test_case "unused not checked without verify:unused" `Quick test_write_post_verify_unused_default;
+      Alcotest.test_case "verify:unused flags unused decls"         `Quick test_write_post_verify_unused_explicit;
     ]);
     ("query/signature", [
       Alcotest.test_case "returns signature and node hash"       `Quick test_query_signature_success;

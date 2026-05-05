@@ -272,6 +272,16 @@ and compile_eexpr ?(tail=false) ctx e =
     let (tag, _) = List.assoc name ctx.ctor_map in
     compile_ctor ctx tag args
 
+  (* Module-qualified function call: mod.fn(args) *)
+  | EApp ({ edesc = EProject ({ edesc = EVar mod_name; _ }, fn_name); _ }, args) ->
+    let qualified = mod_name ^ "." ^ fn_name in
+    (match List.assoc_opt qualified ctx.func_map with
+     | Some idx ->
+       let arg_code = List.concat_map (compile_eexpr ctx) args in
+       arg_code @ [Call idx]
+     | None ->
+       failwith ("Codegen: unknown module function: " ^ qualified))
+
   (* General function call — may be a tail call *)
   | EApp ({ edesc = EVar name; _ }, args) ->
     (match List.assoc_opt name ctx.func_map with
@@ -502,20 +512,30 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
     ) prog
   in
   let fn_decls =
-    List.filter_map (fun (d : edecl) ->
+    let check_fn f =
+      let params_ok =
+        List.for_all (fun p -> is_supported_type p.Ast.param_type) f.params
+      in
+      let ret_ok =
+        match f.return_type with
+        | Some t -> is_supported_type t
+        | None   -> false
+      in
+      params_ok && ret_ok
+    in
+    let rec collect prefix (d : edecl) =
       match d.edecl_desc with
       | EDeclFn f ->
-        let params_ok =
-          List.for_all (fun p -> is_supported_type p.Ast.param_type) f.params
+        let f' = match prefix with
+          | None   -> f
+          | Some p -> { f with fn_name = p ^ "." ^ f.fn_name }
         in
-        let ret_ok =
-          match f.return_type with
-          | Some t -> is_supported_type t
-          | None   -> false
-        in
-        if params_ok && ret_ok then Some f else None
-      | _ -> None
-    ) eprog
+        if check_fn f' then [f'] else []
+      | EDeclModule { module_name; body; _ } ->
+        List.concat_map (collect (Some module_name)) body
+      | _ -> []
+    in
+    List.concat_map (collect None) eprog
   in
   let fn_entries =
     List.map (fun (f : edecl_fn) ->
@@ -536,7 +556,30 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
     ) fn_decls
   in
   let func_map =
-    List.map (fun (fn_name, idx, _, _) -> (fn_name, idx)) fn_entries
+    let base = List.map (fun (fn_name, idx, _, _) -> (fn_name, idx)) fn_entries in
+    (* For each "import M as A" declaration, add aliased entries so that
+       calls written as A.fn resolve to the same WASM function as M.fn. *)
+    let aliases =
+      List.filter_map (fun (d : Ast.decl) ->
+        match d.Ast.decl_desc with
+        | Ast.DeclImport { module_path; alias = Some a } -> Some (module_path, a)
+        | _ -> None
+      ) prog
+    in
+    List.fold_left (fun fm (module_path, alias) ->
+      let mpfx  = module_path ^ "." in
+      let apfx  = alias ^ "." in
+      let added = List.filter_map (fun (name, idx) ->
+        if String.length name > String.length mpfx
+           && String.sub name 0 (String.length mpfx) = mpfx
+        then
+          let fn_name = String.sub name (String.length mpfx)
+                          (String.length name - String.length mpfx) in
+          Some (apfx ^ fn_name, idx)
+        else None
+      ) fm in
+      fm @ added
+    ) base aliases
   in
   List.iter (fun (_, idx, param_tys, decl_body) ->
     let ctx =

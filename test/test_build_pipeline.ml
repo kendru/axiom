@@ -248,6 +248,59 @@ let test_main_returns_via_runtime src expected () =
       | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
 
 (* ------------------------------------------------------------------ *)
+(* Multi-file build helpers                                            *)
+(* ------------------------------------------------------------------ *)
+
+(** Create a temporary directory, write multiple source files into it, build
+    the named entry file, and run [f] on the resulting .wasm path. *)
+let with_tmp_dir f =
+  let dir = Filename.temp_file "axiom_multifile_" "" in
+  Sys.remove dir;
+  Unix.mkdir dir 0o700;
+  Fun.protect
+    (fun () -> f dir)
+    ~finally:(fun () ->
+      (* Remove all files in dir, then the dir itself. *)
+      (try
+         let entries = Sys.readdir dir in
+         Array.iter (fun name ->
+           (try Sys.remove (Filename.concat dir name) with _ -> ())
+         ) entries;
+         Unix.rmdir dir
+       with _ -> ()))
+
+let axiom_build_in_dir ~dir ~entry ~dst =
+  let src = Filename.concat dir entry in
+  axiom_build ~src ~dst
+
+let test_multifile_returns files entry expected () =
+  with_tmp_dir (fun dir ->
+    List.iter (fun (name, contents) ->
+      write_file (Filename.concat dir name) contents
+    ) files;
+    with_tmp_file ".wasm" (fun d ->
+      let rc = axiom_build_in_dir ~dir ~entry ~dst:d in
+      if rc <> 0 then Alcotest.fail "axiom build failed";
+      match execute_main d with
+      | Got n when n = expected -> ()
+      | Got n     -> Alcotest.failf "main returned %d, expected %d" n expected
+      | RunFail m -> Alcotest.fail ("execution failed: " ^ m)
+      | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
+
+let test_multifile_validates files entry () =
+  with_tmp_dir (fun dir ->
+    List.iter (fun (name, contents) ->
+      write_file (Filename.concat dir name) contents
+    ) files;
+    with_tmp_file ".wasm" (fun d ->
+      let rc = axiom_build_in_dir ~dir ~entry ~dst:d in
+      if rc <> 0 then Alcotest.fail "axiom build failed";
+      match validate_wasm d with
+      | Pass     -> ()
+      | Fail msg -> Alcotest.fail msg
+      | Skip msg -> Printf.printf "[SKIP] %s\n%!" msg))
+
+(* ------------------------------------------------------------------ *)
 (* Source fixtures                                                     *)
 (* ------------------------------------------------------------------ *)
 
@@ -1171,6 +1224,45 @@ let () =
             (test_main_returns_via_runtime src_perform_double 10)
         ; Alcotest.test_case "runtime: tail count(10) = 42" `Quick
             (test_main_returns_via_runtime src_tail_if 42)
+        ] )
+    ; ( "cross_file_import",
+        (* Issue #120: import X / import X as Y across files *)
+        [ Alcotest.test_case "validates: import lib.add"         `Quick
+            (test_multifile_validates
+               [ ("lib.axm",
+                  {|pub fn add(a: Int, b: Int) -> Int ! pure { add(a, b) }|})
+               ; ("app.axm",
+                  {|import lib
+fn main() -> Int ! pure { lib.add(10, 32) }|})
+               ]
+               "app.axm")
+        ; Alcotest.test_case "lib.add(10,32) = 42"               `Quick
+            (test_multifile_returns
+               [ ("lib.axm",
+                  {|pub fn add(a: Int, b: Int) -> Int ! pure { add(a, b) }|})
+               ; ("app.axm",
+                  {|import lib
+fn main() -> Int ! pure { lib.add(10, 32) }|})
+               ]
+               "app.axm" 42)
+        ; Alcotest.test_case "import alias: m.double(21) = 42"   `Quick
+            (test_multifile_returns
+               [ ("math.axm",
+                  {|pub fn double(x: Int) -> Int ! pure { add(x, x) }|})
+               ; ("app.axm",
+                  {|import math as m
+fn main() -> Int ! pure { m.double(21) }|})
+               ]
+               "app.axm" 42)
+        ; Alcotest.test_case "import missing file fails"          `Quick
+            (fun () ->
+               with_tmp_dir (fun dir ->
+                 write_file (Filename.concat dir "app.axm")
+                   {|import no_such_module
+fn main() -> Int ! pure { 0 }|};
+                 with_tmp_file ".wasm" (fun d ->
+                   let rc = axiom_build_in_dir ~dir ~entry:"app.axm" ~dst:d in
+                   Alcotest.(check bool) "non-zero exit" true (rc <> 0))))
         ] )
     ; ( "basics_e2e",
         (* Issue #45: 01_basics.axm end-to-end.  Wires together every

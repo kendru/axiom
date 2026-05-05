@@ -205,12 +205,15 @@ let fn_env_extend_let fn_env pat value =
   | _ -> fn_env
 
 (** Best-effort: extract the effects the callee expression requires.
-    Handles direct named references and immediate lambda applications;
-    returns [[]] for arbitrary higher-order expressions. *)
+    Handles direct named references, module-qualified references, and immediate
+    lambda applications; returns [[]] for arbitrary higher-order expressions. *)
 let effects_of_callee fn_env (e : Ast.expr) =
   match e.desc with
   | Var name ->
     (match List.assoc_opt name fn_env with Some es -> es | None -> [])
+  | Project ({ desc = Var mod_name; _ }, fn_name) ->
+    let qualified = mod_name ^ "." ^ fn_name in
+    (match List.assoc_opt qualified fn_env with Some es -> es | None -> [])
   | Fn { effects; _ } -> effects_of_set effects
   | _ -> []
 
@@ -361,14 +364,23 @@ let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env) (e : Ast.expr) : eexp
   | Project (e, field) ->
     eexpr (EProject (elaborate_expr fn_env ev_env e, field))
 
-(** Build a fn_env from a list of top-level (or module-level) declarations. *)
+(** Build a fn_env from a list of top-level (or module-level) declarations.
+    Functions inside [DeclModule] are included with their qualified name
+    ([module_name.fn_name]) so that module-qualified calls can thread evidence. *)
 let fn_env_of_decls decls =
-  List.filter_map (fun (d : Ast.decl) ->
+  let rec collect prefix (d : Ast.decl) =
     match d.decl_desc with
     | DeclFn { fn_name; effects; _ } ->
-      Some (fn_name, effects_of_set effects)
-    | _ -> None
-  ) decls
+      let name = match prefix with
+        | None   -> fn_name
+        | Some p -> p ^ "." ^ fn_name
+      in
+      [(name, effects_of_set effects)]
+    | DeclModule { module_name; body; _ } ->
+      List.concat_map (collect (Some module_name)) body
+    | _ -> []
+  in
+  List.concat_map (collect None) decls
 
 let rec elaborate_decl (fn_env : fn_env) (d : Ast.decl) : edecl =
   match d.decl_desc with

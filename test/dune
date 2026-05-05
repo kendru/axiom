@@ -51,7 +51,7 @@
 (test
  (name test_build_pipeline)
  (modules test_build_pipeline)
- (libraries axiom_lib alcotest)
+ (libraries axiom_lib alcotest unix)
  (action (setenv AXIOM_EXE %{exe:../bin/main.exe} (run %{test}))))
 
 (test

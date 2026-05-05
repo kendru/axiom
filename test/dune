@@ -59,3 +59,9 @@
  (modules test_mcp_server)
  (libraries alcotest unix)
  (action (setenv MCP_EXE %{exe:../bin/mcp_server.exe} (run %{test}))))
+
+(test
+ (name test_transforms)
+ (modules test_transforms)
+ (libraries alcotest unix)
+ (action (setenv MCP_EXE %{exe:../bin/mcp_server.exe} (run %{test}))))

@@ -1633,12 +1633,936 @@ let dispatch_write state cmd =
     Cmd_halt (Mcp_types.make_error "command/unknown"
       (Printf.sprintf "Unknown write op '%s'" op))
 
+(* ─── Transform helpers ──────────────────────────────────────────────────── *)
+
+let rec rename_in_type old_name new_name = function
+  | Ast.TyName s -> Ast.TyName (if s = old_name then new_name else s)
+  | Ast.TyApp (s, args) ->
+    Ast.TyApp ((if s = old_name then new_name else s),
+               List.map (rename_in_type old_name new_name) args)
+  | Ast.TyTuple ts ->
+    Ast.TyTuple (List.map (rename_in_type old_name new_name) ts)
+  | Ast.TyFun (ps, r, eff) ->
+    Ast.TyFun (List.map (rename_in_type old_name new_name) ps,
+               rename_in_type old_name new_name r,
+               Option.map (rename_in_eff_set old_name new_name) eff)
+
+and rename_in_eff_set old_name new_name = function
+  | Ast.Pure -> Ast.Pure
+  | Ast.Effects (ts, tail) ->
+    Ast.Effects (List.map (rename_in_type old_name new_name) ts, tail)
+
+let rec rename_in_expr old_name new_name e =
+  { e with Ast.desc = rename_in_expr_desc old_name new_name e.Ast.desc }
+
+and rename_in_expr_desc old_name new_name d = match d with
+  | Ast.Var s -> Ast.Var (if s = old_name then new_name else s)
+  | Ast.Let lb ->
+    Ast.Let { lb with
+              Ast.value = rename_in_expr old_name new_name lb.Ast.value;
+              body  = rename_in_expr old_name new_name lb.Ast.body }
+  | Ast.App (f, args) ->
+    Ast.App (rename_in_expr old_name new_name f,
+             List.map (rename_in_expr old_name new_name) args)
+  | Ast.Fn fn ->
+    Ast.Fn { Ast.params = List.map (fun p ->
+               { p with Ast.param_type =
+                          rename_in_type old_name new_name p.Ast.param_type }) fn.Ast.params;
+             return_type = Option.map (rename_in_type old_name new_name) fn.Ast.return_type;
+             effects = Option.map (rename_in_eff_set old_name new_name) fn.Ast.effects;
+             fn_body = rename_in_expr old_name new_name fn.Ast.fn_body }
+  | Ast.Match md ->
+    Ast.Match { Ast.scrutinee = rename_in_expr old_name new_name md.Ast.scrutinee;
+                arms = List.map (fun arm ->
+                  { arm with Ast.arm_body =
+                               rename_in_expr old_name new_name arm.Ast.arm_body }) md.Ast.arms }
+  | Ast.If id_ ->
+    Ast.If { Ast.cond  = rename_in_expr old_name new_name id_.Ast.cond;
+             then_ = rename_in_expr old_name new_name id_.Ast.then_;
+             else_ = rename_in_expr old_name new_name id_.Ast.else_ }
+  | Ast.Do stmts ->
+    Ast.Do (List.map (function
+      | Ast.StmtLet { pat; value } ->
+        Ast.StmtLet { pat; value = rename_in_expr old_name new_name value }
+      | Ast.StmtExpr e ->
+        Ast.StmtExpr (rename_in_expr old_name new_name e)) stmts)
+  | Ast.Letrec (bindings, body) ->
+    Ast.Letrec (
+      List.map (fun b ->
+        { b with
+          Ast.letrec_params = List.map (fun p ->
+            { p with Ast.param_type =
+                       rename_in_type old_name new_name p.Ast.param_type }) b.Ast.letrec_params;
+          letrec_return_type = rename_in_type old_name new_name b.Ast.letrec_return_type;
+          letrec_body = rename_in_expr old_name new_name b.Ast.letrec_body }) bindings,
+      rename_in_expr old_name new_name body)
+  | Ast.Record fields ->
+    Ast.Record (List.map (fun (f, e) -> (f, rename_in_expr old_name new_name e)) fields)
+  | Ast.RecordUpdate (base, fields) ->
+    Ast.RecordUpdate (rename_in_expr old_name new_name base,
+                      List.map (fun (f, e) -> (f, rename_in_expr old_name new_name e)) fields)
+  | Ast.Project (e, f) -> Ast.Project (rename_in_expr old_name new_name e, f)
+  | Ast.Perform pd ->
+    Ast.Perform { pd with
+                  Ast.effect_name =
+                    (if pd.Ast.effect_name = old_name then new_name else pd.Ast.effect_name);
+                  args = List.map (rename_in_expr old_name new_name) pd.Ast.args }
+  | Ast.Handle hd ->
+    Ast.Handle { Ast.handled = rename_in_expr old_name new_name hd.Ast.handled;
+                 handlers = List.map (fun h ->
+                   { Ast.effect_handler =
+                       (if h.Ast.effect_handler = old_name then new_name
+                        else h.Ast.effect_handler);
+                     op_handlers = List.map (fun op ->
+                       { op with Ast.op_handler_body =
+                                   rename_in_expr old_name new_name op.Ast.op_handler_body }
+                     ) h.Ast.op_handlers;
+                     return_handler = Option.map (fun r ->
+                       { r with Ast.return_body =
+                                  rename_in_expr old_name new_name r.Ast.return_body }
+                     ) h.Ast.return_handler }
+                 ) hd.Ast.handlers }
+  | x -> x
+
+let rec rename_in_decl old_name new_name d =
+  let desc' = match d.Ast.decl_desc with
+    | Ast.DeclFn { pub; fn_name; type_params; params; return_type; effects; decl_body } ->
+      Ast.DeclFn {
+        pub; type_params;
+        fn_name = (if fn_name = old_name then new_name else fn_name);
+        params = List.map (fun p ->
+          { p with Ast.param_type = rename_in_type old_name new_name p.Ast.param_type }) params;
+        return_type = Option.map (rename_in_type old_name new_name) return_type;
+        effects = Option.map (rename_in_eff_set old_name new_name) effects;
+        decl_body = rename_in_expr old_name new_name decl_body }
+    | Ast.DeclType { pub; type_name; type_params; ctors } ->
+      Ast.DeclType { pub; type_params; ctors;
+        type_name = (if type_name = old_name then new_name else type_name) }
+    | Ast.DeclEffect { pub; effect_name; type_params; ops } ->
+      Ast.DeclEffect { pub; type_params; ops;
+        effect_name = (if effect_name = old_name then new_name else effect_name) }
+    | Ast.DeclModule { pub; module_name; body } ->
+      Ast.DeclModule { pub; module_name;
+        body = List.map (rename_in_decl old_name new_name) body }
+    | Ast.DeclImport { module_path; alias } ->
+      Ast.DeclImport { module_path;
+        alias = (match alias with Some a when a = old_name -> Some new_name | a -> a) }
+    | d -> d
+  in
+  { d with Ast.decl_desc = desc' }
+
+(* Re-encode, re-typecheck, and store a module; returns (new_ms, old_hashes, type_diags). *)
+let update_module_ast state mod_name new_ast =
+  let old_hashes = match Hashtbl.find_opt state.modules mod_name with
+    | None    -> Hashtbl.create 0
+    | Some ms -> ms.decl_hashes
+  in
+  let (root_hash, decl_hashes) = encode_ast state new_ast in
+  let new_source = Printer.print_program new_ast in
+  let (ms, type_diags) = match
+    (try Ok (Typechecker.check_program new_ast) with Failure msg -> Error msg)
+  with
+    | Ok (type_env, effect_env) ->
+      ({ typed_ast = new_ast; type_env; effect_env; root_hash; decl_hashes }, [])
+    | Error msg ->
+      ({ typed_ast = new_ast; type_env = []; effect_env = [];
+         root_hash; decl_hashes },
+       [Mcp_types.make_error "type/error" msg])
+  in
+  store_module state mod_name new_source ms;
+  (ms, old_hashes, type_diags)
+
+(* Build the changed_nodes JSON array by diffing before/after decl_hashes. *)
+let changed_nodes_json prog_for_kinds hashes_before hashes_after =
+  let kind_of name =
+    match List.find_opt (fun d -> decl_name d = Some name) prog_for_kinds with
+    | Some d -> (match d.Ast.decl_desc with
+        | Ast.DeclFn _     -> "function"
+        | Ast.DeclType _   -> "type"
+        | Ast.DeclEffect _ -> "effect"
+        | _                -> "other")
+    | None -> "other"
+  in
+  let all_names =
+    let tbl = Hashtbl.create 8 in
+    Hashtbl.iter (fun n _ -> Hashtbl.replace tbl n ()) hashes_before;
+    Hashtbl.iter (fun n _ -> Hashtbl.replace tbl n ()) hashes_after;
+    Hashtbl.fold (fun n () acc -> n :: acc) tbl []
+  in
+  List.filter_map (fun name ->
+    let before = Option.value ~default:"" (Hashtbl.find_opt hashes_before name) in
+    let after  = Option.value ~default:"" (Hashtbl.find_opt hashes_after  name) in
+    if before = after then None
+    else Some (Object [
+      ("name",   String name);
+      ("before", String before);
+      ("after",  String after);
+      ("kind",   String (kind_of name));
+    ])
+  ) all_names
+
+(* Collect free variable names in a list of do-stmts (vars used but not
+   bound within the range). *)
+let collect_free_vars_in_stmts stmts =
+  let bound = Hashtbl.create 8 in
+  let used  = Hashtbl.create 8 in
+  let add_bound_pat p =
+    let rec go p = match p.Ast.pat_desc with
+      | Ast.PVar s -> Hashtbl.replace bound s ()
+      | Ast.PCtor (_, ps) -> List.iter go ps
+      | Ast.PRecord (fs, _) -> List.iter (fun (_, p) -> go p) fs
+      | Ast.POr (a, b) -> go a; go b
+      | _ -> ()
+    in go p
+  in
+  let rec walk_e e = walk_desc e.Ast.desc
+  and walk_desc = function
+    | Ast.Var s ->
+      if not (Hashtbl.mem bound s) then Hashtbl.replace used s ()
+    | Ast.Let lb ->
+      walk_e lb.Ast.value;
+      add_bound_pat lb.Ast.pat;
+      walk_e lb.Ast.body
+    | Ast.App (f, args) -> walk_e f; List.iter walk_e args
+    | Ast.Fn fn ->
+      (* params shadow outer; recurse only into body *)
+      let saved = Hashtbl.copy bound in
+      List.iter (fun p -> Hashtbl.replace bound p.Ast.param_name ()) fn.Ast.params;
+      walk_e fn.Ast.fn_body;
+      Hashtbl.reset bound;
+      Hashtbl.iter (Hashtbl.replace bound) saved
+    | Ast.Match md ->
+      walk_e md.Ast.scrutinee;
+      List.iter (fun arm ->
+        let saved = Hashtbl.copy bound in
+        let rec go_pat p = match p.Ast.pat_desc with
+          | Ast.PVar s -> Hashtbl.replace bound s ()
+          | Ast.PCtor (_, ps) -> List.iter go_pat ps
+          | Ast.PRecord (fs, _) -> List.iter (fun (_, p) -> go_pat p) fs
+          | Ast.POr (a, _) -> go_pat a
+          | _ -> ()
+        in go_pat arm.Ast.pattern;
+        walk_e arm.Ast.arm_body;
+        Hashtbl.reset bound;
+        Hashtbl.iter (Hashtbl.replace bound) saved
+      ) md.Ast.arms
+    | Ast.If id_ -> walk_e id_.Ast.cond; walk_e id_.Ast.then_; walk_e id_.Ast.else_
+    | Ast.Do inner ->
+      let saved = Hashtbl.copy bound in
+      walk_stmts inner;
+      Hashtbl.reset bound;
+      Hashtbl.iter (Hashtbl.replace bound) saved
+    | Ast.Letrec (bs, body) ->
+      List.iter (fun b -> Hashtbl.replace bound b.Ast.letrec_name ()) bs;
+      List.iter (fun b -> walk_e b.Ast.letrec_body) bs;
+      walk_e body
+    | Ast.Record fs -> List.iter (fun (_, e) -> walk_e e) fs
+    | Ast.RecordUpdate (base, fs) -> walk_e base; List.iter (fun (_, e) -> walk_e e) fs
+    | Ast.Project (e, _) -> walk_e e
+    | Ast.Perform pd -> List.iter walk_e pd.Ast.args
+    | Ast.Handle hd ->
+      walk_e hd.Ast.handled;
+      List.iter (fun h ->
+        let saved = Hashtbl.copy bound in
+        List.iter (fun op ->
+          List.iter (fun p -> Hashtbl.replace bound p ()) op.Ast.op_handler_params;
+          walk_e op.Ast.op_handler_body) h.Ast.op_handlers;
+        Option.iter (fun r ->
+          Hashtbl.replace bound r.Ast.return_var ();
+          walk_e r.Ast.return_body) h.Ast.return_handler;
+        Hashtbl.reset bound;
+        Hashtbl.iter (Hashtbl.replace bound) saved
+      ) hd.Ast.handlers
+    | _ -> ()
+  and walk_stmts = function
+    | [] -> ()
+    | Ast.StmtLet { pat; value } :: rest ->
+      walk_e value;
+      add_bound_pat pat;
+      walk_stmts rest
+    | Ast.StmtExpr e :: rest -> walk_e e; walk_stmts rest
+  in
+  walk_stmts stmts;
+  Hashtbl.fold (fun s () acc -> s :: acc) used []
+
+(* Return true when the expression references a variable named "resume". *)
+let rec expr_uses_resume e = match e.Ast.desc with
+  | Ast.Var "resume" -> true
+  | Ast.App (f, args) -> expr_uses_resume f || List.exists expr_uses_resume args
+  | Ast.Let lb -> expr_uses_resume lb.Ast.value || expr_uses_resume lb.Ast.body
+  | Ast.Fn fn -> expr_uses_resume fn.Ast.fn_body
+  | Ast.If id_ ->
+    expr_uses_resume id_.Ast.cond || expr_uses_resume id_.Ast.then_ ||
+    expr_uses_resume id_.Ast.else_
+  | Ast.Do stmts ->
+    List.exists (function
+      | Ast.StmtExpr e -> expr_uses_resume e
+      | Ast.StmtLet { value; _ } -> expr_uses_resume value) stmts
+  | Ast.Match md ->
+    expr_uses_resume md.Ast.scrutinee ||
+    List.exists (fun arm -> expr_uses_resume arm.Ast.arm_body) md.Ast.arms
+  | Ast.Handle hd ->
+    expr_uses_resume hd.Ast.handled ||
+    List.exists (fun h ->
+      List.exists (fun op -> expr_uses_resume op.Ast.op_handler_body) h.Ast.op_handlers
+    ) hd.Ast.handlers
+  | Ast.Letrec (bs, body) ->
+    List.exists (fun b -> expr_uses_resume b.Ast.letrec_body) bs || expr_uses_resume body
+  | _ -> false
+
+(* Return true when the expression directly contains a perform of target_eff. *)
+let rec expr_performs_eff target_eff e = match e.Ast.desc with
+  | Ast.Perform pd -> pd.Ast.effect_name = target_eff
+  | Ast.App (f, args) ->
+    expr_performs_eff target_eff f || List.exists (expr_performs_eff target_eff) args
+  | Ast.Let lb ->
+    expr_performs_eff target_eff lb.Ast.value || expr_performs_eff target_eff lb.Ast.body
+  | Ast.Fn fn -> expr_performs_eff target_eff fn.Ast.fn_body
+  | Ast.If id_ ->
+    expr_performs_eff target_eff id_.Ast.cond || expr_performs_eff target_eff id_.Ast.then_ ||
+    expr_performs_eff target_eff id_.Ast.else_
+  | Ast.Do stmts ->
+    List.exists (function
+      | Ast.StmtExpr e -> expr_performs_eff target_eff e
+      | Ast.StmtLet { value; _ } -> expr_performs_eff target_eff value) stmts
+  | Ast.Match md ->
+    expr_performs_eff target_eff md.Ast.scrutinee ||
+    List.exists (fun arm -> expr_performs_eff target_eff arm.Ast.arm_body) md.Ast.arms
+  | Ast.Handle hd ->
+    (* stop at handle boundary for the target effect *)
+    let handled_eff = List.exists (fun h -> h.Ast.effect_handler = target_eff) hd.Ast.handlers in
+    (not handled_eff && expr_performs_eff target_eff hd.Ast.handled) ||
+    List.exists (fun h ->
+      List.exists (fun op -> expr_performs_eff target_eff op.Ast.op_handler_body) h.Ast.op_handlers
+    ) hd.Ast.handlers
+  | Ast.Letrec (bs, body) ->
+    List.exists (fun b -> expr_performs_eff target_eff b.Ast.letrec_body) bs ||
+    expr_performs_eff target_eff body
+  | _ -> false
+
+(* Insert `perform Log.log("perform <eff>.<op>")` before each StmtExpr that is
+   a direct perform of target_eff in any Do block. *)
+let rec add_log_stmts target_eff e =
+  { e with Ast.desc = add_log_stmts_desc target_eff e.Ast.desc }
+
+and add_log_stmts_desc target_eff d = match d with
+  | Ast.Do stmts ->
+    Ast.Do (List.concat_map (function
+      | Ast.StmtExpr ({ Ast.desc = Ast.Perform pd; _ } as pe)
+          when pd.Ast.effect_name = target_eff ->
+        let log_e = Ast.expr (Ast.Perform {
+          Ast.effect_name = "Log";
+          op_name = "log";
+          args = [Ast.expr (Ast.StringLit
+            (Printf.sprintf "perform %s.%s" pd.Ast.effect_name pd.Ast.op_name))];
+        }) in
+        [Ast.StmtExpr log_e; Ast.StmtExpr pe]
+      | Ast.StmtExpr e -> [Ast.StmtExpr (add_log_stmts target_eff e)]
+      | Ast.StmtLet { pat; value } ->
+        [Ast.StmtLet { pat; value = add_log_stmts target_eff value }]
+    ) stmts)
+  | Ast.Let lb ->
+    Ast.Let { lb with
+              Ast.value = add_log_stmts target_eff lb.Ast.value;
+              body  = add_log_stmts target_eff lb.Ast.body }
+  | Ast.App (f, args) ->
+    Ast.App (add_log_stmts target_eff f, List.map (add_log_stmts target_eff) args)
+  | Ast.Fn fn ->
+    Ast.Fn { fn with Ast.fn_body = add_log_stmts target_eff fn.Ast.fn_body }
+  | Ast.If id_ ->
+    Ast.If { Ast.cond  = add_log_stmts target_eff id_.Ast.cond;
+             then_ = add_log_stmts target_eff id_.Ast.then_;
+             else_ = add_log_stmts target_eff id_.Ast.else_ }
+  | Ast.Match md ->
+    Ast.Match { Ast.scrutinee = add_log_stmts target_eff md.Ast.scrutinee;
+                arms = List.map (fun arm ->
+                  { arm with Ast.arm_body = add_log_stmts target_eff arm.Ast.arm_body }
+                ) md.Ast.arms }
+  | Ast.Handle hd ->
+    Ast.Handle { Ast.handled = add_log_stmts target_eff hd.Ast.handled;
+                 handlers = List.map (fun h ->
+                   { h with
+                     Ast.op_handlers = List.map (fun op ->
+                       { op with Ast.op_handler_body =
+                                   add_log_stmts target_eff op.Ast.op_handler_body }
+                     ) h.Ast.op_handlers;
+                     return_handler = Option.map (fun r ->
+                       { r with Ast.return_body = add_log_stmts target_eff r.Ast.return_body }
+                     ) h.Ast.return_handler }
+                 ) hd.Ast.handlers }
+  | Ast.Letrec (bs, body) ->
+    Ast.Letrec (
+      List.map (fun b ->
+        { b with Ast.letrec_body = add_log_stmts target_eff b.Ast.letrec_body }) bs,
+      add_log_stmts target_eff body)
+  | Ast.RecordUpdate (base, fields) ->
+    Ast.RecordUpdate (add_log_stmts target_eff base,
+                      List.map (fun (f, e) -> (f, add_log_stmts target_eff e)) fields)
+  | Ast.Record fields ->
+    Ast.Record (List.map (fun (f, e) -> (f, add_log_stmts target_eff e)) fields)
+  | Ast.Project (e, f) -> Ast.Project (add_log_stmts target_eff e, f)
+  | Ast.Perform pd ->
+    Ast.Perform { pd with Ast.args = List.map (add_log_stmts target_eff) pd.Ast.args }
+  | x -> x
+
+(* Ensure Log appears in the effect annotation of a fn decl that performs target_eff. *)
+let ensure_log_in_effects target_eff d =
+  match d.Ast.decl_desc with
+  | Ast.DeclFn { pub; fn_name; type_params; params; return_type; effects; decl_body }
+      when expr_performs_eff target_eff decl_body ->
+    let new_effects = match effects with
+      | None ->
+        Some (Ast.Effects ([Ast.TyName "Log"; Ast.TyName target_eff], None))
+      | Some Ast.Pure ->
+        Some (Ast.Effects ([Ast.TyName "Log"], None))
+      | Some (Ast.Effects (ts, tail)) ->
+        let has_log = List.exists (function Ast.TyName "Log" -> true | _ -> false) ts in
+        if has_log then Some (Ast.Effects (ts, tail))
+        else Some (Ast.Effects (Ast.TyName "Log" :: ts, tail))
+    in
+    { d with Ast.decl_desc = Ast.DeclFn {
+        pub; fn_name; type_params; params; return_type; decl_body;
+        effects = new_effects } }
+  | _ -> d
+
+(* Substitute var_name → replacement in an expression (simple, not capture-avoiding). *)
+let rec subst_var var_name repl e =
+  { e with Ast.desc = subst_var_desc var_name repl e.Ast.desc }
+
+and subst_var_desc var_name repl d = match d with
+  | Ast.Var s when s = var_name -> repl.Ast.desc
+  | Ast.Let lb ->
+    if (match lb.Ast.pat.Ast.pat_desc with Ast.PVar s -> s = var_name | _ -> false)
+    then Ast.Let { lb with Ast.value = subst_var var_name repl lb.Ast.value }
+    else Ast.Let { lb with
+                   Ast.value = subst_var var_name repl lb.Ast.value;
+                   body  = subst_var var_name repl lb.Ast.body }
+  | Ast.App (f, args) ->
+    Ast.App (subst_var var_name repl f, List.map (subst_var var_name repl) args)
+  | Ast.Fn fn ->
+    if List.exists (fun p -> p.Ast.param_name = var_name) fn.Ast.params
+    then Ast.Fn fn
+    else Ast.Fn { fn with Ast.fn_body = subst_var var_name repl fn.Ast.fn_body }
+  | Ast.If id_ ->
+    Ast.If { Ast.cond  = subst_var var_name repl id_.Ast.cond;
+             then_ = subst_var var_name repl id_.Ast.then_;
+             else_ = subst_var var_name repl id_.Ast.else_ }
+  | Ast.Do stmts ->
+    Ast.Do (List.map (function
+      | Ast.StmtExpr e -> Ast.StmtExpr (subst_var var_name repl e)
+      | Ast.StmtLet { pat; value } ->
+        Ast.StmtLet { pat; value = subst_var var_name repl value }) stmts)
+  | Ast.Match md ->
+    Ast.Match { Ast.scrutinee = subst_var var_name repl md.Ast.scrutinee;
+                arms = List.map (fun arm ->
+                  { arm with Ast.arm_body = subst_var var_name repl arm.Ast.arm_body }
+                ) md.Ast.arms }
+  | Ast.Handle hd ->
+    Ast.Handle { Ast.handled = subst_var var_name repl hd.Ast.handled;
+                 handlers = List.map (fun h ->
+                   { h with
+                     Ast.op_handlers = List.map (fun op ->
+                       if List.mem var_name op.Ast.op_handler_params then op
+                       else { op with Ast.op_handler_body =
+                                        subst_var var_name repl op.Ast.op_handler_body }
+                     ) h.Ast.op_handlers;
+                     return_handler = Option.map (fun r ->
+                       if r.Ast.return_var = var_name then r
+                       else { r with Ast.return_body = subst_var var_name repl r.Ast.return_body }
+                     ) h.Ast.return_handler }
+                 ) hd.Ast.handlers }
+  | Ast.Letrec (bs, body) ->
+    if List.exists (fun b -> b.Ast.letrec_name = var_name) bs
+    then Ast.Letrec (bs, body)
+    else Ast.Letrec (
+      List.map (fun b -> { b with Ast.letrec_body = subst_var var_name repl b.Ast.letrec_body }) bs,
+      subst_var var_name repl body)
+  | Ast.Perform pd ->
+    Ast.Perform { pd with Ast.args = List.map (subst_var var_name repl) pd.Ast.args }
+  | Ast.Record fields ->
+    Ast.Record (List.map (fun (f, e) -> (f, subst_var var_name repl e)) fields)
+  | Ast.RecordUpdate (base, fields) ->
+    Ast.RecordUpdate (subst_var var_name repl base,
+                      List.map (fun (f, e) -> (f, subst_var var_name repl e)) fields)
+  | Ast.Project (e, f) -> Ast.Project (subst_var var_name repl e, f)
+  | x -> x
+
+(* Apply a parallel substitution of params → args in an expression. *)
+let apply_subst params args e =
+  List.fold_left2 (fun acc_e param arg -> subst_var param arg acc_e) e params args
+
+(* Replace all performs of target_eff with the inlined op bodies. *)
+let rec inline_performs target_eff (eh : Ast.effect_handler) e =
+  { e with Ast.desc = inline_performs_desc target_eff eh e.Ast.desc }
+
+and inline_performs_desc target_eff eh d = match d with
+  | Ast.Perform pd when pd.Ast.effect_name = target_eff ->
+    let op_h = List.find_opt (fun op -> op.Ast.op_handler_name = pd.Ast.op_name)
+                 eh.Ast.op_handlers in
+    (match op_h with
+     | None -> Ast.Perform pd
+     | Some op when List.length op.Ast.op_handler_params <> List.length pd.Ast.args ->
+       Ast.Perform pd
+     | Some op ->
+       let subst = apply_subst op.Ast.op_handler_params pd.Ast.args op.Ast.op_handler_body in
+       subst.Ast.desc)
+  | Ast.Let lb ->
+    Ast.Let { lb with
+              Ast.value = inline_performs target_eff eh lb.Ast.value;
+              body  = inline_performs target_eff eh lb.Ast.body }
+  | Ast.App (f, args) ->
+    Ast.App (inline_performs target_eff eh f, List.map (inline_performs target_eff eh) args)
+  | Ast.Fn fn ->
+    Ast.Fn { fn with Ast.fn_body = inline_performs target_eff eh fn.Ast.fn_body }
+  | Ast.If id_ ->
+    Ast.If { Ast.cond  = inline_performs target_eff eh id_.Ast.cond;
+             then_ = inline_performs target_eff eh id_.Ast.then_;
+             else_ = inline_performs target_eff eh id_.Ast.else_ }
+  | Ast.Do stmts ->
+    Ast.Do (List.map (function
+      | Ast.StmtExpr e -> Ast.StmtExpr (inline_performs target_eff eh e)
+      | Ast.StmtLet { pat; value } ->
+        Ast.StmtLet { pat; value = inline_performs target_eff eh value }) stmts)
+  | Ast.Match md ->
+    Ast.Match { Ast.scrutinee = inline_performs target_eff eh md.Ast.scrutinee;
+                arms = List.map (fun arm ->
+                  { arm with Ast.arm_body = inline_performs target_eff eh arm.Ast.arm_body }
+                ) md.Ast.arms }
+  | Ast.Handle hd ->
+    Ast.Handle { Ast.handled = inline_performs target_eff eh hd.Ast.handled;
+                 handlers = hd.Ast.handlers }
+  | Ast.Letrec (bs, body) ->
+    Ast.Letrec (
+      List.map (fun b ->
+        { b with Ast.letrec_body = inline_performs target_eff eh b.Ast.letrec_body }) bs,
+      inline_performs target_eff eh body)
+  | Ast.Perform pd ->
+    Ast.Perform { pd with Ast.args = List.map (inline_performs target_eff eh) pd.Ast.args }
+  | Ast.Record fields ->
+    Ast.Record (List.map (fun (f, e) -> (f, inline_performs target_eff eh e)) fields)
+  | Ast.RecordUpdate (base, fields) ->
+    Ast.RecordUpdate (inline_performs target_eff eh base,
+                      List.map (fun (f, e) -> (f, inline_performs target_eff eh e)) fields)
+  | Ast.Project (e, f) -> Ast.Project (inline_performs target_eff eh e, f)
+  | x -> x
+
+(* Inline trivial handlers for target_eff recursively through an expression. *)
+let rec inline_handler_in_expr target_eff e =
+  { e with Ast.desc = inline_handler_desc target_eff e.Ast.desc }
+
+and inline_handler_desc target_eff d = match d with
+  | Ast.Handle hd ->
+    let handled' = inline_handler_in_expr target_eff hd.Ast.handled in
+    let eff_handler = List.find_opt
+        (fun h -> h.Ast.effect_handler = target_eff) hd.Ast.handlers in
+    (match eff_handler with
+     | None ->
+       Ast.Handle { Ast.handled = handled';
+                    handlers = List.map (fun h ->
+                      { h with
+                        Ast.op_handlers = List.map (fun op ->
+                          { op with Ast.op_handler_body =
+                                      inline_handler_in_expr target_eff op.Ast.op_handler_body }
+                        ) h.Ast.op_handlers;
+                        return_handler = Option.map (fun r ->
+                          { r with Ast.return_body =
+                                     inline_handler_in_expr target_eff r.Ast.return_body }
+                        ) h.Ast.return_handler }
+                    ) hd.Ast.handlers }
+     | Some eh ->
+       let trivial =
+         eh.Ast.return_handler = None &&
+         List.for_all (fun op -> not (expr_uses_resume op.Ast.op_handler_body)) eh.Ast.op_handlers
+       in
+       if not trivial then
+         Ast.Handle { Ast.handled = handled'; handlers = hd.Ast.handlers }
+       else begin
+         let inlined = inline_performs target_eff eh handled' in
+         let remaining = List.filter
+             (fun h -> h.Ast.effect_handler <> target_eff) hd.Ast.handlers in
+         if remaining = [] then inlined.Ast.desc
+         else Ast.Handle { Ast.handled = inlined; handlers = remaining }
+       end)
+  | Ast.Let lb ->
+    Ast.Let { lb with
+              Ast.value = inline_handler_in_expr target_eff lb.Ast.value;
+              body  = inline_handler_in_expr target_eff lb.Ast.body }
+  | Ast.App (f, args) ->
+    Ast.App (inline_handler_in_expr target_eff f,
+             List.map (inline_handler_in_expr target_eff) args)
+  | Ast.Fn fn ->
+    Ast.Fn { fn with Ast.fn_body = inline_handler_in_expr target_eff fn.Ast.fn_body }
+  | Ast.If id_ ->
+    Ast.If { Ast.cond  = inline_handler_in_expr target_eff id_.Ast.cond;
+             then_ = inline_handler_in_expr target_eff id_.Ast.then_;
+             else_ = inline_handler_in_expr target_eff id_.Ast.else_ }
+  | Ast.Do stmts ->
+    Ast.Do (List.map (function
+      | Ast.StmtExpr e -> Ast.StmtExpr (inline_handler_in_expr target_eff e)
+      | Ast.StmtLet { pat; value } ->
+        Ast.StmtLet { pat; value = inline_handler_in_expr target_eff value }) stmts)
+  | Ast.Match md ->
+    Ast.Match { Ast.scrutinee = inline_handler_in_expr target_eff md.Ast.scrutinee;
+                arms = List.map (fun arm ->
+                  { arm with Ast.arm_body =
+                               inline_handler_in_expr target_eff arm.Ast.arm_body }) md.Ast.arms }
+  | Ast.Letrec (bs, body) ->
+    Ast.Letrec (
+      List.map (fun b ->
+        { b with Ast.letrec_body = inline_handler_in_expr target_eff b.Ast.letrec_body }) bs,
+      inline_handler_in_expr target_eff body)
+  | Ast.RecordUpdate (base, fields) ->
+    Ast.RecordUpdate (inline_handler_in_expr target_eff base,
+                      List.map (fun (f, e) -> (f, inline_handler_in_expr target_eff e)) fields)
+  | Ast.Record fields ->
+    Ast.Record (List.map (fun (f, e) -> (f, inline_handler_in_expr target_eff e)) fields)
+  | Ast.Project (e, f) -> Ast.Project (inline_handler_in_expr target_eff e, f)
+  | Ast.Perform pd ->
+    Ast.Perform { pd with Ast.args = List.map (inline_handler_in_expr target_eff) pd.Ast.args }
+  | x -> x
+
 (* ─── Transform tool ─────────────────────────────────────────────────────── *)
 
-let dispatch_transform _state cmd =
-  let op = match obj_get "op" cmd with String s -> s | _ -> "" in
-  Cmd_halt (Mcp_types.make_error "command/unimplemented"
-    (Printf.sprintf "Transform op '%s' is not yet implemented" op))
+let dispatch_transform state cmd =
+  let op   = match obj_get "op"   cmd with String s -> s | _ -> "" in
+  let args = obj_get "args" cmd in
+  match op with
+
+  (* ── rename: rename a decl and every reference across all modules ────── *)
+  | "rename" ->
+    let new_name = match obj_get "new_name" args with String s -> s | _ -> "" in
+    if new_name = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "rename requires a non-empty 'new_name' field")
+    else
+    let anchor_json = match obj_get "anchor" args with
+      | Null -> args  (* allow args to act as anchor directly *)
+      | a    -> a
+    in
+    (match resolve_anchor state anchor_json with
+     | Error d -> Cmd_halt d
+     | Ok (def_mod, old_name, _) ->
+       if old_name = "" then
+         Cmd_halt (Mcp_types.make_error "command/invalid"
+           "rename anchor must resolve to a named declaration")
+       else
+       (* Apply rename to every submitted module; collect changed_nodes. *)
+       let all_changed = ref [] in
+       let all_type_diags = ref [] in
+       Hashtbl.iter (fun mod_name ms ->
+         let new_ast = List.map (rename_in_decl old_name new_name) ms.typed_ast in
+         if not (Ast.equal_program new_ast ms.typed_ast) then begin
+           let (new_ms, old_hashes, td) = update_module_ast state mod_name new_ast in
+           all_type_diags := !all_type_diags @ td;
+           let changed = changed_nodes_json new_ms.typed_ast old_hashes new_ms.decl_hashes in
+           all_changed := !all_changed @ changed
+         end
+       ) state.modules;
+       (* If the defining module wasn't renamed (e.g. not submitted), warn. *)
+       let def_diags =
+         if not (Hashtbl.mem state.modules def_mod) then
+           [Mcp_types.make_warning "rename/partial"
+              (Printf.sprintf "Module '%s' was not updated (not submitted)" def_mod)]
+         else []
+       in
+       Cmd_success (Object [
+         ("old_name",     String old_name);
+         ("new_name",     String new_name);
+         ("changed_nodes", Array !all_changed)],
+         def_diags @ !all_type_diags))
+
+  (* ── extract_function: pull a do-stmt range into a new private fn ─────── *)
+  | "extract_function" ->
+    let new_name    = match obj_get "new_name" args with String s -> s | _ -> "" in
+    let range_json  = obj_get "range" args in
+    let anchor_json = obj_get "anchor" args in
+    if new_name = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "extract_function requires a non-empty 'new_name' field")
+    else
+    let (range_start, range_end) = match range_json with
+      | Array [Int a; Int b] -> (a, b)
+      | _ ->
+        Cmd_halt (Mcp_types.make_error "command/invalid"
+          "extract_function requires 'range': [start, end] (inclusive 0-based indices)")
+        |> (fun _ -> (0, -1))
+    in
+    if range_end < range_start then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "extract_function: range end must be >= range start")
+    else
+    (match resolve_anchor state anchor_json with
+     | Error d -> Cmd_halt d
+     | Ok (mod_name, fn_name, ms) ->
+       let fn_decl = List.find_opt (fun d ->
+         match d.Ast.decl_desc with
+         | Ast.DeclFn { fn_name = n; _ } -> n = fn_name
+         | _ -> false) ms.typed_ast in
+       (match fn_decl with
+        | None ->
+          Cmd_halt (Mcp_types.make_error "anchor/not-found"
+            (Printf.sprintf "Function '%s' not found in module '%s'" fn_name mod_name))
+        | Some fd ->
+          let (outer_params, body) = match fd.Ast.decl_desc with
+            | Ast.DeclFn { params; decl_body; _ } -> (params, decl_body)
+            | _ -> ([], Ast.expr Ast.UnitLit)
+          in
+          let stmts = match body.Ast.desc with
+            | Ast.Do ss -> ss
+            | _ ->
+              [Ast.StmtExpr body]
+          in
+          let n = List.length stmts in
+          if range_start < 0 || range_end >= n then
+            Cmd_halt (Mcp_types.make_error "command/invalid"
+              (Printf.sprintf "extract_function: range [%d,%d] is out of bounds (body has %d stmts)"
+                 range_start range_end n))
+          else begin
+            let range_stmts = List.filteri (fun i _ -> i >= range_start && i <= range_end) stmts in
+            (* Collect free variables in the range *)
+            let free_vars = collect_free_vars_in_stmts range_stmts in
+            (* Filter out globally available names *)
+            let is_global v =
+              List.mem_assoc v ms.type_env ||
+              List.mem_assoc v Typechecker.stdlib_env
+            in
+            let param_vars = List.filter (fun v -> not (is_global v)) free_vars in
+            (* Get type for each param var (outer fn param if available, else Int placeholder) *)
+            let placeholder_used = ref false in
+            let extracted_params = List.map (fun v ->
+              let ty = match List.find_opt (fun p -> p.Ast.param_name = v) outer_params with
+                | Some p -> p.Ast.param_type
+                | None ->
+                  placeholder_used := true;
+                  Ast.TyName "Int"
+              in
+              { Ast.param_name = v; param_type = ty }
+            ) param_vars in
+            (* Build the extracted function body *)
+            let ext_body = match range_stmts with
+              | [Ast.StmtExpr e] -> e
+              | _ -> Ast.expr (Ast.Do range_stmts)
+            in
+            (* Build the new function declaration *)
+            let new_fn_decl = Ast.decl (Ast.DeclFn {
+              pub = false;
+              fn_name = new_name;
+              type_params = [];
+              params = extracted_params;
+              return_type = None;
+              effects = None;
+              decl_body = ext_body;
+            }) in
+            (* Build the call expression *)
+            let call_args = List.map (fun p -> Ast.expr (Ast.Var p.Ast.param_name)) extracted_params in
+            let call_e = Ast.expr (Ast.App (Ast.expr (Ast.Var new_name), call_args)) in
+            (* Replace the range with the call in the original function *)
+            let new_stmts =
+              List.mapi (fun i s ->
+                if i = range_start then Some (Ast.StmtExpr call_e)
+                else if i > range_start && i <= range_end then None
+                else Some s
+              ) stmts |> List.filter_map Fun.id
+            in
+            let new_body = match new_stmts with
+              | [Ast.StmtExpr e] -> e
+              | _ -> Ast.expr (Ast.Do new_stmts)
+            in
+            let new_ast = List.map (fun d ->
+              match d.Ast.decl_desc with
+              | Ast.DeclFn ({ fn_name = n; _ } as r) when n = fn_name ->
+                { d with Ast.decl_desc = Ast.DeclFn { r with decl_body = new_body } }
+              | _ -> d
+            ) ms.typed_ast @ [new_fn_decl] in
+            let (new_ms, old_hashes, type_diags) = update_module_ast state mod_name new_ast in
+            let placeholder_diags =
+              if !placeholder_used then
+                [Mcp_types.make_warning "transform/type-placeholder"
+                   (Printf.sprintf
+                      "Some parameters of '%s' were given placeholder type 'Int'; \
+                       please update their types manually" new_name)]
+              else []
+            in
+            let changed = changed_nodes_json new_ms.typed_ast old_hashes new_ms.decl_hashes in
+            Cmd_success (Object [
+              ("extracted_fn",  String new_name);
+              ("params",        Array (List.map (fun p -> String p.Ast.param_name) extracted_params));
+              ("changed_nodes", Array changed)],
+              placeholder_diags @ type_diags)
+          end))
+
+  (* ── mock_effects: generate a stub-handler test module ───────────────── *)
+  | "mock_effects" ->
+    let target_name  = match obj_get "target"      args with String s -> s | _ -> "" in
+    let into_mod     = match obj_get "into_module"  args with String s -> s | _ -> "" in
+    if target_name = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "mock_effects requires a 'target' module name")
+    else if into_mod = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "mock_effects requires an 'into_module' name")
+    else
+    (match Hashtbl.find_opt state.modules target_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" target_name))
+     | Some target_ms ->
+       (* Collect effect decls from target module *)
+       let effect_decls =
+         List.filter_map (fun d -> match d.Ast.decl_desc with
+           | Ast.DeclEffect { effect_name; ops; _ } -> Some (effect_name, ops)
+           | _ -> None) target_ms.typed_ast
+       in
+       (* Default value for a return type *)
+       let rec default_val = function
+         | Ast.TyName "Unit"   -> "()"
+         | Ast.TyName "Int"    -> "0"
+         | Ast.TyName "Float"  -> "0.0"
+         | Ast.TyName "Bool"   -> "false"
+         | Ast.TyName "String" -> {|""|}
+         | Ast.TyApp ("Option", _) -> "None"
+         | Ast.TyTuple ts ->
+           "(" ^ String.concat ", " (List.map default_val ts) ^ ")"
+         | _ -> "()"
+       in
+       (* Generate handler clause for one effect *)
+       let gen_handler (eff_name, ops) =
+         let op_clauses = List.map (fun op ->
+           let param_names = List.mapi (fun i _ -> Printf.sprintf "_p%d" i) op.Ast.effect_op_params in
+           let params_s = String.concat ", " param_names in
+           let ret_s = default_val op.Ast.effect_op_return in
+           Printf.sprintf "%s(%s) => %s" op.Ast.effect_op_name params_s ret_s
+         ) ops in
+         eff_name ^ " { " ^ String.concat " " op_clauses ^ " }"
+       in
+       (* Collect pub functions as (fn_name, params, return_type, effects) tuples *)
+       let pub_fns = List.filter_map (fun d -> match d.Ast.decl_desc with
+         | Ast.DeclFn { pub = true; fn_name; params; return_type; effects; _ } ->
+           Some (fn_name, params, return_type, effects)
+         | _ -> None) target_ms.typed_ast
+       in
+       let buf = Buffer.create 512 in
+       List.iter (fun (fn_name, params, return_type, effects) ->
+         let params_s = String.concat ", " (List.map Printer.print_param params) in
+         let arg_names_s = String.concat ", " (List.map (fun p -> p.Ast.param_name) params) in
+         let ret_s = match return_type with
+           | None   -> ""
+           | Some t -> " -> " ^ Printer.print_type_expr t
+         in
+         (* Collect effects for this fn *)
+         let eff_names = effect_names_of_decl_annotation effects in
+         let handlers = List.filter_map (fun eff_name ->
+           match List.assoc_opt eff_name effect_decls with
+           | None -> None
+           | Some ops -> Some (gen_handler (eff_name, ops))
+         ) eff_names in
+         Buffer.add_string buf (Printf.sprintf "pub fn mock_%s(%s)%s ! pure {\n"
+           fn_name params_s ret_s);
+         if handlers = [] then
+           Buffer.add_string buf (Printf.sprintf "  %s(%s)\n" fn_name arg_names_s)
+         else begin
+           Buffer.add_string buf (Printf.sprintf "  handle %s(%s) with {\n"
+             fn_name arg_names_s);
+           List.iter (fun h -> Buffer.add_string buf ("    " ^ h ^ "\n")) handlers;
+           Buffer.add_string buf "  }\n"
+         end;
+         Buffer.add_string buf "}\n\n"
+       ) pub_fns;
+       let mock_source = Buffer.contents buf in
+       if mock_source = "" then
+         Cmd_halt (Mcp_types.make_error "transform/no-pub-fns"
+           (Printf.sprintf "Module '%s' has no public functions to mock" target_name))
+       else
+       (* Parse and store the mock module *)
+       let parse_result =
+         try let tokens = Lexer.tokenize mock_source in
+             Ok (Parser.parse_program tokens)
+         with Failure msg -> Error msg
+       in
+       (match parse_result with
+        | Error msg ->
+          Cmd_halt (Mcp_types.make_error "parse/error"
+            (Printf.sprintf "Generated mock source failed to parse: %s\nSource:\n%s" msg mock_source))
+        | Ok new_ast ->
+          let (new_ms, old_hashes, type_diags) = update_module_ast state into_mod new_ast in
+          let changed = changed_nodes_json new_ms.typed_ast old_hashes new_ms.decl_hashes in
+          Cmd_success (Object [
+            ("module",       String into_mod);
+            ("source",       String mock_source);
+            ("changed_nodes", Array changed)],
+            type_diags)))
+
+  (* ── add_effect_logging: insert Log.log calls before target performs ──── *)
+  | "add_effect_logging" ->
+    let mod_name    = match obj_get "module" args with String s -> s | _ -> "" in
+    let target_eff  = match obj_get "effect" args with String s -> s | _ -> "" in
+    if mod_name = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "add_effect_logging requires a 'module' field")
+    else if target_eff = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "add_effect_logging requires an 'effect' field")
+    else
+    (match Hashtbl.find_opt state.modules mod_name with
+     | None ->
+       Cmd_halt (Mcp_types.make_error "anchor/not-found"
+         (Printf.sprintf "Module '%s' not found" mod_name))
+     | Some ms ->
+       let new_ast = List.map (fun d ->
+         match d.Ast.decl_desc with
+         | Ast.DeclFn ({ decl_body; _ } as r)
+             when expr_performs_eff target_eff decl_body ->
+           let new_body = add_log_stmts target_eff decl_body in
+           let d' = { d with Ast.decl_desc = Ast.DeclFn { r with decl_body = new_body } } in
+           ensure_log_in_effects target_eff d'
+         | _ -> d
+       ) ms.typed_ast in
+       let (new_ms, old_hashes, type_diags) = update_module_ast state mod_name new_ast in
+       let changed = changed_nodes_json new_ms.typed_ast old_hashes new_ms.decl_hashes in
+       Cmd_success (Object [
+         ("module",        String mod_name);
+         ("effect",        String target_eff);
+         ("changed_nodes", Array changed)],
+         type_diags))
+
+  (* ── inline_handler: inline trivial handlers for an effect ───────────── *)
+  | "inline_handler" ->
+    let target_eff  = match obj_get "effect" args with String s -> s | _ -> "" in
+    let anchor_json = obj_get "anchor" args in
+    if target_eff = "" then
+      Cmd_halt (Mcp_types.make_error "command/invalid"
+        "inline_handler requires an 'effect' field")
+    else
+    (match resolve_anchor state anchor_json with
+     | Error d -> Cmd_halt d
+     | Ok (mod_name, fn_name, ms) ->
+       let new_ast = List.map (fun d ->
+         match d.Ast.decl_desc with
+         | Ast.DeclFn ({ fn_name = n; effects; decl_body; _ } as r) when n = fn_name ->
+           let new_body = inline_handler_in_expr target_eff decl_body in
+           let new_effects = match effects with
+             | Some (Ast.Effects (ts, tail)) ->
+               let ts' = List.filter (function
+                 | Ast.TyName s when s = target_eff -> false | _ -> true) ts in
+               if ts' = [] && tail = None then Some Ast.Pure
+               else Some (Ast.Effects (ts', tail))
+             | e -> e
+           in
+           { d with Ast.decl_desc = Ast.DeclFn { r with
+               decl_body = new_body; effects = new_effects } }
+         | _ -> d
+       ) ms.typed_ast in
+       let (new_ms, old_hashes, type_diags) = update_module_ast state mod_name new_ast in
+       let changed = changed_nodes_json new_ms.typed_ast old_hashes new_ms.decl_hashes in
+       Cmd_success (Object [
+         ("function",     String fn_name);
+         ("effect",       String target_eff);
+         ("changed_nodes", Array changed)],
+         type_diags))
+
+  | _ ->
+    Cmd_halt (Mcp_types.make_error "command/unknown"
+      (Printf.sprintf "Unknown transform op '%s'" op))
 
 (* ─── Verify tool ────────────────────────────────────────────────────────── *)
 
@@ -1865,10 +2789,13 @@ let tool_transform_schema =
   Object [
     ("name", String "transform");
     ("description", String
-       "Apply mechanical, deterministic refactors (rename, extract-function, \
-        mock-effects, add-effect-logging, inline-handler).  Automatically \
-        verifies the resulting state.  Accepts a batch of commands.");
-    ("inputSchema", batch_input_schema []);
+       "Apply mechanical, deterministic refactors (rename, extract_function, \
+        mock_effects, add_effect_logging, inline_handler).  Runs \
+        type/exhaustive verification on the post-transform state by default.  \
+        Accepts a batch of commands followed by an optional 'verify' array.");
+    ("inputSchema", batch_input_schema
+       ["rename"; "extract_function"; "mock_effects";
+        "add_effect_logging"; "inline_handler"]);
   ]
 
 let tool_verify_schema =
@@ -1931,8 +2858,14 @@ let handle state msg =
        let br'       = { br with br_diagnostics = br.br_diagnostics @ post_diags } in
        send (response id (wrap_batch_result br'))
      | "transform" ->
-       send (response id (wrap_batch_result
-           (batch_execute (dispatch_transform state) cmds)))
+       let verify_checks = match obj_get "verify" args with
+         | Array vs -> List.filter_map (function String s -> Some s | _ -> None) vs
+         | _        -> ["types"; "exhaustive"]
+       in
+       let br         = batch_execute (dispatch_transform state) cmds in
+       let post_diags = run_post_batch_verify state verify_checks in
+       let br'        = { br with br_diagnostics = br.br_diagnostics @ post_diags } in
+       send (response id (wrap_batch_result br'))
      | "verify" ->
        send (response id (wrap_batch_result
            (batch_execute (dispatch_verify state) cmds)))

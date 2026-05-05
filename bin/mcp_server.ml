@@ -1463,33 +1463,53 @@ let store_module state name source ms =
   Hashtbl.replace state.sources name source;
   save_module_registry state.store_dir state.sources
 
+(* ─── Reusable verify library functions ──────────────────────────────────── *)
+(* These are called both from dispatch_verify and from run_post_batch_verify
+   (after write/transform mutations), ensuring identical diagnostic shapes. *)
+
+let diags_of_match_warnings ms =
+  List.map (fun (w : Typechecker.match_warning) ->
+    let msg  = Printf.sprintf "Non-exhaustive match; missing: %s"
+                 (String.concat ", " w.mw_missing) in
+    let node = match w.mw_fn_name with
+      | Some fn -> (match Hashtbl.find_opt ms.decl_hashes fn with
+          | Some h -> h | None -> ms.root_hash)
+      | None -> ms.root_hash
+    in
+    Mcp_types.make_warning ~node
+      ~location:(make_loc w.mw_line w.mw_col)
+      "match/non-exhaustive" msg
+  ) (Typechecker.collect_match_warnings ms.typed_ast)
+
+let diags_of_unused_items ms =
+  List.map (fun (u : Typechecker.unused_item) ->
+    let node = Hashtbl.find_opt ms.decl_hashes u.ui_name in
+    let msg  = Printf.sprintf "Unused %s '%s'" u.ui_kind u.ui_name in
+    Mcp_types.make_warning ?node
+      ~location:(make_loc u.ui_line u.ui_col)
+      "decl/unused" msg
+  ) (Typechecker.collect_unused ms.typed_ast)
+
+let diags_of_type_errors_project state =
+  let prog = combined_program state in
+  if prog = [] then []
+  else
+    match (try Ok (Typechecker.check_program prog) with Failure msg -> Error msg) with
+    | Ok _      -> []
+    | Error msg -> [Mcp_types.make_error "type/error" msg]
+
 (* Run the post-batch verification checks on all modules in state.
-   Handles "exhaustive" and "unused"; "types" is implicit (checked per-command);
-   "effects" is skipped without an entry point. *)
+   Handles "exhaustive", "unused", and "types" (project-wide).
+   "effects" and "tail_calls" are skipped without an explicit entry point / anchor. *)
 let run_post_batch_verify state verify_checks =
   let diags = ref [] in
+  if List.mem "types" verify_checks then
+    diags := !diags @ diags_of_type_errors_project state;
   Hashtbl.iter (fun _name ms ->
     if List.mem "exhaustive" verify_checks then
-      List.iter (fun (w : Typechecker.match_warning) ->
-        let msg  = Printf.sprintf "Non-exhaustive match; missing: %s"
-                     (String.concat ", " w.mw_missing) in
-        let node = match w.mw_fn_name with
-          | Some fn -> (match Hashtbl.find_opt ms.decl_hashes fn with
-              | Some h -> h | None -> ms.root_hash)
-          | None -> ms.root_hash
-        in
-        diags := !diags @ [Mcp_types.make_warning ~node
-                             ~location:(make_loc w.mw_line w.mw_col)
-                             "match/non-exhaustive" msg]
-      ) (Typechecker.collect_match_warnings ms.typed_ast);
+      diags := !diags @ diags_of_match_warnings ms;
     if List.mem "unused" verify_checks then
-      List.iter (fun (u : Typechecker.unused_item) ->
-        let node = Hashtbl.find_opt ms.decl_hashes u.ui_name in
-        let msg  = Printf.sprintf "Unused %s '%s'" u.ui_kind u.ui_name in
-        diags := !diags @ [Mcp_types.make_warning ?node
-                             ~location:(make_loc u.ui_line u.ui_col)
-                             "decl/unused" msg]
-      ) (Typechecker.collect_unused ms.typed_ast)
+      diags := !diags @ diags_of_unused_items ms
   ) state.modules;
   !diags
 
@@ -1627,103 +1647,168 @@ let dispatch_verify state cmd =
   let args = obj_get "args" cmd in
   match op with
   | "types" ->
-    let source = match obj_get "source" args with String s -> s | _ -> "" in
-    (try
-       let tokens = Lexer.tokenize source in
-       let ast    = Parser.parse_program tokens in
-       ignore (Typechecker.check_program ast);
-       Cmd_success (Object [], [])
-     with Failure msg ->
-       let diag = Mcp_types.make_error "type/error" msg in
-       Cmd_success (Object [], [diag]))
+    (* Three modes:
+       1. scope = "project"         → typecheck combined program of all modules
+       2. scope = {"module": "..."}  → typecheck just that module
+       3. source = "..."            → typecheck ad-hoc source string (legacy) *)
+    let scope = obj_get "scope" args in
+    (match scope with
+     | String "project" ->
+       let diags = diags_of_type_errors_project state in
+       Cmd_success (Object [("scope", String "project")], diags)
+
+     | Object fields when List.mem_assoc "module" fields ->
+       let mod_name = match List.assoc "module" fields with String s -> s | _ -> "" in
+       (match Hashtbl.find_opt state.modules mod_name with
+        | None ->
+          Cmd_halt (Mcp_types.make_error "anchor/not-found"
+            (Printf.sprintf "Module '%s' not found" mod_name))
+        | Some ms ->
+          let diags =
+            match (try Ok (Typechecker.check_program ms.typed_ast)
+                   with Failure msg -> Error msg) with
+            | Ok _      -> []
+            | Error msg -> [Mcp_types.make_error ~node:ms.root_hash "type/error" msg]
+          in
+          Cmd_success (Object [("scope", Object [("module", String mod_name)])], diags))
+
+     | _ ->
+       (* Legacy: typecheck source string without updating state. *)
+       let source = match obj_get "source" args with String s -> s | _ -> "" in
+       (try
+          let tokens = Lexer.tokenize source in
+          let ast    = Parser.parse_program tokens in
+          ignore (Typechecker.check_program ast);
+          Cmd_success (Object [], [])
+        with Failure msg ->
+          Cmd_success (Object [], [Mcp_types.make_error "type/error" msg])))
 
   | "exhaustive" ->
-    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
-    (match Hashtbl.find_opt state.modules mod_name with
-     | None ->
-       Cmd_halt (Mcp_types.make_error "anchor/not-found"
-         (Printf.sprintf "Module '%s' not found" mod_name))
-     | Some ms ->
-       let warnings = Typechecker.collect_match_warnings ms.typed_ast in
-       let diags = List.map (fun (w : Typechecker.match_warning) ->
-           let msg = Printf.sprintf "Non-exhaustive match; missing: %s"
-               (String.concat ", " w.mw_missing) in
-           let node = match w.mw_fn_name with
-             | Some fn -> (match Hashtbl.find_opt ms.decl_hashes fn with
-                 | Some h -> h | None -> ms.root_hash)
-             | None -> ms.root_hash
-           in
-           Mcp_types.make_warning
-             ~node
-             ~location:(make_loc w.mw_line w.mw_col)
-             "match/non-exhaustive" msg
-         ) warnings in
-       Cmd_success (Object [], diags))
+    (* scope = "project" checks all modules; default (or module specified) checks one. *)
+    let scope = obj_get "scope" args in
+    (match scope with
+     | String "project" ->
+       let diags = Hashtbl.fold (fun _name ms acc ->
+           acc @ diags_of_match_warnings ms
+         ) state.modules [] in
+       Cmd_success (Object [("scope", String "project")], diags)
+     | _ ->
+       let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+       (match Hashtbl.find_opt state.modules mod_name with
+        | None ->
+          Cmd_halt (Mcp_types.make_error "anchor/not-found"
+            (Printf.sprintf "Module '%s' not found" mod_name))
+        | Some ms ->
+          Cmd_success (Object [], diags_of_match_warnings ms)))
 
   | "effects" ->
-    (* Cross-module effect tracing: build a combined function map from all
-       submitted modules and walk from the given entry point, following calls
-       across module boundaries.  The entry_point function must exist somewhere
-       in the project; module is optional and used only to locate it. *)
-    let mod_name    = match obj_get "module"      args with String s -> s | _ -> "" in
-    let entry_point = match obj_get "entry_point" args with String s -> s | _ -> "" in
-    (* Build combined program for cross-module walking. *)
-    let prog =
-      if mod_name <> "" then
-        (* If a module is specified, start with that module's decls; append all
-           others so cross-module calls can be followed. *)
-        let others = Hashtbl.fold (fun mn ms acc ->
-          if mn = mod_name then acc else acc @ ms.typed_ast) state.modules [] in
-        (match Hashtbl.find_opt state.modules mod_name with
-         | None -> []
-         | Some ms -> ms.typed_ast @ others)
-      else
-        combined_program state
+    (* Resolve entry point via:
+       1. args.anchor (hash or symbolic ref) → use resolve_anchor
+       2. args.entry_point string (legacy)    → look up by name directly *)
+    let (entry_point, prog) =
+      match obj_get "anchor" args with
+      | Null ->
+        let mod_name    = match obj_get "module"      args with String s -> s | _ -> "" in
+        let entry_point = match obj_get "entry_point" args with String s -> s | _ -> "" in
+        let prog =
+          if mod_name <> "" then
+            let others = Hashtbl.fold (fun mn ms acc ->
+              if mn = mod_name then acc else acc @ ms.typed_ast) state.modules [] in
+            (match Hashtbl.find_opt state.modules mod_name with
+             | None -> []
+             | Some ms -> ms.typed_ast @ others)
+          else
+            combined_program state
+        in
+        (entry_point, prog)
+      | anchor_json ->
+        (match resolve_anchor state anchor_json with
+         | Error _ -> ("", [])  (* will be caught below *)
+         | Ok (_mod_name, fn_name, _ms) ->
+           (fn_name, combined_program state))
     in
-    if prog = [] then
-      Cmd_halt (Mcp_types.make_error "anchor/not-found"
-        (if mod_name <> "" then Printf.sprintf "Module '%s' not found" mod_name
-         else "No modules submitted"))
-    else
-      (try
-         let sites = Typechecker.collect_unhandled_effects prog entry_point in
-         (* Annotate each effect site with which module the function belongs to. *)
-         let diags = List.map (fun (s : Typechecker.effect_site) ->
-             let owner_mod = module_of_fn state s.es_function in
-             let node = match owner_mod with
-               | None -> None
-               | Some mn ->
-                 (match Hashtbl.find_opt state.modules mn with
+    (* Validate anchor resolution failure (only arises from hash path) *)
+    let anchor_err =
+      match obj_get "anchor" args with
+      | Null -> None
+      | anchor_json ->
+        (match resolve_anchor state anchor_json with
+         | Error d -> Some d
+         | Ok _ -> None)
+    in
+    (match anchor_err with
+     | Some d -> Cmd_halt d
+     | None ->
+       if prog = [] then
+         Cmd_halt (Mcp_types.make_error "anchor/not-found" "No modules submitted")
+       else if entry_point = "" then
+         Cmd_halt (Mcp_types.make_error "command/invalid"
+           "effects requires an entry_point or anchor")
+       else
+         (try
+            let sites = Typechecker.collect_unhandled_effects prog entry_point in
+            let diags = List.map (fun (s : Typechecker.effect_site) ->
+                let owner_mod = module_of_fn state s.es_function in
+                let node = match owner_mod with
                   | None -> None
-                  | Some ms -> Hashtbl.find_opt ms.decl_hashes s.es_function)
-             in
-             let msg  = Printf.sprintf "Unhandled effect '%s' in function '%s'"
-                 s.es_effect s.es_function in
-             let loc_mod = owner_mod in
-             Mcp_types.make_warning ?node
-               ~location:(make_loc ?module_name:loc_mod s.es_line s.es_col)
-               "effect/unhandled" msg
-           ) sites in
-         Cmd_success (Object [], diags)
-       with Failure msg ->
-         Cmd_halt (Mcp_types.make_error "anchor/not-found" msg))
+                  | Some mn ->
+                    (match Hashtbl.find_opt state.modules mn with
+                     | None -> None
+                     | Some ms -> Hashtbl.find_opt ms.decl_hashes s.es_function)
+                in
+                let msg = Printf.sprintf "Unhandled effect '%s' in function '%s'"
+                    s.es_effect s.es_function in
+                Mcp_types.make_warning ?node
+                  ~location:(make_loc ?module_name:(module_of_fn state s.es_function)
+                               s.es_line s.es_col)
+                  "effect/unhandled" msg
+              ) sites in
+            Cmd_success (Object [], diags)
+          with Failure msg ->
+            Cmd_halt (Mcp_types.make_error "anchor/not-found" msg)))
 
   | "unused" ->
-    let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
-    (match Hashtbl.find_opt state.modules mod_name with
-     | None ->
-       Cmd_halt (Mcp_types.make_error "anchor/not-found"
-         (Printf.sprintf "Module '%s' not found" mod_name))
-     | Some ms ->
-       let items = Typechecker.collect_unused ms.typed_ast in
-       let diags = List.map (fun (u : Typechecker.unused_item) ->
-           let node = Hashtbl.find_opt ms.decl_hashes u.ui_name in
-           let msg  = Printf.sprintf "Unused %s '%s'" u.ui_kind u.ui_name in
-           Mcp_types.make_warning ?node
-             ~location:(make_loc u.ui_line u.ui_col)
-             "decl/unused" msg
-         ) items in
-       Cmd_success (Object [], diags))
+    (* scope = "project" checks all modules; default checks one. *)
+    let scope = obj_get "scope" args in
+    (match scope with
+     | String "project" ->
+       let diags = Hashtbl.fold (fun _name ms acc ->
+           acc @ diags_of_unused_items ms
+         ) state.modules [] in
+       Cmd_success (Object [("scope", String "project")], diags)
+     | _ ->
+       let mod_name = match obj_get "module" args with String s -> s | _ -> "" in
+       (match Hashtbl.find_opt state.modules mod_name with
+        | None ->
+          Cmd_halt (Mcp_types.make_error "anchor/not-found"
+            (Printf.sprintf "Module '%s' not found" mod_name))
+        | Some ms ->
+          Cmd_success (Object [], diags_of_unused_items ms)))
+
+  | "tail_calls" ->
+    (* Verify that all recursive self-calls in the specified function are in
+       tail position.  Args: { anchor: <hash-or-symbolic> } *)
+    let anchor_json = obj_get "anchor" args in
+    (match resolve_anchor state anchor_json with
+     | Error d -> Cmd_halt d
+     | Ok (mod_name, fn_name, ms) ->
+       let prog = combined_program state in
+       let violations = Typechecker.collect_tail_call_violations prog fn_name in
+       let fn_node = Hashtbl.find_opt ms.decl_hashes fn_name in
+       let diags = List.map (fun (v : Typechecker.tail_call_violation) ->
+           let msg = Printf.sprintf
+               "Recursive call to '%s' is not in tail position" v.tv_fn_name in
+           Mcp_types.make_warning ?node:fn_node
+             ~location:(make_loc ?module_name:(Some mod_name) v.tv_line v.tv_col)
+             "tail_call/non-tail" msg
+         ) violations in
+       let ok = violations = [] in
+       Cmd_success (Object [
+         ("function",  String fn_name);
+         ("module",    String mod_name);
+         ("node",      match fn_node with None -> Null | Some h -> String h);
+         ("all_tail",  Bool ok)],
+         diags))
 
   | _ ->
     Cmd_halt (Mcp_types.make_error "command/unknown"
@@ -1790,9 +1875,11 @@ let tool_verify_schema =
   Object [
     ("name", String "verify");
     ("description", String
-       "On-demand invariant checks: types, exhaustive pattern matching, effect \
-        handling, and unused declarations.  Accepts a batch of commands.");
-    ("inputSchema", batch_input_schema ["types"; "exhaustive"; "effects"; "unused"]);
+       "On-demand invariant checks: types (single source or project-wide), \
+        exhaustive pattern matching, effect handling, unused declarations, \
+        and tail-call position.  Accepts a batch of commands.");
+    ("inputSchema", batch_input_schema
+       ["types"; "exhaustive"; "effects"; "unused"; "tail_calls"]);
   ]
 
 (* ─── Request handler ────────────────────────────────────────────────────── *)

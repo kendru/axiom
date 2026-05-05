@@ -1675,6 +1675,305 @@ let test_write_post_verify_unused_explicit () =
     Alcotest.(check bool) "unused diagnostic present" true has_unused
   )
 
+(* ─── verify / types project scope ───────────────────────────────────────── *)
+
+let tail_source =
+  {|fn sum(acc: Int, n: Int) -> Int ! pure {
+  if eq(n, 0) { acc } else { sum(add(acc, n), sub(n, 1)) }
+}|}
+
+let non_tail_source =
+  {|fn fact(n: Int) -> Int ! pure {
+  if eq(n, 0) { 1 } else { mul(n, fact(sub(n, 1))) }
+}|}
+
+let test_verify_types_project_no_errors () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "types" {|{"scope":"project"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics for well-typed project" true
+      (batch_diagnostics batch = [])
+  )
+
+let test_verify_types_project_scope_field_returned () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "types" {|{"scope":"project"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    let scope = json_field "scope" (first_result batch) in
+    Alcotest.(check bool) "result has scope=project" true
+      (scope = `String "project")
+  )
+
+let test_verify_types_module_scope () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "types" {|{"scope":{"module":"mymod"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok for module scope" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics" true (batch_diagnostics batch = [])
+  )
+
+let test_verify_types_module_scope_not_found () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "types" {|{"scope":{"module":"nonexistent"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted for missing module" true (not (batch_ok batch))
+  )
+
+(* ─── verify / exhaustive project scope ──────────────────────────────────── *)
+
+let test_verify_exhaustive_project_scope () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape exhaustive_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "exhaustive" {|{"scope":"project"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics for exhaustive module" true
+      (batch_diagnostics batch = [])
+  )
+
+(* ─── verify / unused project scope ──────────────────────────────────────── *)
+
+let test_verify_unused_project_scope () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape one_unused_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "unused" {|{"scope":"project"}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "unused diagnostic found in project scope" true
+      (List.exists (fun d -> json_field "code" d = `String "decl/unused") diags)
+  )
+
+(* ─── verify / effects with anchor ───────────────────────────────────────── *)
+
+let test_verify_effects_hash_anchor () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape effects_all_handled_source))));
+    let init_batch = parse_batch_response (read_line ()) in
+    let main_hash = match json_field "nodes" (first_result init_batch) with
+      | `Assoc fs ->
+        (match List.assoc_opt "main" fs with Some (`String h) -> h | _ -> "")
+      | _ -> ""
+    in
+    Alcotest.(check bool) "got main hash" true (String.length main_hash > 0);
+    write_line (tool_call 3 "verify"
+      (single_cmd "effects"
+         (Printf.sprintf {|{"anchor":{"hash":"%s"}}|} main_hash)));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok with hash anchor" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics — all effects handled" true
+      (batch_diagnostics batch = [])
+  )
+
+let test_verify_effects_symbolic_anchor () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape effects_unhandled_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "effects"
+         {|{"anchor":{"module":"mymod","name":"main"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok with symbolic anchor" true (batch_ok batch);
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "unhandled effect diagnostic present" true
+      (List.exists (fun d -> json_field "code" d = `String "effect/unhandled") diags)
+  )
+
+let test_verify_effects_anchor_not_found_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "effects"
+         {|{"anchor":{"module":"no_mod","name":"no_fn"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted for bad anchor" true (not (batch_ok batch))
+  )
+
+(* ─── verify / tail_calls ─────────────────────────────────────────────────── *)
+
+let test_verify_tail_calls_all_tail () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape tail_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "tail_calls"
+         {|{"anchor":{"module":"mymod","name":"sum"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics — all calls in tail position" true
+      (batch_diagnostics batch = []);
+    let r = first_result batch in
+    Alcotest.(check bool) "all_tail is true" true
+      (json_field "all_tail" r = `Bool true);
+    Alcotest.(check bool) "function name present" true
+      (json_field "function" r = `String "sum");
+    Alcotest.(check bool) "node hash present" true
+      (match json_field "node" r with `String s -> String.length s > 0 | _ -> false)
+  )
+
+let test_verify_tail_calls_non_tail_violation () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape non_tail_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "tail_calls"
+         {|{"anchor":{"module":"mymod","name":"fact"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok (violations are warnings)" true (batch_ok batch);
+    let r = first_result batch in
+    Alcotest.(check bool) "all_tail is false" true
+      (json_field "all_tail" r = `Bool false);
+    let diags = batch_diagnostics batch in
+    Alcotest.(check bool) "violation diagnostic present" true (diags <> []);
+    (match diags with
+     | d :: _ ->
+       Alcotest.(check bool) "severity is warning" true
+         (json_field "severity" d = `String "warning");
+       Alcotest.(check bool) "code is tail_call/non-tail" true
+         (json_field "code" d = `String "tail_call/non-tail");
+       Alcotest.(check bool) "node hash present in diagnostic" true
+         (match json_field "node" d with `String s -> String.length s > 0 | _ -> false)
+     | [] -> ())
+  )
+
+let test_verify_tail_calls_pure_fn_no_violations () =
+  (* A non-recursive function should have no violations *)
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape well_typed_source))));
+    ignore (read_line ());
+    write_line (tool_call 3 "verify"
+      (single_cmd "tail_calls"
+         {|{"anchor":{"module":"mymod","name":"double"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no diagnostics for non-recursive fn" true
+      (batch_diagnostics batch = []);
+    let r = first_result batch in
+    Alcotest.(check bool) "all_tail is true for non-recursive fn" true
+      (json_field "all_tail" r = `Bool true)
+  )
+
+let test_verify_tail_calls_anchor_not_found_halts () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "verify"
+      (single_cmd "tail_calls"
+         {|{"anchor":{"module":"no_mod","name":"no_fn"}}|}));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch halted for bad anchor" true (not (batch_ok batch))
+  )
+
+let test_verify_tail_calls_hash_anchor () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    write_line (tool_call 2 "write"
+      (single_cmd "module"
+         (Printf.sprintf {|{"source":"%s","name":"mymod"}|}
+            (json_string_escape tail_source))));
+    let init_batch = parse_batch_response (read_line ()) in
+    let sum_hash = match json_field "nodes" (first_result init_batch) with
+      | `Assoc fs ->
+        (match List.assoc_opt "sum" fs with Some (`String h) -> h | _ -> "")
+      | _ -> ""
+    in
+    Alcotest.(check bool) "got sum hash" true (String.length sum_hash > 0);
+    write_line (tool_call 3 "verify"
+      (single_cmd "tail_calls"
+         (Printf.sprintf {|{"anchor":{"hash":"%s"}}|} sum_hash)));
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok with hash anchor" true (batch_ok batch);
+    Alcotest.(check bool) "all_tail true for tail-recursive fn" true
+      (json_field "all_tail" (first_result batch) = `Bool true)
+  )
+
+(* ─── write post-verify: types project check ─────────────────────────────── *)
+
+let test_write_post_verify_types_project () =
+  let (write_line, read_line, close) = start_server () in
+  Fun.protect ~finally:close (fun () ->
+    initialize write_line read_line;
+    let req = Printf.sprintf
+      {|{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write","arguments":{"commands":[{"op":"module","args":{"source":"%s","name":"mymod"}}],"verify":["types"]}}}|}
+      (json_string_escape well_typed_source)
+    in
+    write_line req;
+    let batch = parse_batch_response (read_line ()) in
+    Alcotest.(check bool) "batch ok" true (batch_ok batch);
+    Alcotest.(check bool) "no type errors for well-typed module" true
+      (not (List.exists (fun d ->
+         json_field "code" d = `String "type/error") (batch_diagnostics batch)))
+  )
+
 (* ─── Test runner ────────────────────────────────────────────────────────── *)
 
 let () =
@@ -1790,5 +2089,32 @@ let () =
       Alcotest.test_case "follow HAS_ARGUMENT → arguments"       `Quick test_query_graph_follow_has_argument;
       Alcotest.test_case "no anchor halts batch"                 `Quick test_query_graph_no_anchor_halts;
       Alcotest.test_case "batch interface+signature+callers"     `Quick test_query_graph_batch_with_existing_ops;
+    ]);
+    ("verify/types/project", [
+      Alcotest.test_case "well-typed project → no diagnostics"   `Quick test_verify_types_project_no_errors;
+      Alcotest.test_case "result carries scope=project"          `Quick test_verify_types_project_scope_field_returned;
+      Alcotest.test_case "module scope → checks one module"      `Quick test_verify_types_module_scope;
+      Alcotest.test_case "module scope missing → halts"          `Quick test_verify_types_module_scope_not_found;
+    ]);
+    ("verify/exhaustive/project", [
+      Alcotest.test_case "project scope → checks all modules"    `Quick test_verify_exhaustive_project_scope;
+    ]);
+    ("verify/unused/project", [
+      Alcotest.test_case "project scope → finds unused decls"    `Quick test_verify_unused_project_scope;
+    ]);
+    ("verify/effects/anchor", [
+      Alcotest.test_case "hash anchor resolves entry point"      `Quick test_verify_effects_hash_anchor;
+      Alcotest.test_case "symbolic anchor resolves entry point"  `Quick test_verify_effects_symbolic_anchor;
+      Alcotest.test_case "bad anchor halts batch"                `Quick test_verify_effects_anchor_not_found_halts;
+    ]);
+    ("verify/tail_calls", [
+      Alcotest.test_case "tail-recursive fn → no violations"     `Quick test_verify_tail_calls_all_tail;
+      Alcotest.test_case "non-tail recursion → violation diag"   `Quick test_verify_tail_calls_non_tail_violation;
+      Alcotest.test_case "non-recursive fn → no violations"      `Quick test_verify_tail_calls_pure_fn_no_violations;
+      Alcotest.test_case "bad anchor halts batch"                `Quick test_verify_tail_calls_anchor_not_found_halts;
+      Alcotest.test_case "hash anchor resolves function"         `Quick test_verify_tail_calls_hash_anchor;
+    ]);
+    ("write/post-verify/types", [
+      Alcotest.test_case "types check in verify list"            `Quick test_write_post_verify_types_project;
     ]);
   ]

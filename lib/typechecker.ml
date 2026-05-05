@@ -1961,3 +1961,78 @@ let collect_callers_in (prog : program) (function_name : string) : caller_site l
     | _ -> ()
   ) prog;
   List.rev !sites
+
+(* ------------------------------------------------------------------ *)
+(* Tail-call violation collection                                       *)
+(* ------------------------------------------------------------------ *)
+
+type tail_call_violation = {
+  tv_fn_name : string;
+  tv_line    : int;
+  tv_col     : int;
+}
+
+(** [collect_tail_call_violations prog fn_name] walks the body of [fn_name]
+    in [prog] and returns one [tail_call_violation] per recursive self-call
+    that is NOT in tail position.  Returns an empty list if [fn_name] is not
+    defined or has no recursive calls at all. *)
+let collect_tail_call_violations (prog : program) (fn_name : string)
+    : tail_call_violation list =
+  let fn_body_opt =
+    List.find_map (fun d ->
+      match d.decl_desc with
+      | DeclFn { fn_name = n; decl_body; _ } when n = fn_name -> Some decl_body
+      | _ -> None) prog
+  in
+  match fn_body_opt with
+  | None -> []
+  | Some body ->
+    let violations = ref [] in
+    let rec walk is_tail e =
+      match e.desc with
+      | App (f, args) ->
+        (match f.desc with
+         | Var callee when callee = fn_name ->
+           if not is_tail then
+             violations := { tv_fn_name = fn_name; tv_line = 0; tv_col = 0 }
+                           :: !violations
+         | _ -> walk false f);
+        List.iter (walk false) args
+      | Let { value; body; _ } ->
+        walk false value;
+        walk is_tail body
+      | If { cond; then_; else_ } ->
+        walk false cond;
+        walk is_tail then_;
+        walk is_tail else_
+      | Match { scrutinee; arms } ->
+        walk false scrutinee;
+        List.iter (fun arm -> walk is_tail arm.arm_body) arms
+      | Do stmts ->
+        let n = List.length stmts in
+        List.iteri (fun i stmt ->
+          match stmt with
+          | StmtLet { value; _ } -> walk false value
+          | StmtExpr e           -> walk (is_tail && i = n - 1) e
+        ) stmts
+      | Fn { fn_body; _ } ->
+        walk true fn_body
+      | Letrec (bindings, body) ->
+        List.iter (fun b -> walk false b.letrec_body) bindings;
+        walk is_tail body
+      | Handle { handled; handlers } ->
+        walk false handled;
+        List.iter (fun h ->
+          List.iter (fun op -> walk is_tail op.op_handler_body) h.op_handlers;
+          Option.iter (fun r -> walk is_tail r.return_body) h.return_handler
+        ) handlers
+      | Record fields -> List.iter (fun (_, e) -> walk false e) fields
+      | RecordUpdate (base, fields) ->
+        walk false base;
+        List.iter (fun (_, e) -> walk false e) fields
+      | Project (e, _) -> walk false e
+      | Perform { args; _ } -> List.iter (walk false) args
+      | Var _ | IntLit _ | FloatLit _ | StringLit _ | BoolLit _ | UnitLit -> ()
+    in
+    walk true body;
+    List.rev !violations

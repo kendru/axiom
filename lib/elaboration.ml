@@ -59,8 +59,11 @@ and eexpr_desc =
   | EDo           of edo_stmt list
   | ELetrec       of eletrec_binding list * eexpr
   | ERecord       of (string * eexpr) list
-  | ERecordUpdate of eexpr * (string * eexpr) list
-  | EProject      of eexpr * string
+                     (** Fields are always in canonical alphabetical order. *)
+  | ERecordUpdate of eexpr * (string * eexpr) list * string list
+                     (** base * updates * all_field_names_sorted *)
+  | EProject      of eexpr * string * int
+                     (** base * field_name * field_index_in_sorted_layout *)
   | EPerform      of eperform_data
   | EHandle       of ehandle_data
 
@@ -218,10 +221,53 @@ let effects_of_callee fn_env (e : Ast.expr) =
   | _ -> []
 
 (* ------------------------------------------------------------------ *)
+(* Record field-layout helpers                                          *)
+(* ------------------------------------------------------------------ *)
+
+(** Sort a list of record fields into canonical (alphabetical) order. *)
+let sort_fields fields =
+  List.sort (fun (a, _) (b, _) -> String.compare a b) fields
+
+(** Given a typechecker [ty], return the sorted list of field names for
+    the record type.  Raises [Failure] if [ty] is not a record type. *)
+let sorted_field_names_of_ty ty =
+  match Typechecker.deref ty with
+  | Typechecker.TyRecord (fields, tail) ->
+    let all_fields, _ = Typechecker.flatten_record fields tail in
+    let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) all_fields in
+    List.map fst sorted
+  | other ->
+    failwith (Format.asprintf "Elaboration: expected record type, got %a"
+                Typechecker.pp_ty other)
+
+(** Find the index of [field_name] in [sorted_names].  Returns 0 on
+    failure (used for module-qualified references where the index is
+    never used as a memory offset). *)
+let field_index sorted_names field_name =
+  let rec go i = function
+    | []           -> 0
+    | n :: rest    -> if n = field_name then i else go (i + 1) rest
+  in
+  go 0 sorted_names
+
+(** Try to infer the type of [e] with the given typechecker context.
+    Returns [None] on failure (e.g. [e] is a module reference that is
+    not in the type environment). *)
+let try_infer_type tc_eenv tc_env e =
+  try Some (Typechecker.infer_expr_in tc_eenv tc_env Typechecker.RPure e)
+  with _ -> None
+
+(* ------------------------------------------------------------------ *)
 (* Main elaboration                                                     *)
 (* ------------------------------------------------------------------ *)
 
-let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env) (e : Ast.expr) : eexpr =
+(** [elaborate_expr fn_env ev_env tc_env tc_eenv e] elaborates [e].
+    [tc_env] and [tc_eenv] are threaded from the typechecker so that
+    record operations can resolve field layouts at elaboration time.
+    [tc_env] is extended as let/do bindings are processed. *)
+let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env)
+    (tc_env : Typechecker.env) (tc_eenv : Typechecker.effect_env)
+    (e : Ast.expr) : eexpr =
   match e.desc with
   | Var x       -> eexpr (EVar x)
   | IntLit n    -> eexpr (EIntLit n)
@@ -232,15 +278,24 @@ let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env) (e : Ast.expr) : eexp
 
   | Let { pat; value; body } ->
     let fn_env' = fn_env_extend_let fn_env pat value in
+    (* Extend tc_env so that the body can resolve record types bound here. *)
+    let body_tc_env = match pat.pat_desc with
+      | PVar x ->
+        (match try_infer_type tc_eenv tc_env value with
+         | Some vty ->
+           Typechecker.env_extend x (Typechecker.mono vty) tc_env
+         | None -> tc_env)
+      | _ -> tc_env
+    in
     eexpr (ELet {
       pat;
-      value = elaborate_expr fn_env  ev_env value;
-      body  = elaborate_expr fn_env' ev_env body;
+      value = elaborate_expr fn_env  ev_env tc_env       tc_eenv value;
+      body  = elaborate_expr fn_env' ev_env body_tc_env  tc_eenv body;
     })
 
   | App (callee, args) ->
-    let ecallee = elaborate_expr fn_env ev_env callee in
-    let eargs   = List.map (elaborate_expr fn_env ev_env) args in
+    let ecallee = elaborate_expr fn_env ev_env tc_env tc_eenv callee in
+    let eargs   = List.map (elaborate_expr fn_env ev_env tc_env tc_eenv) args in
     let callee_effs = effects_of_callee fn_env callee in
     let ev_args = List.filter_map (fun eff ->
         match List.assoc_opt eff ev_env with
@@ -255,16 +310,22 @@ let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env) (e : Ast.expr) : eexp
     let ev_env' = List.fold_left
         (fun acc ep -> (ep.ev_effect, ep.ev_name) :: acc)
         ev_env ev_params in
+    (* Extend tc_env with param types for the body. *)
+    let body_tc_env = List.fold_left (fun env p ->
+        Typechecker.env_extend p.param_name
+          (Typechecker.mono (Typechecker.ty_of_type_expr p.param_type))
+          env
+      ) tc_env params in
     eexpr (EFn {
       ev_params;
       params;
       return_type;
       effects;
-      fn_body = elaborate_expr fn_env ev_env' fn_body;
+      fn_body = elaborate_expr fn_env ev_env' body_tc_env tc_eenv fn_body;
     })
 
   | Perform { effect_name; op_name; args } ->
-    let eargs = List.map (elaborate_expr fn_env ev_env) args in
+    let eargs = List.map (elaborate_expr fn_env ev_env tc_env tc_eenv) args in
     let ev_var =
       match List.assoc_opt effect_name ev_env with
       | Some v -> v
@@ -283,12 +344,12 @@ let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env) (e : Ast.expr) : eexp
         let eop_handlers = List.map (fun (oh : Ast.op_handler) ->
             { op_handler_name   = oh.op_handler_name;
               op_handler_params = oh.op_handler_params;
-              op_handler_body   = elaborate_expr fn_env ev_env oh.op_handler_body;
+              op_handler_body   = elaborate_expr fn_env ev_env tc_env tc_eenv oh.op_handler_body;
             }
           ) h.op_handlers in
         let ereturn = Option.map (fun (rh : Ast.return_handler) ->
             { return_var  = rh.return_var;
-              return_body = elaborate_expr fn_env ev_env rh.return_body;
+              return_body = elaborate_expr fn_env ev_env tc_env tc_eenv rh.return_body;
             }
           ) h.return_handler in
         { effect_handler = h.effect_handler;
@@ -302,38 +363,46 @@ let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env) (e : Ast.expr) : eexp
         (h.effect_handler, ev_var_name h.effect_handler) :: acc
       ) ev_env handlers in
     eexpr (EHandle {
-      handled  = elaborate_expr fn_env ev_env' handled;
+      handled  = elaborate_expr fn_env ev_env' tc_env tc_eenv handled;
       handlers = ehandlers;
     })
 
   | Match { scrutinee; arms } ->
     eexpr (EMatch {
-      scrutinee = elaborate_expr fn_env ev_env scrutinee;
+      scrutinee = elaborate_expr fn_env ev_env tc_env tc_eenv scrutinee;
       arms = List.map (fun (a : Ast.match_arm) ->
           { pattern  = a.pattern;
-            arm_body = elaborate_expr fn_env ev_env a.arm_body;
+            arm_body = elaborate_expr fn_env ev_env tc_env tc_eenv a.arm_body;
           }) arms;
     })
 
   | If { cond; then_; else_ } ->
     eexpr (EIf {
-      cond  = elaborate_expr fn_env ev_env cond;
-      then_ = elaborate_expr fn_env ev_env then_;
-      else_ = elaborate_expr fn_env ev_env else_;
+      cond  = elaborate_expr fn_env ev_env tc_env tc_eenv cond;
+      then_ = elaborate_expr fn_env ev_env tc_env tc_eenv then_;
+      else_ = elaborate_expr fn_env ev_env tc_env tc_eenv else_;
     })
 
   | Do stmts ->
-    let rec go fn_env stmts =
+    let rec go fn_env tc_env stmts =
       match stmts with
       | [] -> []
       | StmtLet { pat; value } :: rest ->
         let fn_env' = fn_env_extend_let fn_env pat value in
-        EStmtLet { pat; value = elaborate_expr fn_env ev_env value }
-        :: go fn_env' rest
+        let next_tc_env = match pat.pat_desc with
+          | PVar x ->
+            (match try_infer_type tc_eenv tc_env value with
+             | Some vty ->
+               Typechecker.env_extend x (Typechecker.mono vty) tc_env
+             | None -> tc_env)
+          | _ -> tc_env
+        in
+        EStmtLet { pat; value = elaborate_expr fn_env ev_env tc_env tc_eenv value }
+        :: go fn_env' next_tc_env rest
       | StmtExpr e :: rest ->
-        EStmtExpr (elaborate_expr fn_env ev_env e) :: go fn_env rest
+        EStmtExpr (elaborate_expr fn_env ev_env tc_env tc_eenv e) :: go fn_env tc_env rest
     in
-    eexpr (EDo (go fn_env stmts))
+    eexpr (EDo (go fn_env tc_env stmts))
 
   | Letrec (bindings, body) ->
     (* Letrec bindings have no effect annotation in the surface AST; they
@@ -341,28 +410,61 @@ let rec elaborate_expr (fn_env : fn_env) (ev_env : ev_env) (e : Ast.expr) : eexp
     let fn_env' = List.fold_left
         (fun acc (b : Ast.letrec_binding) -> (b.letrec_name, []) :: acc)
         fn_env bindings in
+    let tc_env' = List.fold_left (fun env (b : Ast.letrec_binding) ->
+        Typechecker.env_extend b.letrec_name
+          (Typechecker.mono (Typechecker.ty_of_type_expr b.letrec_return_type))
+          env
+      ) tc_env bindings in
     let ebindings = List.map (fun (b : Ast.letrec_binding) ->
         { letrec_name        = b.letrec_name;
           letrec_ev_params   = [];
           letrec_params      = b.letrec_params;
           letrec_return_type = b.letrec_return_type;
-          letrec_body        = elaborate_expr fn_env' ev_env b.letrec_body;
+          letrec_body        = elaborate_expr fn_env' ev_env tc_env' tc_eenv b.letrec_body;
         }
       ) bindings in
-    eexpr (ELetrec (ebindings, elaborate_expr fn_env' ev_env body))
+    eexpr (ELetrec (ebindings, elaborate_expr fn_env' ev_env tc_env' tc_eenv body))
 
   | Record fields ->
+    (* Canonical layout: fields in alphabetical order. *)
+    let sorted = sort_fields fields in
     eexpr (ERecord (List.map (fun (n, v) ->
-        (n, elaborate_expr fn_env ev_env v)) fields))
+        (n, elaborate_expr fn_env ev_env tc_env tc_eenv v)) sorted))
 
-  | RecordUpdate (e, fields) ->
+  | RecordUpdate (base, updates) ->
+    (* Determine the full sorted field list from the base's inferred type. *)
+    let all_field_names =
+      match try_infer_type tc_eenv tc_env base with
+      | Some ty -> (try sorted_field_names_of_ty ty
+                    with Failure msg ->
+                      failwith ("Elaboration: RecordUpdate: " ^ msg))
+      | None ->
+        failwith "Elaboration: RecordUpdate: cannot determine base record type"
+    in
     eexpr (ERecordUpdate (
-      elaborate_expr fn_env ev_env e,
-      List.map (fun (n, v) -> (n, elaborate_expr fn_env ev_env v)) fields
+      elaborate_expr fn_env ev_env tc_env tc_eenv base,
+      List.map (fun (n, v) ->
+          (n, elaborate_expr fn_env ev_env tc_env tc_eenv v)) updates,
+      all_field_names
     ))
 
   | Project (e, field) ->
-    eexpr (EProject (elaborate_expr fn_env ev_env e, field))
+    (* Determine the field index for record accesses.  Returns 0 for
+       module-qualified references (EVar of a module name) which are not in
+       the type environment; the index is unused in that context because
+       module-qualified EProject nodes only appear inside EApp. *)
+    let idx =
+      match try_infer_type tc_eenv tc_env e with
+      | Some ty ->
+        (match Typechecker.deref ty with
+         | Typechecker.TyRecord (fields, tail) ->
+           let all_fields, _ = Typechecker.flatten_record fields tail in
+           let sorted = List.sort (fun (a, _) (b, _) -> String.compare a b) all_fields in
+           field_index (List.map fst sorted) field
+         | _ -> 0)
+      | None -> 0
+    in
+    eexpr (EProject (elaborate_expr fn_env ev_env tc_env tc_eenv e, field, idx))
 
 (** Build a fn_env from a list of top-level (or module-level) declarations.
     Functions inside [DeclModule] are included with their qualified name
@@ -382,30 +484,42 @@ let fn_env_of_decls decls =
   in
   List.concat_map (collect None) decls
 
-let rec elaborate_decl (fn_env : fn_env) (d : Ast.decl) : edecl =
+let rec elaborate_decl (fn_env : fn_env)
+    (tc_env : Typechecker.env) (tc_eenv : Typechecker.effect_env)
+    (d : Ast.decl) : edecl =
   match d.decl_desc with
   | DeclFn { pub; fn_name; type_params; params; return_type; effects; decl_body } ->
     let eff_names = effects_of_set effects in
     let ev_params = List.map make_ev_param eff_names in
     let ev_env    = List.map (fun ep -> (ep.ev_effect, ep.ev_name)) ev_params in
+    (* Extend tc_env with the declared parameter types for body elaboration. *)
+    let body_tc_env = List.fold_left (fun env p ->
+        Typechecker.env_extend p.param_name
+          (Typechecker.mono (Typechecker.ty_of_type_expr p.param_type))
+          env
+      ) tc_env params in
     { edecl_desc = EDeclFn {
         pub; fn_name; type_params; ev_params; params; return_type; effects;
-        decl_body = elaborate_expr fn_env ev_env decl_body;
+        decl_body = elaborate_expr fn_env ev_env body_tc_env tc_eenv decl_body;
       }
     }
   | DeclModule { pub; module_name; body } ->
     let fn_env' = fn_env_of_decls body in
     { edecl_desc = EDeclModule {
         pub; module_name;
-        body = List.map (elaborate_decl fn_env') body;
+        body = List.map (elaborate_decl fn_env' tc_env tc_eenv) body;
       }
     }
   | other ->
     { edecl_desc = EDeclPassthrough other }
 
 let elaborate_program (prog : Ast.program) : eprogram =
+  (* Run check_program to obtain a type environment for record layout
+     resolution during elaboration.  The program has already been validated
+     by the caller; this second call always succeeds. *)
+  let (tc_env, tc_eenv) = Typechecker.check_program prog in
   let fn_env = fn_env_of_decls prog in
-  List.map (elaborate_decl fn_env) prog
+  List.map (elaborate_decl fn_env tc_env tc_eenv) prog
 
 (* ------------------------------------------------------------------ *)
 (* Pretty-printer (for dump / round-trip tests)                        *)
@@ -494,15 +608,15 @@ let rec pp_eexpr fmt e =
          ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
          (fun f (n, v) -> Format.fprintf f "%s = %a" n pp_eexpr v)) fields
 
-  | ERecordUpdate (e, fields) ->
+  | ERecordUpdate (e, fields, _all) ->
     Format.fprintf fmt "{ %a with %a }"
       pp_eexpr e
       (Format.pp_print_list
          ~pp_sep:(fun f () -> Format.pp_print_string f ", ")
          (fun f (n, v) -> Format.fprintf f "%s = %a" n pp_eexpr v)) fields
 
-  | EProject (e, field) ->
-    Format.fprintf fmt "%a.%s" pp_eexpr e field
+  | EProject (e, field, idx) ->
+    Format.fprintf fmt "%a.%s[%d]" pp_eexpr e field idx
 
 and pp_eeffect_handler fmt h =
   Format.fprintf fmt "%s[ev:%s] { %a%a }"

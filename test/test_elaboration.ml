@@ -56,10 +56,10 @@ let rec collect_performs acc e =
       (collect_performs acc body) bs
   | ERecord fields ->
     List.fold_left (fun a (_, v) -> collect_performs a v) acc fields
-  | ERecordUpdate (e, fields) ->
+  | ERecordUpdate (e, fields, _) ->
     List.fold_left (fun a (_, v) -> collect_performs a v)
       (collect_performs acc e) fields
-  | EProject (e, _) -> collect_performs acc e
+  | EProject (e, _, _) -> collect_performs acc e
   | _ -> acc
 
 (* ------------------------------------------------------------------ *)

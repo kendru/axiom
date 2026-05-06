@@ -277,8 +277,8 @@ and compile_eexpr ?(tail=false) ctx e =
     let (tag, _) = List.assoc name ctx.ctor_map in
     compile_ctor ctx tag args
 
-  (* Module-qualified function call: mod.fn(args) *)
-  | EApp ({ edesc = EProject ({ edesc = EVar mod_name; _ }, fn_name); _ }, args) ->
+  (* Module-qualified function call: mod.fn(args) — index is unused here *)
+  | EApp ({ edesc = EProject ({ edesc = EVar mod_name; _ }, fn_name, _); _ }, args) ->
     let qualified = mod_name ^ "." ^ fn_name in
     (match List.assoc_opt qualified ctx.func_map with
      | Some idx ->
@@ -370,6 +370,50 @@ and compile_eexpr ?(tail=false) ctx e =
     (match List.assoc_opt s ctx.string_pool with
      | Some off -> [I32Const off]
      | None -> failwith ("Codegen: string literal not in pool: " ^ String.escaped s))
+
+  (* ── Record construction ─────────────────────────────────────────────
+     Layout: heap-allocated block of n × 4 bytes.  Field i (in canonical
+     alphabetical order) lives at byte offset i × 4.  The elaboration pass
+     guarantees that [fields] are already sorted alphabetically. *)
+  | ERecord fields ->
+    let n = List.length fields in
+    if n = 0 then
+      [I32Const 0]   (* empty record is represented as a null pointer *)
+    else
+      let ptr_local = alloc_local ctx in
+      [I32Const (n * 4); Call ctx.alloc_idx; LocalSet ptr_local]
+      @ List.concat (List.mapi (fun i (_, v) ->
+          [LocalGet ptr_local]
+          @ compile_eexpr ctx v
+          @ [I32Store (2, i * 4)]
+        ) fields)
+      @ [LocalGet ptr_local]
+
+  (* ── Record field projection ─────────────────────────────────────────
+     Load the i32 value at offset [idx × 4] from the record pointer. *)
+  | EProject (base, _field, idx) ->
+    compile_eexpr ctx base @ [I32Load (2, idx * 4)]
+
+  (* ── Functional record update ────────────────────────────────────────
+     Allocate a fresh record of the same size.  For each field (in sorted
+     order): if it is listed in [updates], emit the new value; otherwise
+     copy the original value from [base_ptr + offset]. *)
+  | ERecordUpdate (base, updates, all_field_names) ->
+    let n = List.length all_field_names in
+    let base_local = alloc_local ctx in
+    let new_ptr_local = alloc_local ctx in
+    compile_eexpr ctx base
+    @ [LocalSet base_local]
+    @ [I32Const (n * 4); Call ctx.alloc_idx; LocalSet new_ptr_local]
+    @ List.concat (List.mapi (fun i field_name ->
+        let value_instrs =
+          match List.assoc_opt field_name updates with
+          | Some update_expr -> compile_eexpr ctx update_expr
+          | None             -> [LocalGet base_local; I32Load (2, i * 4)]
+        in
+        [LocalGet new_ptr_local] @ value_instrs @ [I32Store (2, i * 4)]
+      ) all_field_names)
+    @ [LocalGet new_ptr_local]
 
   | other ->
     failwith (Format.asprintf "Codegen: unsupported eexpr: %a" pp_eexpr { edesc = other })
@@ -511,10 +555,10 @@ let rec scan_eexpr_strings acc e =
       (scan_eexpr_strings acc body) bindings
   | ERecord fields ->
     List.fold_left (fun a (_, e2) -> scan_eexpr_strings a e2) acc fields
-  | ERecordUpdate (e2, fields) ->
+  | ERecordUpdate (e2, fields, _) ->
     List.fold_left (fun a (_, fe) -> scan_eexpr_strings a fe)
       (scan_eexpr_strings acc e2) fields
-  | EProject (e2, _) -> scan_eexpr_strings acc e2
+  | EProject (e2, _, _) -> scan_eexpr_strings acc e2
   | EPerform { args; _ } -> List.fold_left scan_eexpr_strings acc args
   | EHandle { handled; handlers } ->
     let acc' = scan_eexpr_strings acc handled in

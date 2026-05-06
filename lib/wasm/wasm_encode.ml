@@ -52,6 +52,7 @@ type instr =
   | CallIndirect of int * int   (** type_idx, table_idx *)
   | ReturnCall of int           (** tail call by func index (opcode 0x12) *)
   | ReturnCallIndirect of int * int (** tail call indirect: type_idx, table_idx (opcode 0x13) *)
+  | Unreachable                 (** trap unconditionally (opcode 0x00) *)
 
 (** Run-length encoded local variable group in a function body. *)
 type local_decl = {
@@ -235,8 +236,9 @@ let rec put_instr buf instr =
     put_uleb128 buf (List.length targets);
     List.iter (put_uleb128 buf) targets;
     put_uleb128 buf default
-  | Return -> put_byte buf 0x0F
-  | Drop   -> put_byte buf 0x1A
+  | Return      -> put_byte buf 0x0F
+  | Drop        -> put_byte buf 0x1A
+  | Unreachable -> put_byte buf 0x00
   | GlobalGet i ->
     put_byte buf 0x23;
     put_uleb128 buf i

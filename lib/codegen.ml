@@ -21,11 +21,11 @@ open Elaboration
 (* ------------------------------------------------------------------ *)
 
 let val_type_of_type_expr = function
-  | Ast.TyName _ -> I32   (* Int, Bool, and all ADT types lower to i32 *)
+  | Ast.TyName _ | Ast.TyApp _ -> I32   (* all scalars and ADT pointers lower to i32 *)
   | _ -> failwith "Codegen: unsupported type"
 
 let is_supported_type = function
-  | Ast.TyName _ -> true
+  | Ast.TyName _ | Ast.TyApp _ -> true
   | _ -> false
 
 (* ------------------------------------------------------------------ *)
@@ -224,7 +224,9 @@ and chain_pats ctx pairs on_match on_fail =
 and compile_match ?(tail=false) ctx scrut_local arms =
   match arms with
   | [] ->
-    [I32Const 0]
+    (* Exhaustiveness is guaranteed by the type-checker; this path is
+       a defensive trap that fires only on a bug in an earlier pass. *)
+    [Unreachable]
   | arm :: rest ->
     let arm_tail = tail && (match ctx.tco with TailCallInstr -> true | TrampolineLoop -> false) in
     let on_fail = compile_match ~tail:arm_tail ctx scrut_local rest in
@@ -630,6 +632,12 @@ let add_str_head_fn m =
         Some [LocalGet 0; I32Const 4; I32Add; I32Load8U (0, 0)])
     ]
 
+(** max(a, b) -> Int: return the larger of two i32 values. *)
+let add_max_fn m =
+  add_function m [I32; I32] [I32] []
+    [ LocalGet 0; LocalGet 1; I32GtS;
+      If (ValType I32, [LocalGet 0], Some [LocalGet 1]) ]
+
 (* ------------------------------------------------------------------ *)
 (* Module emitter                                                       *)
 (* ------------------------------------------------------------------ *)
@@ -666,11 +674,13 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
   let str_eq_idx     = add_str_eq_fn m in
   let str_concat_idx = add_str_concat_fn m alloc_idx in
   let str_head_idx   = add_str_head_fn m in
+  let max_idx        = add_max_fn m in
   let string_builtins =
     [ ("string_length", str_length_idx)
     ; ("string_eq",     str_eq_idx)
     ; ("concat",        str_concat_idx)
     ; ("string_head",   str_head_idx)
+    ; ("max",           max_idx)
     ]
   in
   let pending     = ref [] in
@@ -686,9 +696,15 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
     List.concat_map (fun (d : Ast.decl) ->
       match d.Ast.decl_desc with
       | Ast.DeclType { ctors; _ } ->
-        List.mapi (fun tag c ->
-          (c.Ast.ctor_name, (tag, List.length c.Ast.ctor_params))
-        ) ctors
+        List.concat_map (fun (tag, c) ->
+          let arity = List.length c.Ast.ctor_params in
+          let entry = (c.Ast.ctor_name, (tag, arity)) in
+          let lower = String.lowercase_ascii c.Ast.ctor_name in
+          (* Add a lowercase alias so that stdlib-style calls like none(), cons(h,t)
+             resolve to the same constructor as the uppercase form. *)
+          if lower = c.Ast.ctor_name then [entry]
+          else [entry; (lower, (tag, arity))]
+        ) (List.mapi (fun tag c -> (tag, c)) ctors)
       | _ -> []
     ) prog
   in

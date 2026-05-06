@@ -241,6 +241,65 @@ bytes.  The emitter calls `__alloc(4 * (1 + k))`, then uses
 `__heap_ptr` starts at 1024 (also a multiple of 4), so all word
 accesses are naturally aligned.
 
+### Structural record layout
+
+`TyRecord` values are heap-allocated blocks with **no tag word**.  Fields
+are laid out contiguously in **canonical alphabetical order** — the same
+order the elaboration pass fixes for every `ERecord` node.
+
+```
+offset 0           : i32  field[0]   (first field alphabetically)
+offset 4           : i32  field[1]
+...
+offset 4*(n-1)     : i32  field[n-1] (last field alphabetically)
+```
+
+**Allocation size** for a record with `n` fields is `4 * n` bytes.
+
+**Canonicalization rule**: field names are sorted with `String.compare`
+(byte-wise lexicographic order, equivalent to alphabetical for ASCII
+identifiers).  The elaboration pass (`elaboration.ml`) sorts every
+`ERecord`'s field list before codegen sees it, so the codegen can rely
+on position `i` corresponding to the `i`-th name in this sorted order.
+
+**Construction** (`ERecord fields`):
+
+```
+alloc(n * 4)  → ptr
+ptr + 0*4 ← compile(field[0].value)
+ptr + 1*4 ← compile(field[1].value)
+...
+result: ptr
+```
+
+**Projection** (`EProject(base, field, idx)`):
+
+The elaboration pass resolves `field` to its 0-based index `idx` in the
+sorted field list at elaboration time.  Codegen emits:
+
+```
+compile(base)
+i32.load offset=(idx * 4)
+```
+
+**Functional update** (`ERecordUpdate(base, updates, all_field_names)`):
+
+Allocates a fresh record of the same size.  For each field (in sorted
+order), if the field appears in `updates` the new expression is used;
+otherwise the original value is copied from the base pointer.
+Aliasing of the original record is therefore never observable.
+
+```
+base_ptr ← compile(base)
+new_ptr  ← alloc(n * 4)
+for i, name in enumerate(all_field_names):
+    if name in updates:
+        new_ptr + i*4 ← compile(updates[name])
+    else:
+        new_ptr + i*4 ← i32.load(base_ptr + i*4)
+result: new_ptr
+```
+
 ---
 
 ## End-to-end pipeline (Milestone 5)

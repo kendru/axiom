@@ -1190,6 +1190,66 @@ let test_example_main_returns path expected () =
       | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m)
 
 (* ------------------------------------------------------------------ *)
+(* Issue #106: record fixtures                                         *)
+(* ------------------------------------------------------------------ *)
+
+(* Construct {x: 10, y: 20} and project x — result 10. *)
+let src_record_project =
+  {|fn main() -> Int ! pure {
+  let r = { x: 10, y: 20 } in
+  r.x
+}|}
+
+(* Same record, project y — result 20. *)
+let src_record_project_y =
+  {|fn main() -> Int ! pure {
+  let r = { x: 10, y: 20 } in
+  r.y
+}|}
+
+(* Functional update: { r with x: 99 }.x should be 99. *)
+let src_record_update =
+  {|fn main() -> Int ! pure {
+  let r = { x: 10, y: 20 } in
+  let r2 = { r with x: 99 } in
+  r2.x
+}|}
+
+(* After { r with x: 99 }, the unchanged field y should still be 20. *)
+let src_record_update_other_field =
+  {|fn main() -> Int ! pure {
+  let r = { x: 10, y: 20 } in
+  let r2 = { r with x: 99 } in
+  r2.y
+}|}
+
+(* Aliasing: update must not mutate original — r.x stays 10 after update. *)
+let src_record_update_no_alias =
+  {|fn main() -> Int ! pure {
+  let r = { x: 10, y: 20 } in
+  let _r2 = { r with x: 99 } in
+  r.x
+}|}
+
+(* Three-field record with alphabetical layout a, b, c; project b = 2. *)
+let src_record_three_fields =
+  {|fn main() -> Int ! pure {
+  let r = { a: 1, b: 2, c: 3 } in
+  r.b
+}|}
+
+(* Record constructed inside a function using parameters; project inside callee. *)
+let src_record_fn_param =
+  {|fn get_x(x: Int, y: Int) -> Int ! pure {
+  let r = { x: x, y: y } in
+  r.x
+}
+
+fn main() -> Int ! pure {
+  get_x(42, 7)
+}|}
+
+(* ------------------------------------------------------------------ *)
 (* Suite                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1483,5 +1543,36 @@ fn main() -> Int ! pure { 0 }|};
             (test_main_returns src_string_head_empty 0)
         ; Alcotest.test_case "triple concat length = 3"            `Quick
             (test_main_returns src_string_triple_concat 3)
+        ] )
+
+    (* ------------------------------------------------------------------ *)
+    (* Issue #106: record construction, projection, and functional update  *)
+    (* ------------------------------------------------------------------ *)
+    ; ( "records",
+        (* Layout: heap-allocated block of n×4 bytes.  Fields stored in
+           canonical alphabetical order, so field i lives at byte offset i×4.
+           Functional update allocates a fresh record; aliasing is not reused. *)
+        [ Alcotest.test_case "build: record construction"          `Quick
+            (test_build_produces_file src_record_project)
+        ; Alcotest.test_case "validates: record construction"      `Quick
+            (test_validates src_record_project)
+        ; Alcotest.test_case "record project x = 10"               `Quick
+            (test_main_returns src_record_project 10)
+        ; Alcotest.test_case "record project y = 20"               `Quick
+            (test_main_returns src_record_project_y 20)
+        ; Alcotest.test_case "build: record update"                `Quick
+            (test_build_produces_file src_record_update)
+        ; Alcotest.test_case "validates: record update"            `Quick
+            (test_validates src_record_update)
+        ; Alcotest.test_case "record update x = 99"                `Quick
+            (test_main_returns src_record_update 99)
+        ; Alcotest.test_case "update preserves other fields"       `Quick
+            (test_main_returns src_record_update_other_field 20)
+        ; Alcotest.test_case "update does not alias original"      `Quick
+            (test_main_returns src_record_update_no_alias 10)
+        ; Alcotest.test_case "three-field record, project middle"  `Quick
+            (test_main_returns src_record_three_fields 2)
+        ; Alcotest.test_case "record passed to fn, project inside" `Quick
+            (test_main_returns src_record_fn_param 42)
         ] )
     ]

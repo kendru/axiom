@@ -77,9 +77,11 @@ type ctx = {
   table_funcs  : int list ref;               (** accumulated func indices for table *)
   tco          : tco_mode;
   trampoline   : trampoline_ctx option;
+  string_pool  : (string * int) list;        (** literal -> static memory offset *)
 }
 
-let make_ctx tco params func_map ctor_map alloc_idx module_ pending effect_map table_funcs =
+let make_ctx tco params func_map ctor_map alloc_idx module_ pending effect_map table_funcs
+    string_pool =
   { env          = List.mapi (fun i (name, _) -> (name, i)) params
   ; next_local   = ref (List.length params)
   ; extra_locals = ref []
@@ -92,6 +94,7 @@ let make_ctx tco params func_map ctor_map alloc_idx module_ pending effect_map t
   ; table_funcs
   ; tco
   ; trampoline   = None
+  ; string_pool
   }
 
 let alloc_local ctx =
@@ -361,6 +364,11 @@ and compile_eexpr ?(tail=false) ctx e =
   | EHandle { handled; handlers } ->
     compile_ehandle ctx handled handlers
 
+  | EStringLit s ->
+    (match List.assoc_opt s ctx.string_pool with
+     | Some off -> [I32Const off]
+     | None -> failwith ("Codegen: string literal not in pool: " ^ String.escaped s))
+
   | other ->
     failwith (Format.asprintf "Codegen: unsupported eexpr: %a" pp_eexpr { edesc = other })
 
@@ -398,7 +406,7 @@ and compile_eletrec ?(tail=false) ctx bindings body =
   List.iter (fun (b, idx, param_tys) ->
     let fn_ctx =
       make_ctx ctx.tco param_tys new_func_map ctx.ctor_map ctx.alloc_idx
-        ctx.module_ ctx.pending ctx.effect_map ctx.table_funcs
+        ctx.module_ ctx.pending ctx.effect_map ctx.table_funcs ctx.string_pool
     in
     let fn_ctx = setup_trampoline ctx.tco idx (List.length param_tys) fn_ctx in
     let instrs = compile_eexpr ~tail:true fn_ctx b.letrec_body in
@@ -435,7 +443,7 @@ and compile_ehandle ctx handled handlers =
         let handler_ctx =
           make_ctx ctx.tco param_pairs ctx.func_map ctx.ctor_map
             ctx.alloc_idx ctx.module_ ctx.pending
-            ctx.effect_map ctx.table_funcs
+            ctx.effect_map ctx.table_funcs ctx.string_pool
         in
         let handler_ctx =
           setup_trampoline ctx.tco fn_idx (List.length param_pairs) handler_ctx
@@ -471,16 +479,176 @@ and compile_ehandle ctx handled handlers =
   ) handled_code handlers
 
 (* ------------------------------------------------------------------ *)
+(* String literal pool                                                  *)
+(* ------------------------------------------------------------------ *)
+
+(** Recursively collect unique string literals from an elaborated expression. *)
+let rec scan_eexpr_strings acc e =
+  match e.edesc with
+  | EStringLit s -> if List.mem s acc then acc else s :: acc
+  | EIntLit _ | EBoolLit _ | EUnitLit | EVar _ | EFloatLit _ -> acc
+  | ELet { value; body; _ } ->
+    scan_eexpr_strings (scan_eexpr_strings acc value) body
+  | EApp (f, args) ->
+    List.fold_left scan_eexpr_strings (scan_eexpr_strings acc f) args
+  | EFn { fn_body; _ } -> scan_eexpr_strings acc fn_body
+  | EMatch { scrutinee; arms } ->
+    List.fold_left (fun a arm -> scan_eexpr_strings a arm.arm_body)
+      (scan_eexpr_strings acc scrutinee) arms
+  | EIf { cond; then_; else_ } ->
+    scan_eexpr_strings
+      (scan_eexpr_strings (scan_eexpr_strings acc cond) then_) else_
+  | EDo stmts ->
+    List.fold_left (fun a stmt ->
+      match stmt with
+      | EStmtExpr e2 -> scan_eexpr_strings a e2
+      | EStmtLet { value; _ } -> scan_eexpr_strings a value
+    ) acc stmts
+  | ELetrec (bindings, body) ->
+    List.fold_left (fun a b -> scan_eexpr_strings a b.letrec_body)
+      (scan_eexpr_strings acc body) bindings
+  | ERecord fields ->
+    List.fold_left (fun a (_, e2) -> scan_eexpr_strings a e2) acc fields
+  | ERecordUpdate (e2, fields) ->
+    List.fold_left (fun a (_, fe) -> scan_eexpr_strings a fe)
+      (scan_eexpr_strings acc e2) fields
+  | EProject (e2, _) -> scan_eexpr_strings acc e2
+  | EPerform { args; _ } -> List.fold_left scan_eexpr_strings acc args
+  | EHandle { handled; handlers } ->
+    let acc' = scan_eexpr_strings acc handled in
+    List.fold_left (fun a handler ->
+      let a' = match handler.return_handler with
+        | None -> a
+        | Some rh -> scan_eexpr_strings a rh.return_body
+      in
+      List.fold_left (fun a2 oh -> scan_eexpr_strings a2 oh.op_handler_body)
+        a' handler.op_handlers
+    ) acc' handlers
+
+let rec scan_edecl_strings acc (d : edecl) =
+  match d.edecl_desc with
+  | EDeclFn f -> scan_eexpr_strings acc f.decl_body
+  | EDeclModule { body; _ } -> List.fold_left scan_edecl_strings acc body
+  | EDeclPassthrough _ -> acc
+
+(** Walk [eprog], collect unique string literals, assign each a static memory
+    offset starting at [base].  Layout per string:
+    [offset+0 .. offset+3] = i32 byte-length (little-endian)
+    [offset+4 .. offset+4+n-1] = UTF-8 content
+    Returns [(literal, offset) list * next_free_offset]. *)
+let build_string_pool eprog base =
+  let strings = List.fold_left scan_edecl_strings [] eprog in
+  List.fold_left (fun (pool, off) s ->
+    let n = String.length s in
+    let next = (off + 4 + n + 3) / 4 * 4 in   (* 4-byte aligned *)
+    (pool @ [(s, off)], next)
+  ) ([], base) strings
+
+(** Encode one string as a length-prefixed segment and add it to the module. *)
+let emit_string_data m s off =
+  let n = String.length s in
+  let seg = Bytes.create (4 + n) in
+  Bytes.set_int32_le seg 0 (Int32.of_int n);
+  Bytes.blit_string s 0 seg 4 n;
+  add_data m off seg
+
+(* ------------------------------------------------------------------ *)
+(* Built-in string helper functions                                     *)
+(* ------------------------------------------------------------------ *)
+
+(** __str_length(ptr) -> len: load the i32 length prefix. *)
+let add_str_length_fn m =
+  add_function m [I32] [I32] []
+    [ LocalGet 0; I32Load (2, 0) ]
+
+(** __str_eq(a, b) -> Bool: byte-by-byte equality. *)
+let add_str_eq_fn m =
+  add_function m [I32; I32] [I32]
+    [{ count = 2; ty = I32 }]   (* locals 2=len_a, 3=i *)
+    [ LocalGet 0; I32Load (2, 0); LocalTee 2;
+      LocalGet 1; I32Load (2, 0);
+      I32Ne; If (Void, [I32Const 0; Return], None);
+      I32Const 0; LocalSet 3;
+      Block (Void, [
+        Loop (Void, [
+          LocalGet 3; LocalGet 2; I32GeS; BrIf 1;
+          LocalGet 0; I32Const 4; I32Add; LocalGet 3; I32Add; I32Load8U (0, 0);
+          LocalGet 1; I32Const 4; I32Add; LocalGet 3; I32Add; I32Load8U (0, 0);
+          I32Ne; If (Void, [I32Const 0; Return], None);
+          LocalGet 3; I32Const 1; I32Add; LocalSet 3;
+          Br 0
+        ])
+      ]);
+      I32Const 1
+    ]
+
+(** __str_concat(a, b) -> ptr: allocate and fill a new length-prefixed string.
+    params: 0=a, 1=b; locals: 2=len_a, 3=len_b, 4=new_ptr, 5=i, 6=dst *)
+let add_str_concat_fn m alloc_idx =
+  add_function m [I32; I32] [I32]
+    [{ count = 5; ty = I32 }]
+    [ LocalGet 0; I32Load (2, 0); LocalSet 2;
+      LocalGet 1; I32Load (2, 0); LocalSet 3;
+      I32Const 4; LocalGet 2; I32Add; LocalGet 3; I32Add;
+      Call alloc_idx; LocalSet 4;
+      LocalGet 4; LocalGet 2; LocalGet 3; I32Add; I32Store (2, 0);
+      (* copy a bytes: dst = new_ptr+4, src base = a+4 *)
+      LocalGet 4; I32Const 4; I32Add; LocalSet 6;
+      I32Const 0; LocalSet 5;
+      Block (Void, [
+        Loop (Void, [
+          LocalGet 5; LocalGet 2; I32GeS; BrIf 1;
+          LocalGet 6; LocalGet 5; I32Add;
+          LocalGet 0; I32Const 4; I32Add; LocalGet 5; I32Add; I32Load8U (0, 0);
+          I32Store8 (0, 0);
+          LocalGet 5; I32Const 1; I32Add; LocalSet 5;
+          Br 0
+        ])
+      ]);
+      (* copy b bytes: dst = new_ptr+4+len_a, src base = b+4 *)
+      LocalGet 4; I32Const 4; I32Add; LocalGet 2; I32Add; LocalSet 6;
+      I32Const 0; LocalSet 5;
+      Block (Void, [
+        Loop (Void, [
+          LocalGet 5; LocalGet 3; I32GeS; BrIf 1;
+          LocalGet 6; LocalGet 5; I32Add;
+          LocalGet 1; I32Const 4; I32Add; LocalGet 5; I32Add; I32Load8U (0, 0);
+          I32Store8 (0, 0);
+          LocalGet 5; I32Const 1; I32Add; LocalSet 5;
+          Br 0
+        ])
+      ]);
+      LocalGet 4
+    ]
+
+(** __str_head(s) -> Int: first byte as char code, or 0 if empty. *)
+let add_str_head_fn m =
+  add_function m [I32] [I32] []
+    [ LocalGet 0; I32Load (2, 0); I32Const 0; I32Eq;
+      If (ValType I32,
+        [I32Const 0],
+        Some [LocalGet 0; I32Const 4; I32Add; I32Load8U (0, 0)])
+    ]
+
+(* ------------------------------------------------------------------ *)
 (* Module emitter                                                       *)
 (* ------------------------------------------------------------------ *)
 
 let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
   let tco    = if use_tail_calls then TailCallInstr else TrampolineLoop in
   let eprog  = elaborate_program prog in
+  (* Pre-scan for string literals; static data starts at offset 64 to leave
+     the first 64 bytes as a reserved zero-page area. *)
+  let static_base = 64 in
+  let (string_pool, static_end) = build_string_pool eprog static_base in
   let m      = create () in
+  (* Add one data segment per unique string literal. *)
+  List.iter (fun (s, off) -> emit_string_data m s off) string_pool;
   add_memory m { min = 1; max = None };
   add_export m "memory" (ExportMem 0);
-  let heap_ptr_idx = add_global m I32 true (GlobI32 1024) in
+  (* Heap bump-allocator starts after all static string data (minimum 1024). *)
+  let initial_heap_ptr = max 1024 ((static_end + 3) / 4 * 4) in
+  let heap_ptr_idx = add_global m I32 true (GlobI32 initial_heap_ptr) in
   let alloc_idx = add_function m ~export:"__alloc"
     [I32] [I32]
     [{ count = 1; ty = I32 }]
@@ -490,6 +658,19 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
     ; I32Add
     ; GlobalSet heap_ptr_idx
     ; LocalGet 1
+    ]
+  in
+  (* Built-in string primitives — always emitted; func_map entries make them
+     callable from Axiom source under their standard names. *)
+  let str_length_idx = add_str_length_fn m in
+  let str_eq_idx     = add_str_eq_fn m in
+  let str_concat_idx = add_str_concat_fn m alloc_idx in
+  let str_head_idx   = add_str_head_fn m in
+  let string_builtins =
+    [ ("string_length", str_length_idx)
+    ; ("string_eq",     str_eq_idx)
+    ; ("concat",        str_concat_idx)
+    ; ("string_head",   str_head_idx)
     ]
   in
   let pending     = ref [] in
@@ -556,7 +737,10 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
     ) fn_decls
   in
   let func_map =
-    let base = List.map (fun (fn_name, idx, _, _) -> (fn_name, idx)) fn_entries in
+    let base =
+      string_builtins
+      @ List.map (fun (fn_name, idx, _, _) -> (fn_name, idx)) fn_entries
+    in
     (* For each "import M as A" declaration, add aliased entries so that
        calls written as A.fn resolve to the same WASM function as M.fn. *)
     let aliases =
@@ -584,7 +768,7 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
   List.iter (fun (_, idx, param_tys, decl_body) ->
     let ctx =
       make_ctx tco param_tys func_map ctor_map alloc_idx m pending
-        effect_map table_funcs
+        effect_map table_funcs string_pool
     in
     let ctx = setup_trampoline tco idx (List.length param_tys) ctx in
     (match (try Ok (compile_eexpr ~tail:true ctx decl_body) with Failure msg -> Error msg) with

@@ -147,3 +147,15 @@ fn from_list<a>(xs: List<a>) -> Option<NonEmpty<a>> ! pure {
     | Cons(h, t) => some(NonEmpty(h, t))
   }
 }
+
+fn main() -> Int ! pure {
+  let list1 = Cons(1, Cons(2, Cons(3, Nil))) in
+  let list2 = Cons(4, Cons(5, Nil)) in
+  let merged = append(list1, list2) in
+  let len = length(merged) in
+  let opt_val = unwrap_or(Some(10), 0) in
+  let tree = Node(Node(Leaf, 1, Leaf), 2, Node(Leaf, 3, Leaf)) in
+  let tsize = tree_size(tree) in
+  let tdepth = tree_depth(tree) in
+  add(add(len, opt_val), add(tsize, tdepth))
+}

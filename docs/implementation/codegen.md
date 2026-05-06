@@ -278,7 +278,7 @@ primitives) are compiled to a stub that returns `i32.const 0`.
 | `move_right` | **Compiled** | pattern match + constructor |
 | `greet` | **Stub** | body uses `concat` (String not implemented) |
 | `apply_twice<a>` | **Skipped** | function-type param (`TyFun` unsupported) |
-| `first_match<a>` | **Skipped** | `List<a>` param (`TyApp` unsupported) |
+| `first_match<a>` | **Compiled** | `List<a>` param — `TyApp` now lowered to i32 |
 
 The file has no `main`, so the emitted module exports an empty `main` stub
 returning 0.
@@ -352,20 +352,57 @@ byte-granularity access:
 | `i32.load8_u` | `0x2D` | `I32Load8U (align, offset)` |
 | `i32.store8` | `0x3A` | `I32Store8 (align, offset)` |
 
+### `examples/02_data_types.axm` — what compiles (issue #105)
+
+`examples/02_data_types.axm` declares `Option<a>`, `Result<a,e>`, `List<a>`,
+`Tree<a>`, `Pair<a,b>`, `NonEmpty<a>`, and `Ordering`.  All functions whose
+parameters and return type are ADT or scalar (no `TyFun` function-type
+arguments) are now fully compiled.
+
+| Function | Status | Notes |
+|----------|--------|-------|
+| `unwrap_or` | **Compiled** | `Option<a>` param lowered to i32 |
+| `length` | **Compiled** | recursive `List<a>` traversal |
+| `append` | **Compiled** | recursive list concatenation |
+| `tree_size` | **Compiled** | recursive Tree traversal |
+| `tree_depth` | **Compiled** | uses built-in `max` helper |
+| `tree_to_list` | **Compiled** | Tree → List conversion |
+| `non_empty_head`, `non_empty_to_list` | **Compiled** | single-ctor match |
+| `from_list` | **Compiled** | Option-returning list coercion |
+| `result_to_option` | **Compiled** | Result → Option conversion |
+| `map_option`, `flat_map_option`, `map_result`, `map_error` | **Skipped** | function-type param (`TyFun` unsupported) |
+| `map`, `filter`, `fold_left`, `reverse` | **Skipped** | function-type param |
+| `tree_map`, `tree_fold` | **Skipped** | function-type param |
+
+`main()` exercises the compiled subset and returns `20` (verified by
+`test/test_build_pipeline.ml` suite `examples_02_10`).
+
+### Lowercase constructor aliases
+
+When a `type` declaration is processed, the ctor_map automatically includes
+both the canonical capitalised name (`None`, `Cons`, …) and its lowercase
+counterpart (`none`, `cons`, …).  This lets stdlib-style helper calls like
+`none()`, `cons(h, t)` resolve to the same tagged-allocation path as the
+explicit uppercase constructor.
+
+### Built-in `max` helper
+
+A `max(a, b) -> Int` helper is always emitted alongside the string helpers.
+Its WASM body uses `i32.gt_s` / `if` to return the larger argument.  It is
+pre-populated in `func_map` so `max(x, y)` calls compile to a plain `call`.
+
 ### Known gaps
 
 The following constructs are **not yet supported** by the code generator:
 
-- **Generic higher-order parameters**: `TyFun` and `TyApp` parameter types
-  are filtered out; functions like `apply_twice` and `first_match` are silently
-  dropped from the output.
-- **Recursive types**: `List<a>`, `Option<a>` etc. require a GC or tagging
-  scheme beyond the current flat-i32 model.
+- **Higher-order parameters**: `TyFun` parameter types are filtered out;
+  functions like `map`, `filter`, `fold_left` are silently skipped.
 - **Algebraic effects in generics**: effect polymorphism works for monomorphic
   effects; polymorphic effect rows are not yet lowered.
 - **Multi-value returns / tuples**: no tuple codegen; `TyTuple` params are filtered.
-- **Standard library**: `none`, `some`, `Nil`, `Cons` constructors are not
-  built-in — programs must declare their own ADTs.
+- **Unmatched pattern defensive trap**: the codegen emits `unreachable` when all
+  match arms have been tried and none matched.  The type-checker guarantees
+  exhaustiveness so this path should never execute.
 
 ---
 

@@ -1175,6 +1175,20 @@ let test_example_fails_with path expected_fragment () =
         Alcotest.failf "expected stderr to contain %S\ngot: %S"
           expected_fragment stderr)
 
+let test_example_main_returns path expected () =
+  if not (Sys.file_exists path) then
+    Printf.printf "[SKIP] %s not found\n%!" path
+  else
+    with_tmp_file ".wasm" (fun d ->
+      let rc, stderr = axiom_build_capture_stderr ~src:path ~dst:d in
+      if rc <> 0 then
+        Alcotest.failf "build failed (exit %d)\nstderr: %S" rc stderr;
+      match execute_main d with
+      | Got n when n = expected -> ()
+      | Got n     -> Alcotest.failf "main returned %d, expected %d" n expected
+      | RunFail m -> Alcotest.fail ("execution failed: " ^ m)
+      | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m)
+
 (* ------------------------------------------------------------------ *)
 (* Suite                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -1410,8 +1424,16 @@ fn main() -> Int ! pure { 0 }|};
            new breakage (a passing example starts failing).
            Update this suite when an example is genuinely fixed. *)
         let ex name = Filename.concat examples_dir (name ^ ".axm") in
+        (* Issue #105: ADT constructor lowering and pattern matching.
+           main() = length(append([1,2,3],[4,5]))       (5)
+                  + unwrap_or(Some(10), 0)               (10)
+                  + tree_size(Node(Node(Leaf,1,Leaf),2,Node(Leaf,3,Leaf)))  (3)
+                  + tree_depth(same tree)                (2)
+                  = 20 *)
         [ Alcotest.test_case "02_data_types builds" `Quick
             (test_example_builds (ex "02_data_types"))
+        ; Alcotest.test_case "02_data_types: main = 20" `Quick
+            (test_example_main_returns (ex "02_data_types") 20)
           (* 03: missing lowercase constructor wrappers for user-defined ADTs
              ('info' for Info, etc.) — blocked by #109 *)
         ; Alcotest.test_case "03_effects: unbound 'info'" `Quick

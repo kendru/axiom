@@ -50,6 +50,31 @@ shaped the code style — each is a candidate for future parser improvement:
    three-argument `compose_apply(f, g, x)` over curried `compose(f, g)` that
    returns a function, or use a named type alias for the function type.
 
+## Build-status triage (issue \#103)
+
+The table below records the current build status of each example, the exact
+error produced, the failure category, and the GitHub issue(s) whose resolution
+would unblock it.  The `examples_02_10` suite in `test/test_build_pipeline.ml`
+asserts the exact failure mode of each broken example so that CI catches silent
+fixes *and* unexpected new breakage.
+
+| Example | Status | Failure | Category | Blocking issue(s) |
+|---------|--------|---------|----------|-------------------|
+| `01_basics.axm` | ✓ passes | — | — | — |
+| `02_data_types.axm` | ✓ passes | — | — | — |
+| `03_effects.axm` | ✗ fails | `unbound variable 'info'` | Missing lowercase constructor wrappers for user-defined ADTs (e.g. `info` for `Info`, `debug` for `Debug`) | [#109] |
+| `04_state_machine.axm` | ✗ fails | `unbound variable 'transitioned'` | Missing lowercase constructor wrappers for user-defined ADTs | [#109] |
+| `05_collections.axm` | ✗ fails | `unbound variable 'pair'` | Missing stdlib `pair` constructor wrapper | [#109] |
+| `06_string_processing.axm` | ✗ fails | `unbound variable 'string_length'` | Missing stdlib string operations | [#110] |
+| `07_validation.axm` | ✗ fails | `unbound variable 'valid'` | Missing lowercase constructor wrappers for user-defined ADTs | [#109] |
+| `08_config.axm` | ✗ fails | `parse error: unexpected token Perform` | Parser bug — `perform` not accepted as the scrutinee of a `match` expression | [#101] |
+| `09_pipeline.axm` | ✗ fails | `unknown effect 'Log'` | Missing `Log` effect declaration in file scope (declared in `03_effects.axm`; needs import or local redeclaration) | [#109] |
+| `10_json.axm` | ✗ fails | `unbound variable 'j_object'` | Missing lowercase constructor wrappers for user-defined ADTs | [#109] |
+
+[#101]: https://github.com/kendru/axiom/issues/101
+[#109]: https://github.com/kendru/axiom/issues/109
+[#110]: https://github.com/kendru/axiom/issues/110
+
 ## Stdlib functions assumed by examples
 
 The examples call functions that don't exist yet. This list captures what

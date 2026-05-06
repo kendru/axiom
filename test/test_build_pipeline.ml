@@ -1067,6 +1067,63 @@ let test_validates_flags ~flags src () =
       | Skip msg -> Printf.printf "[SKIP] %s\n%!" msg))
 
 (* ------------------------------------------------------------------ *)
+(* Issue #103: examples 02–10 triage helpers                          *)
+(* ------------------------------------------------------------------ *)
+
+let axiom_build_capture_stderr ~src ~dst =
+  let err_tmp = Filename.temp_file "axiom_stderr_" ".txt" in
+  let cmd =
+    Printf.sprintf "%s build %s -o %s 2>%s"
+      (Filename.quote axiom_exe)
+      (Filename.quote src)
+      (Filename.quote dst)
+      (Filename.quote err_tmp)
+  in
+  let rc = Sys.command cmd in
+  let stderr_out =
+    let ic = open_in err_tmp in
+    let buf = Buffer.create 128 in
+    (try while true do Buffer.add_channel buf ic 1 done
+     with End_of_file -> ());
+    close_in ic;
+    (try Sys.remove err_tmp with _ -> ());
+    Buffer.contents buf
+  in
+  (rc, stderr_out)
+
+let string_contains haystack needle =
+  let hlen = String.length haystack and nlen = String.length needle in
+  if nlen = 0 then true
+  else if nlen > hlen then false
+  else
+    let rec loop i =
+      if i > hlen - nlen then false
+      else if String.sub haystack i nlen = needle then true
+      else loop (i + 1)
+    in
+    loop 0
+
+let test_example_builds path () =
+  if not (Sys.file_exists path) then
+    Printf.printf "[SKIP] %s not found\n%!" path
+  else
+    with_tmp_file ".wasm" (fun d ->
+      let rc, stderr = axiom_build_capture_stderr ~src:path ~dst:d in
+      if rc <> 0 then
+        Alcotest.failf "expected build to succeed, got exit %d\nstderr: %S" rc stderr)
+
+let test_example_fails_with path expected_fragment () =
+  if not (Sys.file_exists path) then
+    Printf.printf "[SKIP] %s not found\n%!" path
+  else
+    with_tmp_file ".wasm" (fun d ->
+      let rc, stderr = axiom_build_capture_stderr ~src:path ~dst:d in
+      Alcotest.(check bool) "non-zero exit" true (rc <> 0);
+      if not (string_contains stderr expected_fragment) then
+        Alcotest.failf "expected stderr to contain %S\ngot: %S"
+          expected_fragment stderr)
+
+(* ------------------------------------------------------------------ *)
 (* Suite                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1293,5 +1350,40 @@ fn main() -> Int ! pure { 0 }|};
         ; Alcotest.test_case "validate: 01_basics.axm from disk" `Quick
             (test_validate_file_from_disk
                (Filename.concat examples_dir "01_basics.axm"))
+        ] )
+    ; ( "examples_02_10",
+        (* Issue #103: triage examples 02–10.
+           Each test locks in the exact current build outcome so that CI flags
+           both silent fixes (a broken example starts passing) and unexpected
+           new breakage (a passing example starts failing).
+           Update this suite when an example is genuinely fixed. *)
+        let ex name = Filename.concat examples_dir (name ^ ".axm") in
+        [ Alcotest.test_case "02_data_types builds" `Quick
+            (test_example_builds (ex "02_data_types"))
+          (* 03: missing lowercase constructor wrappers for user-defined ADTs
+             ('info' for Info, etc.) — blocked by #109 *)
+        ; Alcotest.test_case "03_effects: unbound 'info'" `Quick
+            (test_example_fails_with (ex "03_effects") "unbound variable 'info'")
+          (* 04: missing lowercase constructor wrapper 'transitioned' — blocked by #109 *)
+        ; Alcotest.test_case "04_state_machine: unbound 'transitioned'" `Quick
+            (test_example_fails_with (ex "04_state_machine") "unbound variable 'transitioned'")
+          (* 05: missing stdlib 'pair' constructor — blocked by #109 *)
+        ; Alcotest.test_case "05_collections: unbound 'pair'" `Quick
+            (test_example_fails_with (ex "05_collections") "unbound variable 'pair'")
+          (* 06: missing stdlib string operations — blocked by #110 *)
+        ; Alcotest.test_case "06_string_processing: unbound 'string_length'" `Quick
+            (test_example_fails_with (ex "06_string_processing") "unbound variable 'string_length'")
+          (* 07: missing lowercase constructor wrappers 'valid'/'invalid' — blocked by #109 *)
+        ; Alcotest.test_case "07_validation: unbound 'valid'" `Quick
+            (test_example_fails_with (ex "07_validation") "unbound variable 'valid'")
+          (* 08: parser bug — 'perform' not accepted as match scrutinee — blocked by #101 *)
+        ; Alcotest.test_case "08_config: parse error on Perform" `Quick
+            (test_example_fails_with (ex "08_config") "unexpected token Perform")
+          (* 09: 'Log' effect used but not declared in file scope — blocked by #109 *)
+        ; Alcotest.test_case "09_pipeline: unknown effect 'Log'" `Quick
+            (test_example_fails_with (ex "09_pipeline") "unknown effect 'Log'")
+          (* 10: missing lowercase constructor wrappers for Json ADT — blocked by #109 *)
+        ; Alcotest.test_case "10_json: unbound 'j_object'" `Quick
+            (test_example_fails_with (ex "10_json") "unbound variable 'j_object'")
         ] )
     ]

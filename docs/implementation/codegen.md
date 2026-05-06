@@ -295,13 +295,67 @@ returning 0.
 | `build: 01_basics.axm from disk` | the actual `examples/01_basics.axm` file compiles |
 | `validate: 01_basics.axm from disk` | its output is valid WASM |
 
+---
+
+## String representation (issue #104)
+
+### Layout in linear memory
+
+Every Axiom string is a **length-prefixed UTF-8 byte sequence** stored in
+linear memory.  The WASM value for a string is an `i32` pointer to its
+first byte:
+
+```
+ptr+0 .. ptr+3 : i32  byte-length (little-endian)
+ptr+4 .. ptr+4+len-1 : UTF-8 content
+```
+
+Total allocation: `4 + len` bytes, padded to a 4-byte boundary.
+
+### Static string literals
+
+String literals are allocated at **compile time** into a static data
+segment.  The codegen pre-scans the elaborated program for all unique
+string literals, assigns each an offset starting at byte **64** (the
+first 64 bytes are a reserved zero page), then emits one WASM `data`
+segment per string.
+
+The heap bump-allocator global `__heap_ptr` is initialised to
+`max(1024, rounded_static_end)` so that dynamic allocations never
+overlap the static region.
+
+### Built-in string primitives
+
+Four WASM helper functions are emitted into every module and bound to
+the corresponding Axiom names:
+
+| Axiom name | WASM signature | Behaviour |
+|-----------|---------------|-----------|
+| `string_length` | `(i32) → i32` | `i32.load ptr` — returns byte count |
+| `string_eq` | `(i32, i32) → i32` | byte-by-byte comparison; returns 1 (equal) or 0 |
+| `concat` | `(i32, i32) → i32` | allocates a new string, copies both inputs |
+| `string_head` | `(i32) → i32` | first byte as char code, or 0 if empty |
+
+`concat` calls `__alloc` internally and uses `i32.load8_u` / `i32.store8`
+for byte-level copying.
+
+These names are pre-populated in `func_map` so ordinary Axiom call
+syntax (e.g. `concat("Hello, ", "world")`) compiles to a plain `call`.
+
+### New WASM instructions
+
+Two instructions were added to `lib/wasm/wasm_encode.ml` to support
+byte-granularity access:
+
+| Instruction | Opcode | OCaml constructor |
+|-------------|--------|-------------------|
+| `i32.load8_u` | `0x2D` | `I32Load8U (align, offset)` |
+| `i32.store8` | `0x3A` | `I32Store8 (align, offset)` |
+
 ### Known gaps
 
 The following constructs are **not yet supported** by the code generator:
 
-- **String type**: no runtime representation; `TyName "String"` passes the
-  type filter but bodies using `concat`, string literals, etc. fall back to
-  stub codegen.
 - **Generic higher-order parameters**: `TyFun` and `TyApp` parameter types
   are filtered out; functions like `apply_twice` and `first_match` are silently
   dropped from the output.

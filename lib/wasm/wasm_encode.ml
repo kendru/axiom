@@ -47,6 +47,8 @@ type instr =
   | GlobalSet of int
   | I32Load of int * int        (** align, offset *)
   | I32Store of int * int       (** align, offset *)
+  | I32Load8U of int * int      (** align, offset — zero-extending byte load *)
+  | I32Store8 of int * int      (** align, offset — byte store *)
   | CallIndirect of int * int   (** type_idx, table_idx *)
   | ReturnCall of int           (** tail call by func index (opcode 0x12) *)
   | ReturnCallIndirect of int * int (** tail call indirect: type_idx, table_idx (opcode 0x13) *)
@@ -247,6 +249,14 @@ let rec put_instr buf instr =
     put_uleb128 buf offset
   | I32Store (align, offset) ->
     put_byte buf 0x36;
+    put_uleb128 buf align;
+    put_uleb128 buf offset
+  | I32Load8U (align, offset) ->
+    put_byte buf 0x2D;
+    put_uleb128 buf align;
+    put_uleb128 buf offset
+  | I32Store8 (align, offset) ->
+    put_byte buf 0x3A;
     put_uleb128 buf align;
     put_uleb128 buf offset
   | CallIndirect (type_idx, table_idx) ->

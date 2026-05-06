@@ -764,6 +764,58 @@ fn main() -> Int ! pure {
 (* b != 0 -> else branch returns a = 10; result = 10 *)
 
 (* ------------------------------------------------------------------ *)
+(* Issue #104: string literals and basic string ops                    *)
+(* ------------------------------------------------------------------ *)
+
+(* string_length(concat("Hello, ", "world")) = 12 *)
+let src_string_concat_length =
+  {|fn main() -> Int ! pure {
+  string_length(concat("Hello, ", "world"))
+}|}
+
+(* string_length("") = 0 *)
+let src_string_empty_length =
+  {|fn main() -> Int ! pure {
+  string_length("")
+}|}
+
+(* string_length("abc") = 3 *)
+let src_string_literal_length =
+  {|fn main() -> Int ! pure {
+  string_length("abc")
+}|}
+
+(* string_eq("hi", "hi") = 1 (true) *)
+let src_string_eq_true =
+  {|fn main() -> Int ! pure {
+  if string_eq("hi", "hi") { 1 } else { 0 }
+}|}
+
+(* string_eq("hi", "bye") = 0 (false) *)
+let src_string_eq_false =
+  {|fn main() -> Int ! pure {
+  if string_eq("hi", "bye") { 1 } else { 0 }
+}|}
+
+(* string_head("ABC") = 65 (ASCII 'A') *)
+let src_string_head =
+  {|fn main() -> Int ! pure {
+  string_head("ABC")
+}|}
+
+(* string_head("") = 0 (empty) *)
+let src_string_head_empty =
+  {|fn main() -> Int ! pure {
+  string_head("")
+}|}
+
+(* Repeated concat to check heap allocation *)
+let src_string_triple_concat =
+  {|fn main() -> Int ! pure {
+  string_length(concat(concat("a", "b"), "c"))
+}|}
+
+(* ------------------------------------------------------------------ *)
 (* Issue #45: 01_basics.axm end-to-end integration                    *)
 (* ------------------------------------------------------------------ *)
 
@@ -1370,9 +1422,10 @@ fn main() -> Int ! pure { 0 }|};
           (* 05: missing stdlib 'pair' constructor — blocked by #109 *)
         ; Alcotest.test_case "05_collections: unbound 'pair'" `Quick
             (test_example_fails_with (ex "05_collections") "unbound variable 'pair'")
-          (* 06: missing stdlib string operations — blocked by #110 *)
-        ; Alcotest.test_case "06_string_processing: unbound 'string_length'" `Quick
-            (test_example_fails_with (ex "06_string_processing") "unbound variable 'string_length'")
+          (* 06: concat/string_length/string_eq are now built-in (#104);
+             eq_char and related char ops still unresolved — blocked by #110 *)
+        ; Alcotest.test_case "06_string_processing: unbound 'eq_char'" `Quick
+            (test_example_fails_with (ex "06_string_processing") "unbound variable 'eq_char'")
           (* 07: missing lowercase constructor wrappers 'valid'/'invalid' — blocked by #109 *)
         ; Alcotest.test_case "07_validation: unbound 'valid'" `Quick
             (test_example_fails_with (ex "07_validation") "unbound variable 'valid'")
@@ -1385,5 +1438,28 @@ fn main() -> Int ! pure { 0 }|};
           (* 10: missing lowercase constructor wrappers for Json ADT — blocked by #109 *)
         ; Alcotest.test_case "10_json: unbound 'j_object'" `Quick
             (test_example_fails_with (ex "10_json") "unbound variable 'j_object'")
+        ] )
+    ; ( "strings",
+        (* Issue #104: string literals and basic string ops.
+           String layout: [i32 byte-length][UTF-8 bytes], i32 pointer.
+           Primitives: concat, string_length, string_eq, string_head. *)
+        [ Alcotest.test_case "validates: concat literal"            `Quick
+            (test_validates src_string_concat_length)
+        ; Alcotest.test_case "string_length(concat) = 12"          `Quick
+            (test_main_returns src_string_concat_length 12)
+        ; Alcotest.test_case "string_length(\"\") = 0"             `Quick
+            (test_main_returns src_string_empty_length 0)
+        ; Alcotest.test_case "string_length(\"abc\") = 3"          `Quick
+            (test_main_returns src_string_literal_length 3)
+        ; Alcotest.test_case "string_eq same = true"               `Quick
+            (test_main_returns src_string_eq_true 1)
+        ; Alcotest.test_case "string_eq different = false"         `Quick
+            (test_main_returns src_string_eq_false 0)
+        ; Alcotest.test_case "string_head(\"ABC\") = 65"           `Quick
+            (test_main_returns src_string_head 65)
+        ; Alcotest.test_case "string_head(\"\") = 0"               `Quick
+            (test_main_returns src_string_head_empty 0)
+        ; Alcotest.test_case "triple concat length = 3"            `Quick
+            (test_main_returns src_string_triple_concat 3)
         ] )
     ]

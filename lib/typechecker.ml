@@ -371,6 +371,7 @@ let rec unify a b =
       failwith (Format.asprintf
                   "Typechecker: type constructor %s applied to wrong number of arguments" n1);
     List.iter2 unify a1 a2
+  | TyCon "Nothing", _ | _, TyCon "Nothing" -> ()
   | a, b ->
     failwith (Format.asprintf "Typechecker: cannot unify %a with %a" pp_ty a pp_ty b)
 

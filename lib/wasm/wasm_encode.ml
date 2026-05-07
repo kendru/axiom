@@ -66,6 +66,12 @@ type func_type = {
   results : val_type list;
 }
 
+(** Memory / table size constraints. *)
+type limits = {
+  min : int;
+  max : int option;
+}
+
 (** Export descriptor. *)
 type export_desc =
   | ExportFunc of int
@@ -73,9 +79,10 @@ type export_desc =
   | ExportMem of int
   | ExportGlobal of int
 
-(** Import descriptor (func imports only for now). *)
+(** Import descriptor. *)
 type import_desc =
-  | ImportFunc of int  (** type index *)
+  | ImportFunc of int    (** type index *)
+  | ImportMem  of limits (** memory limits *)
 
 (** Constant initialiser for globals. *)
 type global_init =
@@ -83,12 +90,6 @@ type global_init =
   | GlobI64 of int64
   | GlobF32 of float
   | GlobF64 of float
-
-(** Memory / table size constraints. *)
-type limits = {
-  min : int;
-  max : int option;
-}
 
 (** Active data segment targeting memory 0. *)
 type data_segment = {
@@ -301,6 +302,11 @@ let encode_type_section buf types =
     List.iter (put_val_type buf) results
   ) types
 
+let put_limits buf { min; max } =
+  match max with
+  | None   -> put_byte buf 0x00; put_uleb128 buf min
+  | Some n -> put_byte buf 0x01; put_uleb128 buf min; put_uleb128 buf n
+
 let encode_import_section buf imports =
   put_uleb128 buf (List.length imports);
   List.iter (fun (modname, fieldname, desc) ->
@@ -310,16 +316,14 @@ let encode_import_section buf imports =
     | ImportFunc type_idx ->
       put_byte buf 0x00;
       put_uleb128 buf type_idx
+    | ImportMem lim ->
+      put_byte buf 0x02;
+      put_limits buf lim
   ) imports
 
 let encode_func_section buf funcs =
   put_uleb128 buf (List.length funcs);
   List.iter (put_uleb128 buf) funcs
-
-let put_limits buf { min; max } =
-  match max with
-  | None   -> put_byte buf 0x00; put_uleb128 buf min
-  | Some n -> put_byte buf 0x01; put_uleb128 buf min; put_uleb128 buf n
 
 let encode_table_section buf tables =
   put_uleb128 buf (List.length tables);
@@ -460,15 +464,27 @@ let add_type m ft =
   m.types <- m.types @ [ft];
   idx
 
-(** Add an import; does not affect the local function index space directly
-    but the import count is included when computing function indices. *)
-let add_import m modname fieldname desc =
-  m.imports <- m.imports @ [(modname, fieldname, desc)]
+let count_func_imports m =
+  List.length
+    (List.filter (fun (_, _, d) -> match d with ImportFunc _ -> true | _ -> false)
+       m.imports)
+
+(** Add a function import; returns the function index (position in the combined
+    function index space = prior func imports + prior local funcs). *)
+let add_import_func m modname fieldname params results =
+  let type_idx = add_type m { params; results } in
+  let func_idx = count_func_imports m + List.length m.funcs in
+  m.imports <- m.imports @ [(modname, fieldname, ImportFunc type_idx)];
+  func_idx
+
+(** Add a memory import (no return value; memory index is managed externally). *)
+let add_import_mem m modname fieldname lim =
+  m.imports <- m.imports @ [(modname, fieldname, ImportMem lim)]
 
 (** Add a local function (type index + body); returns the function index
-    (import count + position in local function list). *)
+    (func import count + position in local function list). *)
 let add_func m type_idx locals instrs =
-  let func_idx = List.length m.imports + List.length m.funcs in
+  let func_idx = count_func_imports m + List.length m.funcs in
   m.funcs  <- m.funcs  @ [type_idx];
   m.bodies <- m.bodies @ [(locals, instrs)];
   func_idx
@@ -516,7 +532,7 @@ let add_function m ?(export = "") params results locals instrs =
     per reserved slot, in index order, before calling [encode]. *)
 let reserve_function m params results =
   let type_idx = add_type m { params; results } in
-  let func_idx = List.length m.imports + List.length m.funcs in
+  let func_idx = count_func_imports m + List.length m.funcs in
   m.funcs <- m.funcs @ [type_idx];
   func_idx
 

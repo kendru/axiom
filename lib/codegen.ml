@@ -962,24 +962,27 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
   (* Pre-scan for string literals; static data starts at offset 64 to leave
      the first 64 bytes as a reserved zero-page area. *)
   let static_base = 64 in
-  let (string_pool, static_end) = build_string_pool eprog static_base in
+  let (string_pool, _static_end) = build_string_pool eprog static_base in
   let m      = create () in
   (* Add one data segment per unique string literal. *)
   List.iter (fun (s, off) -> emit_string_data m s off) string_pool;
-  add_memory m { min = 1; max = None };
+  (* Import memory and core runtime primitives from the "axm" runtime module.
+     The runtime owns linear memory (2 pages minimum) and the bump allocator.
+     Static string data is placed by the data segments above into the shared
+     memory; the runtime's heap starts at page 1 (byte offset 65536) so there
+     is no overlap as long as string pool fits within the first 64 KiB.
+     The imported memory is re-exported so downstream tooling can inspect it. *)
+  add_import_mem m "axm" "memory" { min = 2; max = None };
   add_export m "memory" (ExportMem 0);
-  (* Heap bump-allocator starts after all static string data (minimum 1024). *)
-  let initial_heap_ptr = max 1024 ((static_end + 3) / 4 * 4) in
-  let heap_ptr_idx = add_global m I32 true (GlobI32 initial_heap_ptr) in
-  let alloc_idx = add_function m ~export:"__alloc"
-    [I32] [I32]
-    [{ count = 1; ty = I32 }]
-    [ GlobalGet heap_ptr_idx
-    ; LocalTee 1
-    ; LocalGet 0
-    ; I32Add
-    ; GlobalSet heap_ptr_idx
-    ; LocalGet 1
+  let alloc_idx    = add_import_func m "axm" "axm_alloc"    [I32]       [I32] in
+  let axm_print_idx = add_import_func m "axm" "axm_print"   [I32; I32]  [I32] in
+  let axm_read_line_idx = add_import_func m "axm" "axm_read_line" []    [I32] in
+  (* console_print(str_ptr: i32) -> i32: wrapper that unpacks the
+     length-prefixed string layout and calls axm_print(data_ptr, len). *)
+  let console_print_idx = add_function m [I32] [I32] []
+    [ LocalGet 0; I32Const 4; I32Add   (* data_ptr = str_ptr + 4 *)
+    ; LocalGet 0; I32Load (2, 0)       (* len      = load(str_ptr) *)
+    ; Call axm_print_idx
     ]
   in
   (* Built-in string primitives — always emitted; func_map entries make them
@@ -990,11 +993,14 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
   let str_head_idx   = add_str_head_fn m in
   let max_idx        = add_max_fn m in
   let string_builtins =
-    [ ("string_length", str_length_idx)
-    ; ("string_eq",     str_eq_idx)
-    ; ("concat",        str_concat_idx)
-    ; ("string_head",   str_head_idx)
-    ; ("max",           max_idx)
+    [ ("string_length",   str_length_idx)
+    ; ("string_eq",       str_eq_idx)
+    ; ("concat",          str_concat_idx)
+    ; ("string_head",     str_head_idx)
+    ; ("max",             max_idx)
+    ; ("console_print",   console_print_idx)
+    ; ("axm_print",       axm_print_idx)
+    ; ("axm_read_line",   axm_read_line_idx)
     ]
   in
   let pending     = ref [] in

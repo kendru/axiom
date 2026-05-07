@@ -130,33 +130,53 @@ let validate_wasm path =
 
 type run_result = Got of int | RunFail of string | RunSkip of string
 
+(** Run [path] under wasmtime, providing the compiled runtime as a preloaded
+    "axm" module.  The Axiom-compiled module imports memory and runtime
+    primitives from "axm"; wasmtime resolves them via [--preload].
+    Skips when runtime.wasm is absent or wasmtime does not support --preload. *)
 let run_via_wasmtime path =
-  let tmp = Filename.temp_file "axiom_wasmtime_" ".txt" in
-  let rc =
-    Sys.command
-      (Printf.sprintf "wasmtime --invoke main %s >%s 2>&1"
-         (Filename.quote path) (Filename.quote tmp))
-  in
-  let out =
-    let ic = open_in tmp in
-    let s = try input_line ic with End_of_file -> "" in
-    close_in ic;
-    (try Sys.remove tmp with _ -> ());
-    String.trim s
-  in
-  (* wasmtime prints the return value; a 0-result shows as "0". *)
-  if rc = 0 then
-    (match int_of_string_opt out with
-     | Some n -> Got n
-     | None   -> Got 0)   (* no output means void / success *)
-  else RunFail (Printf.sprintf "wasmtime exited %d" rc)
+  if not (Lazy.force has_runtime) then
+    RunSkip (Printf.sprintf
+      "runtime.wasm not found at %s; run 'zig build' in runtime/"
+      runtime_wasm_path)
+  else
+    let tmp = Filename.temp_file "axiom_wasmtime_" ".txt" in
+    let rc =
+      Sys.command
+        (Printf.sprintf "wasmtime --preload axm=%s --invoke main %s >%s 2>&1"
+           (Filename.quote runtime_wasm_path)
+           (Filename.quote path) (Filename.quote tmp))
+    in
+    let out =
+      let ic = open_in tmp in
+      let s = try input_line ic with End_of_file -> "" in
+      close_in ic;
+      (try Sys.remove tmp with _ -> ());
+      String.trim s
+    in
+    if rc = 0 then
+      (match int_of_string_opt out with
+       | Some n -> Got n
+       | None   -> Got 0)
+    else RunFail (Printf.sprintf "wasmtime exited %d: %s" rc out)
 
+(** Run [path] under Node.js with mock "axm" imports.
+    The mock provides a bump allocator (heap starting at page 1 = 65536),
+    axm_print writing to stdout, and no-op stubs for axm_read_line. *)
 let run_via_node path =
   let script =
     Printf.sprintf
       "const fs=require('fs');\
        const buf=fs.readFileSync(%s);\
-       WebAssembly.instantiate(buf).then(({instance})=>{\
+       let hp=65536;\
+       const mem=new WebAssembly.Memory({initial:2});\
+       const axm={\
+         memory:mem,\
+         axm_alloc:(n)=>{const p=hp;hp+=((n+3)&~3);while(hp>mem.buffer.byteLength)mem.grow(1);return p;},\
+         axm_print:(p,l)=>{process.stdout.write(Buffer.from(new Uint8Array(mem.buffer,p,l)));return 0;},\
+         axm_read_line:()=>0\
+       };\
+       WebAssembly.instantiate(buf,{axm}).then(({instance})=>{\
          const r=instance.exports.main();\
          console.log(r);\
        }).catch(e=>{console.error(e.message);process.exit(1);})"
@@ -181,17 +201,18 @@ let run_via_node path =
      | None   -> RunFail (Printf.sprintf "unexpected output: %S" out))
   else RunFail (Printf.sprintf "node exited %d" rc)
 
+(** Prefer Node.js (which works with mock axm imports for all programs);
+    fall back to wasmtime+runtime if node is absent. *)
 let execute_main path =
-  if Lazy.force has_wasmtime then run_via_wasmtime path
-  else if Lazy.force has_node then run_via_node path
-  else RunSkip "no wasm runtime available (install wasmtime or node)"
+  if Lazy.force has_node then run_via_node path
+  else if Lazy.force has_wasmtime then run_via_wasmtime path
+  else RunSkip "no wasm runtime available (install node or wasmtime+runtime)"
 
-(** Run [axiom_path] via the Axiom runtime:
-    1. Instantiate [axiom_path] normally (it exports [main]).
-    2. Instantiate [runtime.wasm] with the Axiom module's [main] as the
-       [axiom_program.main] import.
-    3. Call [_start] on the runtime instance.
-    4. Return the value from [get_exit_code]. *)
+(** Run [axiom_path] via the compiled Axiom runtime (Node.js + WASI):
+    1. Instantiate [runtime.wasm] with WASI imports (so axm_print can write to stdout).
+    2. Instantiate [axiom_path] with the runtime's exports as the "axm" import module.
+    3. Call [main] on the Axiom instance and return the result.
+    Skips when runtime.wasm is absent or when Node's 'wasi' module is unavailable. *)
 let run_via_runtime axiom_path =
   if not (Lazy.force has_node) then
     RunSkip "no node.js runtime available"
@@ -201,18 +222,19 @@ let run_via_runtime axiom_path =
     let script =
       Printf.sprintf
         "const fs=require('fs');\
+         let WASI;\
+         try{WASI=require('wasi').WASI;}catch(e){process.exit(99);}\
+         const wasi=new WASI({version:'preview1',env:{},args:[]});\
          const axiomBuf=fs.readFileSync(%s);\
          const rtBuf=fs.readFileSync(%s);\
-         WebAssembly.instantiate(axiomBuf)\
-           .then(({instance:ai})=>{\
-             const axiomMain=ai.exports.main;\
-             return WebAssembly.instantiate(rtBuf,{axiom_program:{main:axiomMain}});\
-           })\
-           .then(({instance:ri})=>{\
-             ri.exports._start();\
-             console.log(ri.exports.get_exit_code());\
-           })\
-           .catch(e=>{console.error(e.message);process.exit(1);})"
+         WebAssembly.compile(rtBuf).then(rtMod=>{\
+           const rtInst=new WebAssembly.Instance(rtMod,{wasi_snapshot_preview1:wasi.wasiImport});\
+           if(typeof wasi.initialize==='function')wasi.initialize(rtInst);\
+           return WebAssembly.compile(axiomBuf).then(axiomMod=>{\
+             const axiomInst=new WebAssembly.Instance(axiomMod,{axm:rtInst.exports});\
+             console.log(axiomInst.exports.main());\
+           });\
+         }).catch(e=>{console.error(e.message);process.exit(1);})"
         (Filename.quote axiom_path)
         (Filename.quote runtime_wasm_path)
     in
@@ -233,6 +255,8 @@ let run_via_runtime axiom_path =
       (match int_of_string_opt out with
        | Some n -> Got n
        | None   -> RunFail (Printf.sprintf "unexpected output: %S" out))
+    else if rc = 99 then
+      RunSkip "Node.js 'wasi' module not available (requires Node >= 12)"
     else RunFail (Printf.sprintf "node exited %d" rc)
 
 let test_main_returns_via_runtime src expected () =
@@ -492,9 +516,9 @@ fn main() -> Int ! pure {
 (* Allocator execution helper                                          *)
 (* ------------------------------------------------------------------ *)
 
-(** Instantiate the module at [path] via Node.js, call __alloc twice,
-    write/read through the exported memory, and return the first
-    allocation address. *)
+(** Instantiate the module with mock "axm" imports via Node.js, call axm_alloc
+    twice, write/read through the shared memory, and return the first allocation
+    address.  The runtime heap starts at page 1 (byte offset 65536). *)
 let run_alloc_check path =
   if not (Lazy.force has_node) then
     RunSkip "no node.js runtime available"
@@ -503,14 +527,20 @@ let run_alloc_check path =
       Printf.sprintf
         "const fs=require('fs');\
          const buf=fs.readFileSync(%s);\
-         WebAssembly.instantiate(buf).then(({instance})=>{\
-           const e=instance.exports;\
-           const ptr=e.__alloc(8);\
-           if(ptr<1024){console.error('ptr too low:'+ptr);process.exit(1);}\
-           const mem=new Uint32Array(e.memory.buffer);\
-           mem[ptr>>2]=0xABCD;\
-           if(mem[ptr>>2]!==0xABCD){console.error('rw mismatch');process.exit(2);}\
-           const ptr2=e.__alloc(4);\
+         let hp=65536;\
+         const mem=new WebAssembly.Memory({initial:2});\
+         const axm={\
+           memory:mem,\
+           axm_alloc:(n)=>{const p=hp;hp+=((n+3)&~3);return p;},\
+           axm_print:()=>0,axm_read_line:()=>0\
+         };\
+         WebAssembly.instantiate(buf,{axm}).then(({instance})=>{\
+           const ptr=axm.axm_alloc(8);\
+           if(ptr<65536){console.error('ptr too low:'+ptr);process.exit(1);}\
+           const mv=new Uint32Array(mem.buffer);\
+           mv[ptr>>2]=0xABCD;\
+           if(mv[ptr>>2]!==0xABCD){console.error('rw mismatch');process.exit(2);}\
+           const ptr2=axm.axm_alloc(4);\
            if(ptr2!==ptr+8){console.error('bump wrong:'+ptr2);process.exit(3);}\
            console.log(ptr);\
          }).catch(e=>{console.error(e.message);process.exit(4);});"
@@ -986,8 +1016,8 @@ let test_main_returns src expected () =
       | RunFail m -> Alcotest.fail ("execution failed: " ^ m)
       | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
 
-(** Check that every compiled module exports __alloc, and that calling
-    it twice with sizes 8 and 4 returns consecutive addresses >= 1024. *)
+(** Check that every compiled module validates and that the mock axm_alloc
+    (heap starting at page 1 = 65536) returns consecutive addresses >= 65536. *)
 let test_allocator_exported src () =
   with_tmp_file ".axm" (fun s ->
     with_tmp_file ".wasm" (fun d ->
@@ -999,8 +1029,8 @@ let test_allocator_exported src () =
       | Skip msg -> Printf.printf "[SKIP] %s\n%!" msg
       | Pass ->
         match run_alloc_check d with
-        | Got n when n >= 1024 -> ()
-        | Got n    -> Alcotest.failf "__alloc returned %d, want >= 1024" n
+        | Got n when n >= 65536 -> ()
+        | Got n    -> Alcotest.failf "axm_alloc returned %d, want >= 65536" n
         | RunFail m -> Alcotest.fail ("allocator check failed: " ^ m)
         | RunSkip m -> Printf.printf "[SKIP] %s\n%!" m))
 

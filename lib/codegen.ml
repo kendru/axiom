@@ -150,6 +150,102 @@ let list_find_index f lst =
   go 0 lst
 
 (* ------------------------------------------------------------------ *)
+(* Free-variable analysis for handler closure capture                   *)
+(* ------------------------------------------------------------------ *)
+
+(** Extract variable names bound by a pattern. *)
+let rec bound_vars_of_epat (pat : Ast.pattern) : string list =
+  match pat.Ast.pat_desc with
+  | Ast.PVar x            -> [x]
+  | Ast.PCtor (_, subs)   -> List.concat_map bound_vars_of_epat subs
+  | Ast.POr (p1, p2)      -> bound_vars_of_epat p1 @ bound_vars_of_epat p2
+  | _                     -> []
+
+(** [free_vars_in_eexpr env bound e acc] collects variables referenced in [e]
+    that are present in [env] (outer local variables) and not already in [bound]
+    or [acc].  Top-level functions and constructors (absent from [env]) are
+    excluded automatically. *)
+let rec free_vars_in_eexpr
+    (env   : (string * int) list)
+    (bound : string list)
+    (e     : eexpr)
+    (acc   : string list)
+  : string list =
+  match e.edesc with
+  | EVar x ->
+    if List.mem x bound || not (List.mem_assoc x env) || List.mem x acc
+    then acc
+    else x :: acc
+  | EIntLit _ | EFloatLit _ | EBoolLit _ | EUnitLit | EStringLit _ -> acc
+  | ELet { pat; value; body } ->
+    let acc'   = free_vars_in_eexpr env bound value acc in
+    let bound' = bound_vars_of_epat pat @ bound in
+    free_vars_in_eexpr env bound' body acc'
+  | EApp (f, args) ->
+    List.fold_left (fun ac a -> free_vars_in_eexpr env bound a ac)
+      (free_vars_in_eexpr env bound f acc) args
+  | EFn { ev_params; params; fn_body; _ } ->
+    let bound' =
+      List.map (fun ep -> ep.ev_name) ev_params
+      @ List.map (fun p -> p.Ast.param_name) params
+      @ bound
+    in
+    free_vars_in_eexpr env bound' fn_body acc
+  | EIf { cond; then_; else_ } ->
+    free_vars_in_eexpr env bound else_
+      (free_vars_in_eexpr env bound then_
+         (free_vars_in_eexpr env bound cond acc))
+  | EDo stmts ->
+    let rec go bnd ac = function
+      | [] -> ac
+      | EStmtLet { pat; value } :: rest ->
+        let ac'  = free_vars_in_eexpr env bnd value ac in
+        let bnd' = bound_vars_of_epat pat @ bnd in
+        go bnd' ac' rest
+      | EStmtExpr e2 :: rest ->
+        go bnd (free_vars_in_eexpr env bnd e2 ac) rest
+    in
+    go bound acc stmts
+  | EMatch { scrutinee; arms } ->
+    List.fold_left (fun ac arm ->
+      let bnd' = bound_vars_of_epat arm.pattern @ bound in
+      free_vars_in_eexpr env bnd' arm.arm_body ac
+    ) (free_vars_in_eexpr env bound scrutinee acc) arms
+  | ELetrec (bindings, body) ->
+    let bnd' = List.map (fun b -> b.letrec_name) bindings @ bound in
+    List.fold_left (fun ac b ->
+      let bp = List.map (fun p -> p.Ast.param_name) b.letrec_params @ bnd' in
+      free_vars_in_eexpr env bp b.letrec_body ac
+    ) (free_vars_in_eexpr env bnd' body acc) bindings
+  | ERecord fields ->
+    List.fold_left (fun ac (_, v) -> free_vars_in_eexpr env bound v ac) acc fields
+  | ERecordUpdate (base, fields, _) ->
+    List.fold_left (fun ac (_, v) -> free_vars_in_eexpr env bound v ac)
+      (free_vars_in_eexpr env bound base acc) fields
+  | EProject (e2, _, _) -> free_vars_in_eexpr env bound e2 acc
+  | EPerform { args; ev_var; _ } ->
+    (* ev_var is itself an outer variable that may need capture *)
+    let acc' =
+      if List.mem ev_var bound || not (List.mem_assoc ev_var env) || List.mem ev_var acc
+      then acc
+      else ev_var :: acc
+    in
+    List.fold_left (fun ac a -> free_vars_in_eexpr env bound a ac) acc' args
+  | EHandle { handled; handlers } ->
+    List.fold_left (fun ac h ->
+      let ret_acc = match h.return_handler with
+        | None -> ac
+        | Some rh ->
+          let bnd' = [rh.return_var] @ bound in
+          free_vars_in_eexpr env bnd' rh.return_body ac
+      in
+      List.fold_left (fun a oh ->
+        let bnd' = oh.op_handler_params @ bound in
+        free_vars_in_eexpr env bnd' oh.op_handler_body a
+      ) ret_acc h.op_handlers
+    ) (free_vars_in_eexpr env bound handled acc) handlers
+
+(* ------------------------------------------------------------------ *)
 (* Expression compiler (elaborated IR)                                  *)
 (* ------------------------------------------------------------------ *)
 
@@ -243,6 +339,12 @@ and compile_eexpr ?(tail=false) ctx e =
   | EIntLit n ->
     [I32Const (Int64.to_int n)]
 
+  | EFloatLit _ ->
+    failwith "Codegen: floating-point not yet supported"
+
+  | EUnitLit ->
+    [I32Const 0]
+
   | EBoolLit b ->
     [I32Const (if b then 1 else 0)]
 
@@ -318,9 +420,13 @@ and compile_eexpr ?(tail=false) ctx e =
   | ELet { pat = { Ast.pat_desc = Ast.PVar x; _ }; value; body } ->
     let idx        = alloc_local ctx in
     let value_code = compile_eexpr ctx value in
-    (* let introduces no new WASM block, so trampoline depth is unchanged *)
     let body_code  = compile_eexpr ~tail { ctx with env = (x, idx) :: ctx.env } body in
     value_code @ [LocalSet idx] @ body_code
+
+  | ELet { pat = { Ast.pat_desc = Ast.PWild; _ }; value; body } ->
+    let value_code = compile_eexpr ctx value in
+    let body_code  = compile_eexpr ~tail ctx body in
+    value_code @ [Drop] @ body_code
 
   | EIf { cond; then_; else_ } ->
     (* The If instruction creates a structured block; bump depth so that Br
@@ -353,15 +459,20 @@ and compile_eexpr ?(tail=false) ctx e =
       | Some i -> i
       | None   -> failwith ("Codegen: unbound evidence variable: " ^ ev_var)
     in
-    let param_tys = List.map val_type_of_type_expr op.Ast.effect_op_params in
+    (* Evidence struct layout (8 bytes per op):
+       op_idx*8+0 = fn table slot; op_idx*8+4 = closure env pointer *)
+    let env_ptr_code = [LocalGet ev_local; I32Load (2, op_idx * 8 + 4)] in
+    let load_fn      = [LocalGet ev_local; I32Load (2, op_idx * 8    )] in
+    (* Handler type: (env_ptr: i32, op_params...) -> op_ret *)
+    let param_tys = I32 :: List.map val_type_of_type_expr op.Ast.effect_op_params in
     let ret_ty    = val_type_of_type_expr op.Ast.effect_op_return in
     let type_idx  = add_type ctx.module_ { params = param_tys; results = [ret_ty] } in
     let arg_code  = List.concat_map (compile_eexpr ctx) args in
-    let load_fn   = [LocalGet ev_local; I32Load (2, op_idx * 4)] in
+    (* Stack: env_ptr  arg0 … argN  fn_slot  → call_indirect *)
     if tail && ctx.tco = TailCallInstr then
-      arg_code @ load_fn @ [ReturnCallIndirect (type_idx, 0)]
+      env_ptr_code @ arg_code @ load_fn @ [ReturnCallIndirect (type_idx, 0)]
     else
-      arg_code @ load_fn @ [CallIndirect (type_idx, 0)]
+      env_ptr_code @ arg_code @ load_fn @ [CallIndirect (type_idx, 0)]
 
   | EHandle { handled; handlers } ->
     compile_ehandle ctx handled handlers
@@ -461,68 +572,227 @@ and compile_eletrec ?(tail=false) ctx bindings body =
   ) entries;
   compile_eexpr ~tail { ctx with func_map = new_func_map } body
 
-(* Handle: compile each op-handler as a module function, build the
-   evidence struct in linear memory, then compile the handled expression
-   in a context where each effect's evidence variable is bound. *)
+(* Handle: compile each op-handler as a module function with a closure
+   environment, build the evidence struct in linear memory, then compile
+   the handled expression in a context where each effect's evidence
+   variable is bound.
+
+   Evidence struct layout (8 bytes per op):
+     op_idx*8+0 : i32  table slot of the handler function
+     op_idx*8+4 : i32  pointer to the closure environment (0 = no closure)
+
+   Closure environment layout (variable size):
+     For abort-style ops (return type Nothing) that have a return handler:
+       slot 0     : throw_ctrl_ptr  (pointer to [abort_flag (i32), abort_val (i32)])
+       slots 1..n : captured outer variables
+     For all other ops:
+       slots 0..n-1 : captured outer variables
+
+   Handler function signature: (env_ptr: i32, op_params...) -> op_ret
+
+   For abort-style handlers, after compiling the body:
+     - store the result in throw_ctrl[4] (abort_val)
+     - store 1 in throw_ctrl[0] (abort_flag)
+     - return 0 (dummy; the actual result is retrieved at the handle site)
+
+   After the handled expression, if a throw_ctrl was allocated for a handler
+   with a return clause, the abort flag is checked:
+     - flag set:   return throw_ctrl[4] (bypass the return handler)
+     - flag clear: apply the return handler to the computation result *)
 and compile_ehandle ctx handled handlers =
-  let (ev_setups, ev_locals) =
-    List.split (List.map (fun (h : eeffect_handler) ->
-      let ops =
-        match List.assoc_opt h.effect_handler ctx.effect_map with
-        | Some ops -> ops
-        | None ->
-          failwith ("Codegen: unknown effect: " ^ h.effect_handler)
-      in
-      let n_ops = List.length ops in
-      let op_slots = List.map (fun (oh : eop_handler) ->
-        let op_idx = list_find_index
-            (fun op -> op.Ast.effect_op_name = oh.op_handler_name) ops in
-        let op = List.nth ops op_idx in
-        let param_pairs =
-          List.map2 (fun name ty -> (name, val_type_of_type_expr ty))
-            oh.op_handler_params op.Ast.effect_op_params
-        in
-        let ret_ty = val_type_of_type_expr op.Ast.effect_op_return in
-        let fn_idx = reserve_function ctx.module_
-            (List.map snd param_pairs) [ret_ty] in
-        let table_slot = add_to_table ctx fn_idx in
-        let handler_ctx =
-          make_ctx ctx.tco param_pairs ctx.func_map ctx.ctor_map
-            ctx.alloc_idx ctx.module_ ctx.pending
-            ctx.effect_map ctx.table_funcs ctx.string_pool
-        in
-        let handler_ctx =
-          setup_trampoline ctx.tco fn_idx (List.length param_pairs) handler_ctx
-        in
-        let body = compile_eexpr ~tail:(ctx.tco = TailCallInstr) handler_ctx oh.op_handler_body in
-        let body = wrap_trampoline ctx.tco body in
-        ctx.pending :=
-          !(ctx.pending) @ [(fn_idx, !(handler_ctx.extra_locals), body)];
-        (op_idx, table_slot)
-      ) h.op_handlers in
-      let ev_local = alloc_local ctx in
-      let setup =
-        [I32Const (n_ops * 4); Call ctx.alloc_idx; LocalSet ev_local]
-        @ List.concat_map (fun (op_idx, slot) ->
-            [LocalGet ev_local; I32Const slot; I32Store (2, op_idx * 4)]
-          ) op_slots
-      in
-      (setup, (h.ev_param.ev_name, ev_local))
-    ) handlers)
+  let is_nothing ty = ty = Ast.TyName "Nothing" in
+
+  let handler_ops eff =
+    match List.assoc_opt eff ctx.effect_map with
+    | Some ops -> ops
+    | None     -> failwith ("Codegen: unknown effect: " ^ eff)
   in
+
+  (* For each handler group, determine if a throw-control block is needed.
+     It is needed when there is a return handler AND at least one op whose
+     declared return type is Nothing (i.e. the handler never calls resume). *)
+  let handler_needs_throw_ctrl (h : eeffect_handler) =
+    h.return_handler <> None &&
+    let ops = handler_ops h.effect_handler in
+    List.exists (fun (oh : eop_handler) ->
+      match List.find_opt
+              (fun o -> o.Ast.effect_op_name = oh.op_handler_name) ops with
+      | Some op -> is_nothing op.Ast.effect_op_return
+      | None    -> false
+    ) h.op_handlers
+  in
+
+  (* Compile all handlers, collecting evidence setup code and ev-var bindings. *)
+  let handler_infos = List.map (fun (h : eeffect_handler) ->
+    let ops  = handler_ops h.effect_handler in
+    let n_ops = List.length ops in
+    let needs_tc = handler_needs_throw_ctrl h in
+
+    (* Optionally allocate a throw-control block: [abort_flag=0, abort_val=0] *)
+    let tc_local, tc_setup =
+      if needs_tc then
+        let l = alloc_local ctx in
+        let s = [I32Const 8; Call ctx.alloc_idx; LocalTee l;
+                 I32Const 0; I32Store (2, 0)] in   (* abort_flag = 0 *)
+        (Some l, s)
+      else
+        (None, [])
+    in
+
+    let op_compiled = List.map (fun (oh : eop_handler) ->
+      let op_idx = list_find_index
+          (fun op -> op.Ast.effect_op_name = oh.op_handler_name) ops in
+      let op = List.nth ops op_idx in
+      let is_abort = is_nothing op.Ast.effect_op_return && tc_local <> None in
+
+      (* Compute outer variables captured by this handler body.
+         "resume" is a special form, not a variable; constructors and
+         top-level functions live in func_map / ctor_map, not env. *)
+      let own_params = oh.op_handler_params in
+      let free_vars  = free_vars_in_eexpr ctx.env own_params
+                         oh.op_handler_body [] in
+
+      (* Closure env layout:
+           slot 0           : throw_ctrl_ptr  (only for abort ops)
+           slots 1..n       : captured vars   (abort case)
+           OR
+           slots 0..n-1     : captured vars   (non-abort case) *)
+      let tc_slot         = if is_abort then Some 0 else None in
+      let free_base       = if is_abort then 1 else 0 in
+      let free_var_slots  = List.mapi (fun i v -> (free_base + i, v)) free_vars in
+      let n_env = List.length free_vars + (if is_abort then 1 else 0) in
+
+      (* Handler WASM function params: (__env: i32, op_params…) *)
+      let param_pairs =
+        ("__env", I32) ::
+        List.map2 (fun name ty -> (name, val_type_of_type_expr ty))
+          oh.op_handler_params op.Ast.effect_op_params
+      in
+      let ret_ty  = val_type_of_type_expr op.Ast.effect_op_return in
+      let fn_idx  = reserve_function ctx.module_
+                      (List.map snd param_pairs) [ret_ty] in
+      let tbl_slot = add_to_table ctx fn_idx in
+
+      (* Build closure env at the call site (inside ctx) *)
+      let env_outer_local = alloc_local ctx in
+      let env_build =
+        if n_env = 0 then
+          [I32Const 0; LocalSet env_outer_local]
+        else
+          [I32Const (n_env * 4); Call ctx.alloc_idx; LocalSet env_outer_local]
+          @ (match tc_slot, tc_local with
+             | Some sl, Some tl ->
+               [LocalGet env_outer_local; LocalGet tl;
+                I32Store (2, sl * 4)]
+             | _ -> [])
+          @ List.concat_map (fun (sl, vname) ->
+              let vl = List.assoc vname ctx.env in
+              [LocalGet env_outer_local; LocalGet vl;
+               I32Store (2, sl * 4)]
+            ) free_var_slots
+      in
+
+      (* Build the handler function context *)
+      let handler_ctx =
+        make_ctx ctx.tco param_pairs ctx.func_map ctx.ctor_map
+          ctx.alloc_idx ctx.module_ ctx.pending
+          ctx.effect_map ctx.table_funcs ctx.string_pool
+      in
+      (* env_ptr is local 0 in handler_ctx (first param) *)
+
+      (* Load captured vars from the closure env into handler locals *)
+      let handler_ctx, prologue =
+        (* Optionally load throw_ctrl_ptr *)
+        let hctx, prol =
+          match tc_slot with
+          | Some sl ->
+            let tcl = alloc_local handler_ctx in
+            let ld  = [LocalGet 0; I32Load (2, sl * 4); LocalSet tcl] in
+            ({ handler_ctx with env = ("__throw_ctrl", tcl) :: handler_ctx.env }, ld)
+          | None -> (handler_ctx, [])
+        in
+        (* Load each free variable *)
+        List.fold_left (fun (hc, prol) (sl, vname) ->
+          let vl  = alloc_local hc in
+          let ld  = [LocalGet 0; I32Load (2, sl * 4); LocalSet vl] in
+          ({ hc with env = (vname, vl) :: hc.env }, prol @ ld)
+        ) (hctx, prol) free_var_slots
+      in
+
+      let handler_ctx =
+        setup_trampoline ctx.tco fn_idx (List.length param_pairs) handler_ctx
+      in
+
+      (* Compile the handler body *)
+      let body = compile_eexpr ~tail:(ctx.tco = TailCallInstr)
+                   handler_ctx oh.op_handler_body in
+
+      (* For abort-style handlers, wrap body to set the throw-ctrl block *)
+      let full_body =
+        if is_abort then begin
+          let tcl        = List.assoc "__throw_ctrl" handler_ctx.env in
+          let av_local   = alloc_local handler_ctx in
+          prologue @ body
+          @ [LocalSet av_local;
+             LocalGet tcl; I32Const 1; I32Store (2, 0);   (* abort_flag = 1 *)
+             LocalGet tcl; LocalGet av_local; I32Store (2, 4); (* abort_val *)
+             I32Const 0]                                   (* dummy return *)
+        end else
+          prologue @ body
+      in
+
+      let wrapped = wrap_trampoline ctx.tco full_body in
+      ctx.pending :=
+        !(ctx.pending) @ [(fn_idx, !(handler_ctx.extra_locals), wrapped)];
+
+      (op_idx, tbl_slot, env_outer_local, env_build)
+    ) h.op_handlers in
+
+    (* Build this effect's evidence struct (n_ops × 8 bytes) *)
+    let ev_local = alloc_local ctx in
+    let ev_setup =
+      tc_setup
+      (* First emit all closure-env build code (allocates & populates env ptrs) *)
+      @ List.concat_map (fun (_, _, _, env_build) -> env_build) op_compiled
+      @ [I32Const (n_ops * 8); Call ctx.alloc_idx; LocalSet ev_local]
+      @ List.concat_map (fun (op_idx, tbl_slot, env_local, _) ->
+          [LocalGet ev_local; I32Const tbl_slot;
+           I32Store (2, op_idx * 8)]
+          @ [LocalGet ev_local; LocalGet env_local;
+             I32Store (2, op_idx * 8 + 4)]
+        ) op_compiled
+    in
+    (h, tc_local, ev_setup, (h.ev_param.ev_name, ev_local))
+  ) handlers in
+
+  let ev_setups = List.map (fun (_, _, s, _) -> s) handler_infos in
+  let ev_locals = List.map (fun (_, _, _, e) -> e) handler_infos in
+
   let ctx' = { ctx with env = ev_locals @ ctx.env } in
   let handled_code = List.concat ev_setups @ compile_eexpr ctx' handled in
-  List.fold_left (fun instrs (h : eeffect_handler) ->
+
+  (* Apply return handlers, conditionally checking abort flag when needed *)
+  List.fold_left (fun instrs (h, tc_local, _, _) ->
     match h.return_handler with
     | None -> instrs
     | Some rh ->
       let result_local = alloc_local ctx in
-      instrs
-      @ [LocalSet result_local]
-      @ compile_eexpr
-          { ctx with env = (rh.return_var, result_local) :: ctx.env }
+      let base = instrs @ [LocalSet result_local] in
+      let ret_body ctx_rh =
+        compile_eexpr
+          { ctx_rh with env = (rh.return_var, result_local) :: ctx_rh.env }
           rh.return_body
-  ) handled_code handlers
+      in
+      (match tc_local with
+       | Some tcl ->
+         base
+         @ [LocalGet tcl; I32Load (2, 0);
+            If (ValType I32,
+                [LocalGet tcl; I32Load (2, 4)],   (* abort: return abort_val *)
+                Some (ret_body ctx))]               (* normal: apply return handler *)
+       | None ->
+         base @ ret_body ctx)
+  ) handled_code handler_infos
 
 (* ------------------------------------------------------------------ *)
 (* String literal pool                                                  *)

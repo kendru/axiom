@@ -1250,6 +1250,237 @@ fn main() -> Int ! pure {
 }|}
 
 (* ------------------------------------------------------------------ *)
+(* Issue #107: CPS effects lowering — State, Throw, interleaving       *)
+(* ------------------------------------------------------------------ *)
+
+(* Pure functions must not be affected by the effects lowering.
+   Regression guard: if the pass incorrectly transforms pure code the
+   result would change. *)
+let src_pure_unchanged =
+  {|fn square(x: Int) -> Int ! pure {
+  mul(x, x)
+}
+
+fn main() -> Int ! pure {
+  square(7)
+}|}
+(* 7*7 = 49 *)
+
+(* State round-trip: handler captures 'init' from outer scope.
+   This exercises handler closure capture — get() must return init = 42. *)
+let src_state_closure =
+  {|effect State {
+  get: () -> Int
+}
+
+fn computation() -> Int ! {State} {
+  perform State.get()
+}
+
+fn run_state(init: Int) -> Int ! pure {
+  handle computation() with {
+    State {
+      get() => resume(init)
+    }
+  }
+}
+
+fn main() -> Int ! pure {
+  run_state(42)
+}|}
+(* get() = init = 42 *)
+
+(* State with two captured variables: handler body closes over both
+   'base' and 'offset', returning base + offset. *)
+let src_state_two_captures =
+  {|effect State {
+  get: () -> Int
+}
+
+fn computation() -> Int ! {State} {
+  perform State.get()
+}
+
+fn run_state2(base: Int, offset: Int) -> Int ! pure {
+  handle computation() with {
+    State {
+      get() => resume(add(base, offset))
+    }
+  }
+}
+
+fn main() -> Int ! pure {
+  run_state2(30, 12)
+}|}
+(* get() = 30 + 12 = 42 *)
+
+(* count_up is the canonical State example from the design doc.
+   run_state is called with init >= n so it terminates immediately:
+   get() returns init = 5, gte(5, 5) = true → returns 5. *)
+let src_count_up_state =
+  {|effect State {
+  get: () -> Int,
+  put: (Int) -> Int
+}
+
+fn count_up(n: Int) -> Int ! {State} {
+  let current = perform State.get() in
+  if gte(current, n) {
+    current
+  } else {
+    let _ = perform State.put(add(current, 1)) in
+    count_up(n)
+  }
+}
+
+fn run_state(init: Int, n: Int) -> Int ! pure {
+  handle count_up(n) with {
+    State {
+      get()  => resume(init)
+      put(s) => resume(s)
+    }
+  }
+}
+
+fn main() -> Int ! pure {
+  run_state(5, 5)
+}|}
+(* init=5, n=5: get()=5, gte(5,5)=true → 5 *)
+
+(* Throw short-circuiting with a return handler (catch pattern).
+   throw(e) sets the abort flag → the return handler ok(v) is bypassed.
+   Result comes from the abort value Fail(99).e = 99. *)
+let src_throw_catch =
+  {|type Outcome = | Ok(Int) | Fail(Int)
+
+effect Throw {
+  throw: (Int) -> Nothing
+}
+
+fn risky(code: Int) -> Int ! {Throw} {
+  perform Throw.throw(code)
+}
+
+fn my_catch(code: Int) -> Outcome ! pure {
+  handle risky(code) with {
+    Throw {
+      throw(e) => Fail(e)
+      return v => Ok(v)
+    }
+  }
+}
+
+fn main() -> Int ! pure {
+  match my_catch(99) with {
+    | Ok(v)   => v
+    | Fail(e) => e
+  }
+}|}
+(* throw(99) → Fail(99) → match Fail(e) → e = 99 *)
+
+(* Throw: normal path (no throw) should apply return handler.
+   risky_or_value(0) returns 0 without throwing.
+   catch wraps it: Ok(0) → match Ok(v) → v = 0. *)
+let src_throw_no_throw =
+  {|type Outcome = | Ok(Int) | Fail(Int)
+
+effect Throw {
+  throw: (Int) -> Nothing
+}
+
+fn safe(value: Int) -> Int ! {Throw} {
+  value
+}
+
+fn my_catch(value: Int) -> Outcome ! pure {
+  handle safe(value) with {
+    Throw {
+      throw(e) => Fail(e)
+      return v => Ok(v)
+    }
+  }
+}
+
+fn main() -> Int ! pure {
+  match my_catch(42) with {
+    | Ok(v)   => v
+    | Fail(e) => e
+  }
+}|}
+(* safe(42) = 42, return handler Ok(42), match Ok(v) → v = 42 *)
+
+(* State + Throw interleaving: computation uses both effects.
+   Inner handle provides State, outer provides Throw.
+   With State.get() = 0, the computation throws 99. *)
+let src_state_throw_interleave =
+  {|effect State {
+  get: () -> Int
+}
+
+effect Throw {
+  throw: (Int) -> Nothing
+}
+
+fn computation() -> Int ! {State, Throw} {
+  let v = perform State.get() in
+  if eq(v, 0) {
+    perform Throw.throw(99)
+  } else {
+    v
+  }
+}
+
+fn main() -> Int ! pure {
+  handle (
+    handle computation() with {
+      State {
+        get() => resume(0)
+      }
+    }
+  ) with {
+    Throw {
+      throw(e) => e
+    }
+  }
+}|}
+(* State.get()=0, eq(0,0)=true → throw(99) → handler returns 99 *)
+
+(* State + Throw interleaving: non-throw path.
+   With State.get() = 7, no throw; returns 7 through both handles. *)
+let src_state_throw_no_throw =
+  {|effect State {
+  get: () -> Int
+}
+
+effect Throw {
+  throw: (Int) -> Nothing
+}
+
+fn computation() -> Int ! {State, Throw} {
+  let v = perform State.get() in
+  if eq(v, 0) {
+    perform Throw.throw(99)
+  } else {
+    v
+  }
+}
+
+fn main() -> Int ! pure {
+  handle (
+    handle computation() with {
+      State {
+        get() => resume(7)
+      }
+    }
+  ) with {
+    Throw {
+      throw(e) => e
+    }
+  }
+}|}
+(* State.get()=7, eq(7,0)=false → else branch returns 7 *)
+
+(* ------------------------------------------------------------------ *)
 (* Suite                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1574,5 +1805,74 @@ fn main() -> Int ! pure { 0 }|};
             (test_main_returns src_record_three_fields 2)
         ; Alcotest.test_case "record passed to fn, project inside" `Quick
             (test_main_returns src_record_fn_param 42)
+        ] )
+
+    (* ------------------------------------------------------------------ *)
+    (* Issue #107: CPS effects lowering — State, Throw, interleaving       *)
+    (* ------------------------------------------------------------------ *)
+    ; ( "effects_lowering",
+        (* Tests for the handler closure-capture and abort mechanisms:
+           - Pure functions must be unaffected (regression guard).
+           - State round-trip: handler captures outer variable (init).
+           - Throw short-circuiting: abort flag bypasses return handler.
+           - State + Throw interleaving: nested handles with both effects. *)
+        [ Alcotest.test_case "build: pure unchanged"             `Quick
+            (test_build_produces_file src_pure_unchanged)
+        ; Alcotest.test_case "validate: pure unchanged"          `Quick
+            (test_validates src_pure_unchanged)
+        ; Alcotest.test_case "pure: square(7) = 49"              `Quick
+            (test_main_returns src_pure_unchanged 49)
+
+        (* State closure capture *)
+        ; Alcotest.test_case "build: state closure"             `Quick
+            (test_build_produces_file src_state_closure)
+        ; Alcotest.test_case "validate: state closure"          `Quick
+            (test_validates src_state_closure)
+        ; Alcotest.test_case "state closure: get()=init=42"     `Quick
+            (test_main_returns src_state_closure 42)
+
+        ; Alcotest.test_case "build: state two captures"        `Quick
+            (test_build_produces_file src_state_two_captures)
+        ; Alcotest.test_case "validate: state two captures"     `Quick
+            (test_validates src_state_two_captures)
+        ; Alcotest.test_case "state two captures: 30+12=42"     `Quick
+            (test_main_returns src_state_two_captures 42)
+
+        ; Alcotest.test_case "build: count_up state"            `Quick
+            (test_build_produces_file src_count_up_state)
+        ; Alcotest.test_case "validate: count_up state"         `Quick
+            (test_validates src_count_up_state)
+        ; Alcotest.test_case "count_up(init=5,n=5) = 5"         `Quick
+            (test_main_returns src_count_up_state 5)
+
+        (* Throw + return handler (catch pattern) *)
+        ; Alcotest.test_case "build: throw catch"               `Quick
+            (test_build_produces_file src_throw_catch)
+        ; Alcotest.test_case "validate: throw catch"            `Quick
+            (test_validates src_throw_catch)
+        ; Alcotest.test_case "throw catch: Fail(99)→e=99"       `Quick
+            (test_main_returns src_throw_catch 99)
+
+        ; Alcotest.test_case "build: throw no-throw catch"      `Quick
+            (test_build_produces_file src_throw_no_throw)
+        ; Alcotest.test_case "validate: throw no-throw catch"   `Quick
+            (test_validates src_throw_no_throw)
+        ; Alcotest.test_case "throw no-throw: Ok(42)→v=42"      `Quick
+            (test_main_returns src_throw_no_throw 42)
+
+        (* State + Throw interleaving *)
+        ; Alcotest.test_case "build: state+throw interleave"    `Quick
+            (test_build_produces_file src_state_throw_interleave)
+        ; Alcotest.test_case "validate: state+throw interleave" `Quick
+            (test_validates src_state_throw_interleave)
+        ; Alcotest.test_case "state+throw: get=0→throw=99"      `Quick
+            (test_main_returns src_state_throw_interleave 99)
+
+        ; Alcotest.test_case "build: state+throw no-throw"      `Quick
+            (test_build_produces_file src_state_throw_no_throw)
+        ; Alcotest.test_case "validate: state+throw no-throw"   `Quick
+            (test_validates src_state_throw_no_throw)
+        ; Alcotest.test_case "state+throw: get=7→value=7"       `Quick
+            (test_main_returns src_state_throw_no_throw 7)
         ] )
     ]

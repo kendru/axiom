@@ -1203,6 +1203,27 @@ let stdlib_fun_scheme bound params ret =
   in
   { bound; body }
 
+(** Convert a CamelCase constructor name to a snake_case alias.
+    E.g. [InvalidTransition] → [invalid_transition], [ConnLog] → [conn_log].
+    Simple lowercase names (no uppercase after position 0) are returned as-is. *)
+let camel_to_snake s =
+  let n = String.length s in
+  if n = 0 then s
+  else begin
+    let buf = Buffer.create (n + 4) in
+    String.iteri (fun i c ->
+      if i > 0 && c >= 'A' && c <= 'Z' then begin
+        let prev = s.[i - 1] in
+        if prev >= 'a' && prev <= 'z' then
+          Buffer.add_char buf '_'
+        else if i + 1 < n && s.[i + 1] >= 'a' && s.[i + 1] <= 'z' then
+          Buffer.add_char buf '_'
+      end;
+      Buffer.add_char buf (Char.lowercase_ascii c)
+    ) s;
+    Buffer.contents buf
+  end
+
 (** Type-constructor sets for the three built-in ADTs.
     Merged with program-specific entries in [check_program] so that
     exhaustiveness checking works without a user-level type declaration. *)
@@ -1210,6 +1231,7 @@ let stdlib_type_ctor_env : (string * string list) list =
   [ ("List",   ["Nil"; "Cons"])
   ; ("Option", ["None"; "Some"])
   ; ("Result", ["Ok"; "Err"])
+  ; ("Pair",   ["Pair"])
   ]
 
 (** Pre-declared value environment.  Every entry here is available in any
@@ -1258,13 +1280,22 @@ let stdlib_env : env =
   ; ("max", max_s)
   ]
 
-(** Pre-declared effect environment.  [DivByZero] is carried by [div]. *)
+(** Pre-declared effect environment.  [DivByZero] is carried by [div].
+    [Throw<e>] is the standard error-propagation effect. *)
 let stdlib_effect_env : effect_env =
   [ ("DivByZero",
      { eff_type_params = []
      ; eff_ops =
          [ { op_name   = "throw"
            ; op_params = []
+           ; op_return = TyCon "Nothing"
+           } ]
+     })
+  ; ("Throw",
+     { eff_type_params = ["e"]
+     ; eff_ops =
+         [ { op_name   = "throw"
+           ; op_params = [TyVar "e"]
            ; op_return = TyCon "Nothing"
            } ]
      })
@@ -1359,8 +1390,12 @@ let build_module_registry (prog : program) : module_registry =
           ((fn_name, scheme) :: env, eenv)
         | DeclType { type_name; type_params; ctors; _ } ->
           let env' = List.fold_left (fun acc ctor ->
-              env_extend ctor.Ast.ctor_name
-                (ctor_scheme_of_type type_name type_params ctor) acc
+              let scheme = ctor_scheme_of_type type_name type_params ctor in
+              let acc1 = env_extend ctor.Ast.ctor_name scheme acc in
+              let alias = camel_to_snake ctor.Ast.ctor_name in
+              if alias <> ctor.Ast.ctor_name && List.assoc_opt alias acc = None
+              then env_extend alias scheme acc1
+              else acc1
             ) env ctors in
           (env', eenv)
         | _ -> (env, eenv)
@@ -1406,8 +1441,13 @@ let build_type_ctor_env (prog : program) : (string * string list) list =
     function bodies are type-checked in pass 2.
 
     Returns the populated [(env, effect_env)] for reuse in tests and
-    downstream tooling. Raises [Failure] on type errors. *)
-let check_program (prog : program) : env * effect_env =
+    downstream tooling. Raises [Failure] on type errors.
+
+    [extra_env] and [extra_eenv] (default empty) are prepended to the seed
+    environment before pass 1 runs.  Use these to inject a prelude
+    environment that was type-checked separately so that its function bodies
+    are not rechecked against the user's type declarations. *)
+let check_program ?(extra_env = []) ?(extra_eenv = []) (prog : program) : env * effect_env =
   type_ctor_env := stdlib_type_ctor_env @ build_type_ctor_env prog;
   let module_registry = build_module_registry prog in
   (* [add_qualified prefix mod_env mod_eenv env eenv] folds [mod_env] and
@@ -1432,9 +1472,12 @@ let check_program (prog : program) : env * effect_env =
       ((fn_name, scheme) :: env, eenv)
     | DeclType { type_name; type_params; ctors; _ } ->
       let env' = List.fold_left (fun acc ctor ->
-          env_extend ctor.Ast.ctor_name
-            (ctor_scheme_of_type type_name type_params ctor)
-            acc
+          let scheme = ctor_scheme_of_type type_name type_params ctor in
+          let acc1 = env_extend ctor.Ast.ctor_name scheme acc in
+          let alias = camel_to_snake ctor.Ast.ctor_name in
+          if alias <> ctor.Ast.ctor_name && List.assoc_opt alias acc = None
+          then env_extend alias scheme acc1
+          else acc1
         ) env ctors in
       (env', eenv)
     | DeclModule { module_name; body; _ } ->
@@ -1458,7 +1501,7 @@ let check_program (prog : program) : env * effect_env =
       (env, eenv)
   in
   let env0, eenv0 =
-    List.fold_left collect (stdlib_env, stdlib_effect_env) prog
+    List.fold_left collect (extra_env @ stdlib_env, extra_eenv @ stdlib_effect_env) prog
   in
   let rec check_decl d =
     match d.decl_desc with

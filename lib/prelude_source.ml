@@ -1,0 +1,76 @@
+(** The standard prelude source text, embedded at compile time.
+    The canonical source lives in [stdlib/prelude.axm]. *)
+let source = {axm|
+type List<a> = | Nil | Cons(a, List<a>)
+type Option<a> = | None | Some(a)
+type Result<a, e> = | Ok(a) | Err(e)
+type Pair<a, b> = | Pair(a, b)
+
+effect Throw<e> {
+  throw: (e) -> Nothing
+}
+
+fn length<a>(xs: List<a>) -> Int ! pure {
+  match xs with {
+    | Nil => 0
+    | Cons(_, t) => add(1, length(t))
+  }
+}
+
+fn append<a>(xs: List<a>, ys: List<a>) -> List<a> ! pure {
+  match xs with {
+    | Nil => ys
+    | Cons(h, t) => cons(h, append(t, ys))
+  }
+}
+
+fn map<a, b>(f: (x: a) -> b ! pure, xs: List<a>) -> List<b> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(h, t) => cons(f(h), map(f, t))
+  }
+}
+
+fn filter<a>(pred: (x: a) -> Bool ! pure, xs: List<a>) -> List<a> ! pure {
+  match xs with {
+    | Nil => nil()
+    | Cons(h, t) =>
+      if pred(h) { cons(h, filter(pred, t)) } else { filter(pred, t) }
+  }
+}
+
+fn fold<a, b>(f: (acc: b, x: a) -> b ! pure, acc: b, xs: List<a>) -> b ! pure {
+  match xs with {
+    | Nil => acc
+    | Cons(h, t) => fold(f, f(acc, h), t)
+  }
+}
+
+fn map_option<a, b>(f: (x: a) -> b ! pure, opt: Option<a>) -> Option<b> ! pure {
+  match opt with {
+    | Some(x) => some(f(x))
+    | None => none()
+  }
+}
+
+fn unwrap_or<a>(opt: Option<a>, default: a) -> a ! pure {
+  match opt with {
+    | Some(x) => x
+    | None => default
+  }
+}
+
+fn map_result<a, b, e>(f: (x: a) -> b ! pure, r: Result<a, e>) -> Result<b, e> ! pure {
+  match r with {
+    | Ok(x) => ok(f(x))
+    | Err(e) => err(e)
+  }
+}
+
+fn map_error<a, e1, e2>(f: (x: e1) -> e2 ! pure, r: Result<a, e1>) -> Result<a, e2> ! pure {
+  match r with {
+    | Ok(x) => ok(x)
+    | Err(e) => err(f(e))
+  }
+}
+|axm}

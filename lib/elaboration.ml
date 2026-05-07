@@ -513,11 +513,12 @@ let rec elaborate_decl (fn_env : fn_env)
   | other ->
     { edecl_desc = EDeclPassthrough other }
 
-let elaborate_program (prog : Ast.program) : eprogram =
+let elaborate_program ?(extra_env = []) ?(extra_eenv = []) (prog : Ast.program) : eprogram =
   (* Run check_program to obtain a type environment for record layout
      resolution during elaboration.  The program has already been validated
      by the caller; this second call always succeeds. *)
-  let (tc_env, tc_eenv) = Typechecker.check_program prog in
+  let (tc_env, tc_eenv) =
+    Typechecker.check_program ~extra_env ~extra_eenv prog in
   let fn_env = fn_env_of_decls prog in
   List.map (elaborate_decl fn_env tc_env tc_eenv) prog
 

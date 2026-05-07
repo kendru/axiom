@@ -1,4 +1,29 @@
-let usage = "Usage: axiom build <input.axm> [-o <output.wasm>] [--no-tail-calls]"
+let usage = "Usage: axiom build <input.axm> [-o <output.wasm>] [--no-tail-calls] [--no-prelude]"
+
+(** Parse, type-check, and return the environment from the standard prelude.
+    The prelude is checked in isolation (against stdlib only) so that its
+    function bodies are never rechecked against user-defined types. *)
+let load_prelude () =
+  let src = Axiom_lib.Prelude_source.source in
+  let tokens =
+    try Axiom_lib.Lexer.tokenize src
+    with Failure msg ->
+      Printf.eprintf "axiom build: lex error in prelude: %s\n" msg;
+      exit 1
+  in
+  let prelude_prog =
+    try Axiom_lib.Parser.parse_program tokens
+    with Failure msg ->
+      Printf.eprintf "axiom build: parse error in prelude: %s\n" msg;
+      exit 1
+  in
+  let env, eenv =
+    try Axiom_lib.Typechecker.check_program prelude_prog
+    with Failure msg ->
+      Printf.eprintf "axiom build: type error in prelude: %s\n" msg;
+      exit 1
+  in
+  (prelude_prog, env, eenv)
 
 (** Scan [prog] for [DeclImport] nodes and load each referenced module from
     [dir] as a [DeclModule] prepended to the program.  Modules already
@@ -67,10 +92,13 @@ let () =
   let input_file   = ref "" in
   let output_file  = ref "" in
   let no_tail_calls = ref false in
+  let no_prelude    = ref false in
   let specs =
     [ ("-o", Arg.Set_string output_file, "<file>  Output .wasm file")
     ; ("--no-tail-calls", Arg.Set no_tail_calls,
        "        Lower tail calls via a trampoline loop instead of return_call")
+    ; ("--no-prelude", Arg.Set no_prelude,
+       "        Do not auto-import the standard prelude")
     ]
   in
   let anon s =
@@ -119,13 +147,21 @@ let () =
       Printf.eprintf "%s\n" msg;
       exit 1
   in
-  (try ignore (Axiom_lib.Typechecker.check_program prog)
+  let prelude_prog, prelude_env, prelude_eenv =
+    if !no_prelude then ([], [], [])
+    else load_prelude ()
+  in
+  (try ignore (Axiom_lib.Typechecker.check_program
+     ~extra_env:prelude_env ~extra_eenv:prelude_eenv prog)
    with Failure msg ->
      Printf.eprintf "axiom build: type error: %s\n" msg;
      exit 1);
-  let _elaborated = Axiom_lib.Elaboration.elaborate_program prog in
+  let _elaborated = Axiom_lib.Elaboration.elaborate_program
+      ~extra_env:prelude_env ~extra_eenv:prelude_eenv prog in
   let use_tail_calls = not !no_tail_calls in
-  let wasm_bytes = Axiom_lib.Codegen.emit ~use_tail_calls prog in
+  let wasm_bytes = Axiom_lib.Codegen.emit ~use_tail_calls
+      ~extra_env:prelude_env ~extra_eenv:prelude_eenv
+      ~prelude_prog prog in
   (try
      let oc = open_out_bin !output_file in
      output_bytes oc wasm_bytes;

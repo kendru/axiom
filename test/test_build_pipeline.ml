@@ -1755,32 +1755,31 @@ fn main() -> Int ! pure { 0 }|};
             (test_example_builds (ex "02_data_types"))
         ; Alcotest.test_case "02_data_types: main = 20" `Quick
             (test_example_main_returns (ex "02_data_types") 20)
-          (* 03: missing lowercase constructor wrappers for user-defined ADTs
-             ('info' for Info, etc.) — blocked by #109 *)
-        ; Alcotest.test_case "03_effects: unbound 'info'" `Quick
-            (test_example_fails_with (ex "03_effects") "unbound variable 'info'")
-          (* 04: missing lowercase constructor wrapper 'transitioned' — blocked by #109 *)
-        ; Alcotest.test_case "04_state_machine: unbound 'transitioned'" `Quick
-            (test_example_fails_with (ex "04_state_machine") "unbound variable 'transitioned'")
-          (* 05: missing stdlib 'pair' constructor — blocked by #109 *)
-        ; Alcotest.test_case "05_collections: unbound 'pair'" `Quick
-            (test_example_fails_with (ex "05_collections") "unbound variable 'pair'")
+          (* 03: 'transform' is still unbound (not a prelude function) — blocked by future issue *)
+        ; Alcotest.test_case "03_effects: unbound 'transform'" `Quick
+            (test_example_fails_with (ex "03_effects") "unbound variable 'transform'")
+          (* 04: now builds — #109 landed lowercase constructor aliases and prelude Throw effect *)
+        ; Alcotest.test_case "04_state_machine builds" `Quick
+            (test_example_builds (ex "04_state_machine"))
+          (* 05: now builds — #109 landed prelude Pair/List/etc. *)
+        ; Alcotest.test_case "05_collections builds" `Quick
+            (test_example_builds (ex "05_collections"))
           (* 06: concat/string_length/string_eq are now built-in (#104);
              eq_char and related char ops still unresolved — blocked by #110 *)
         ; Alcotest.test_case "06_string_processing: unbound 'eq_char'" `Quick
             (test_example_fails_with (ex "06_string_processing") "unbound variable 'eq_char'")
-          (* 07: missing lowercase constructor wrappers 'valid'/'invalid' — blocked by #109 *)
-        ; Alcotest.test_case "07_validation: unbound 'valid'" `Quick
-            (test_example_fails_with (ex "07_validation") "unbound variable 'valid'")
+          (* 07: 'contains' is still unbound — blocked by future issue *)
+        ; Alcotest.test_case "07_validation: unbound 'contains'" `Quick
+            (test_example_fails_with (ex "07_validation") "unbound variable 'contains'")
           (* 08: parser bug — 'perform' not accepted as match scrutinee — blocked by #101 *)
         ; Alcotest.test_case "08_config: parse error on Perform" `Quick
             (test_example_fails_with (ex "08_config") "unexpected token Perform")
           (* 09: 'Log' effect used but not declared in file scope — blocked by #109 *)
         ; Alcotest.test_case "09_pipeline: unknown effect 'Log'" `Quick
             (test_example_fails_with (ex "09_pipeline") "unknown effect 'Log'")
-          (* 10: missing lowercase constructor wrappers for Json ADT — blocked by #109 *)
-        ; Alcotest.test_case "10_json: unbound 'j_object'" `Quick
-            (test_example_fails_with (ex "10_json") "unbound variable 'j_object'")
+          (* 10: now builds — #109 landed lowercase constructor aliases *)
+        ; Alcotest.test_case "10_json builds" `Quick
+            (test_example_builds (ex "10_json"))
         ] )
     ; ( "strings",
         (* Issue #104: string literals and basic string ops.

@@ -83,7 +83,7 @@ fn intersperse<a>(sep: a, xs: List<a>) -> List<a> ! pure {
   }
 }
 
-fn sort<a>(cmp: (x: a, y: a) -> Ordering ! pure, xs: List<a>) -> List<a> ! pure {
+fn sort<a>(cmp: (x: a, y: a) -> Ordering ! pure, xs: List<a>) -> List<a> ! {DivByZero} {
   match xs with {
     | Nil => nil()
     | Cons(_, Nil) => xs
@@ -110,7 +110,7 @@ fn merge<a>(cmp: (x: a, y: a) -> Ordering ! pure, xs: List<a>, ys: List<a>) -> L
   }
 }
 
-fn split_half<a>(xs: List<a>) -> Pair<List<a>, List<a>> ! pure {
+fn split_half<a>(xs: List<a>) -> Pair<List<a>, List<a>> ! {DivByZero} {
   let n = length(xs) in
   let half = div(n, 2) in
   pair(take(half, xs), drop(half, xs))

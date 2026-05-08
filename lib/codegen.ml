@@ -956,9 +956,10 @@ let add_max_fn m =
 (* Module emitter                                                       *)
 (* ------------------------------------------------------------------ *)
 
-let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
+let emit ?(use_tail_calls=true) ?(extra_env=[]) ?(extra_eenv=[])
+         ?(prelude_prog=[]) (prog : Ast.program) : bytes =
   let tco    = if use_tail_calls then TailCallInstr else TrampolineLoop in
-  let eprog  = elaborate_program prog in
+  let eprog  = elaborate_program ~extra_env ~extra_eenv prog in
   (* Pre-scan for string literals; static data starts at offset 64 to leave
      the first 64 bytes as a reserved zero-page area. *)
   let static_base = 64 in
@@ -1005,14 +1006,14 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
   in
   let pending     = ref [] in
   let table_funcs = ref [] in
-  let effect_map =
+  let build_effect_map decls =
     List.filter_map (fun (d : Ast.decl) ->
       match d.Ast.decl_desc with
       | Ast.DeclEffect { effect_name; ops; _ } -> Some (effect_name, ops)
       | _ -> None
-    ) prog
+    ) decls
   in
-  let ctor_map =
+  let build_ctor_map decls =
     List.concat_map (fun (d : Ast.decl) ->
       match d.Ast.decl_desc with
       | Ast.DeclType { ctors; _ } ->
@@ -1026,8 +1027,22 @@ let emit ?(use_tail_calls=true) (prog : Ast.program) : bytes =
           else [entry; (lower, (tag, arity))]
         ) (List.mapi (fun tag c -> (tag, c)) ctors)
       | _ -> []
-    ) prog
+    ) decls
   in
+  (* Build maps from prog first, then fill in missing entries from prelude_prog
+     so that user-defined effects/types take precedence over the prelude. *)
+  let user_effect_map = build_effect_map prog in
+  let user_ctor_map   = build_ctor_map prog in
+  let prelude_effect_entries =
+    List.filter (fun (name, _) -> not (List.mem_assoc name user_effect_map))
+      (build_effect_map prelude_prog)
+  in
+  let prelude_ctor_entries =
+    List.filter (fun (name, _) -> not (List.mem_assoc name user_ctor_map))
+      (build_ctor_map prelude_prog)
+  in
+  let effect_map = user_effect_map @ prelude_effect_entries in
+  let ctor_map   = user_ctor_map   @ prelude_ctor_entries in
   let fn_decls =
     let check_fn f =
       let params_ok =
